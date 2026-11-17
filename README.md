@@ -2,6 +2,8 @@
 
 A Rust Soulseek daemon for Linux with a modern React browser interface, an authenticated API and SQLite persistence. Run it with Docker, Podman or as a native Linux service.
 
+**[Explore the project website →](https://salnajjar.github.io/RustySoul/)** — screenshots, features and installation options.
+
 **First beta: v0.1.0-beta.1.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
 
 ## Quick start with Docker

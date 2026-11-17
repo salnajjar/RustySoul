@@ -2,7 +2,17 @@ name: Verify
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'site/**'
+      - 'screens/**'
+      - 'scripts/build-site.py'
+      - '.github/workflows/pages.yml'
   pull_request:
+    paths-ignore:
+      - 'site/**'
+      - 'screens/**'
+      - 'scripts/build-site.py'
+      - '.github/workflows/pages.yml'
   workflow_call:
 permissions:
   contents: read
