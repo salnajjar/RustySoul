@@ -4855,9 +4855,13 @@ test("whole transfer user groups inherit collapse and expand defaults as new use
     await page
       .getByRole("button", { name: "Expand all users", exact: true })
       .click();
+    // Keep the last response held until scrolling has requested it. Releasing
+    // it first races removal of the sentinel against Playwright's locator.
+    await page.locator(".infinite-sentinel").scrollIntoViewIfNeeded();
+    await expect
+      .poll(() => requests.some((q) => q.get("offset") === "290"))
+      .toBe(true);
     releaseDave();
-    if (await page.locator(".infinite-sentinel").count())
-      await page.locator(".infinite-sentinel").scrollIntoViewIfNeeded();
     await expect(
       page.getByRole("button", {
         name: `Collapse ${direction} for dave`,
