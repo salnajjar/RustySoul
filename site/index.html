@@ -547,16 +547,22 @@
             </div>
             <pre
               tabindex="0"
-            ><code id="code-docker">git clone https://github.com/salnajjar/RustySoul.git
-cd RustySoul
-cp .env.example .env
+            ><code id="code-docker">mkdir -m 700 rustysoul &amp;&amp;
+cd rustysoul &amp;&amp;
+mkdir deploy &amp;&amp;
+RUSTYSOUL_FILES=https://raw.githubusercontent.com/salnajjar/RustySoul/main &amp;&amp;
+curl -fL "$RUSTYSOUL_FILES/compose.yaml" -o compose.yaml &amp;&amp;
+curl -fL "$RUSTYSOUL_FILES/deploy/container.toml" -o deploy/container.toml &amp;&amp;
+(umask 077; curl -fL "$RUSTYSOUL_FILES/.env.example" -o .env) &amp;&amp;
 
-# Set your media paths in .env, then:
-docker compose pull
+# Optional: configure media paths in .env before starting.
+docker compose pull &amp;&amp;
 docker compose up -d --no-build</code></pre>
             <p class="install-help">
-              Requires Docker Engine and Compose on Linux. The
-              <code>:beta</code> image is public; no registry login needed.
+              Requires curl, Docker Engine and Compose on Linux. Downloads only
+              Compose, configuration and deployment defaults for a new
+              installation. The application comes from the public
+              <code>:beta</code> image; no registry login needed.
               <a
                 href="https://github.com/salnajjar/RustySoul/blob/main/docs/STORAGE_MOUNTS.md"
                 >Configure your mounts ↗</a
@@ -582,18 +588,20 @@ docker compose up -d --no-build</code></pre>
             </div>
             <pre
               tabindex="0"
-            ><code id="code-podman">git clone https://github.com/salnajjar/RustySoul.git
-cd RustySoul
-podman pull ghcr.io/salnajjar/rustysoul:beta
-mkdir -p ~/.config/containers/systemd ~/.config/rustysoul
-install -m 600 .env.example ~/.config/rustysoul/daemon.env
-install -m 644 deploy/container.toml ~/.config/rustysoul/rustysoul.toml
-install -m 644 deploy/rustysoul.container ~/.config/containers/systemd/
-systemctl --user daemon-reload
+            ><code id="code-podman">mkdir -p ~/.config/containers/systemd &amp;&amp;
+mkdir -m 700 ~/.config/rustysoul &amp;&amp;
+RUSTYSOUL_FILES=https://raw.githubusercontent.com/salnajjar/RustySoul/main &amp;&amp;
+curl -fL "$RUSTYSOUL_FILES/deploy/container.toml" -o ~/.config/rustysoul/rustysoul.toml &amp;&amp;
+(umask 077; curl -fL "$RUSTYSOUL_FILES/.env.example" -o ~/.config/rustysoul/daemon.env) &amp;&amp;
+curl -fL "$RUSTYSOUL_FILES/deploy/rustysoul.container" -o ~/.config/containers/systemd/rustysoul.container &amp;&amp;
+podman pull ghcr.io/salnajjar/rustysoul:beta &amp;&amp;
+systemctl --user daemon-reload &amp;&amp;
 systemctl --user start rustysoul.service</code></pre>
             <p class="install-help">
-              Requires Podman with Quadlet and a user systemd session. This
-              example uses named volumes.
+              Requires curl, Podman with Quadlet and a user systemd session.
+              Downloads only the Quadlet service, configuration and deployment
+              defaults for a new installation, then pulls the application image.
+              This example uses named volumes.
               <a
                 href="https://github.com/salnajjar/RustySoul/blob/main/docs/CONTAINERS.md"
                 >Read the Podman guide ↗</a
