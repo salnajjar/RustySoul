@@ -1,0 +1,10 @@
+# Bridge mode: bind inside the container; Compose controls the published host interface.
+bind = "0.0.0.0:8484"
+allow_remote = true
+data_dir = "/var/lib/rustysoul"
+download_dir = "/downloads"
+location_roots = ["/downloads", "/library"]
+[soulseek]
+listen_port = 2234
+shares = ["/library"]
+auto_connect = true

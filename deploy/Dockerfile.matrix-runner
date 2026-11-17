@@ -1,0 +1,5 @@
+FROM docker:29-cli AS cli
+FROM python:3.14-slim
+COPY --from=cli /usr/local/bin/docker /usr/local/bin/docker
+COPY scripts/container-matrix.py /opt/container-matrix.py
+ENTRYPOINT ["python3", "/opt/container-matrix.py"]

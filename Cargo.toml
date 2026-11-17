@@ -1,0 +1,58 @@
+[package]
+name = "rustysoul"
+version = "0.1.0-beta.1"
+license = "GPL-3.0-only"
+edition = "2024"
+rust-version = "1.91"
+description = "A Linux Soulseek daemon with a browser interface and authenticated API"
+publish = false
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.4"
+notify = "8"
+igd-next = "0.18"
+axum = { version = "0.8", features = ["json", "multipart"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+include_dir = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.43", features = ["bundled", "backup", "hooks", "limits"] }
+sha2 = "0.10"
+soulseek-rs-lib = "=20.0.0"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["limit", "util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+base64 = "0.22"
+cap-std = "3"
+tokio-util = { version = "0.7", features = ["io"] }
+oxipng = { version = "=10.2.1", default-features = false, features = ["zopfli"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["fs", "param"] }
+
+tempfile = "3"
+
+[dev-dependencies]
+flate2 = "1"
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[patch.crates-io]
+soulseek-rs-lib = { path = "vendor/soulseek-rs-lib" }

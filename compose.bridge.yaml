@@ -1,0 +1,31 @@
+# Alternative to compose.yaml for bridge networking. TCP publication is fixed at container creation.
+services:
+  rustysoul:
+    build: .
+    image: "${RUSTYSOUL_IMAGE:-ghcr.io/salnajjar/rustysoul:beta}"
+    container_name: rustysoul
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    stop_grace_period: 90s
+    ports:
+      - "127.0.0.1:8484:8484"
+      - "${RUSTYSOUL_TRANSFER_PORT:-2234}:${RUSTYSOUL_TRANSFER_PORT:-2234}/tcp"
+    environment:
+      RUSTYSOUL_PUBLISHED_TRANSFER_PORT: "${RUSTYSOUL_TRANSFER_PORT:-2234}"
+      RUSTYSOUL_DEFAULT_USERNAME: "${RUSTYSOUL_DEFAULT_USERNAME:-admin}"
+      RUSTYSOUL_DEFAULT_PASSWORD: "${RUSTYSOUL_DEFAULT_PASSWORD:-change-me-now}"
+    volumes:
+      - ./deploy/container.bridge.toml:/etc/rustysoul/rustysoul.toml:ro
+      - rustysoul-data:/var/lib/rustysoul
+      - ${RUSTYSOUL_DOWNLOADS_SOURCE:-rustysoul-downloads}:/downloads
+      - ${RUSTYSOUL_LIBRARY_SOURCE:-rustysoul-library}:/library:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+volumes:
+  rustysoul-data:
+  rustysoul-downloads:
+  rustysoul-library:

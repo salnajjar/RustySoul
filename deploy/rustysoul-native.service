@@ -1,0 +1,37 @@
+[Unit]
+Description=RustySoul native Linux daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustysoul
+Group=@GROUP@
+StateDirectory=rustysoul-native
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/rustysoul-native
+EnvironmentFile=/etc/rustysoul-native/daemon.env
+ExecStart=/usr/local/bin/rustysoul-native --config /etc/rustysoul-native/rustysoul.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@DOWNLOADS@
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+TasksMax=256
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

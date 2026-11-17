@@ -1,0 +1,335 @@
+.system-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 15px;
+  border: 1px solid #cbdac4;
+  background: #f0f5eb;
+  border-radius: 8px;
+  margin: 12px 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #38543b;
+}
+.system-message > div {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.system-message > button {
+  flex-shrink: 0;
+}
+.system-message.message-error {
+  background: #fff3ec;
+  border-color: #e6c1ae;
+  color: #87452d;
+}
+.library-progress {
+  border: 1px solid #d5dfca;
+  border-radius: 8px;
+  padding: 16px;
+  background: #f1f5eb;
+  line-height: 1.8;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.library-banner {
+  margin: 0 0 22px;
+}
+.library-detail {
+  margin: 12px 0;
+}
+.library-progress strong {
+  display: block;
+}
+.scan-indicator {
+  height: 3px;
+  margin: 10px 0;
+  background: #d6e1cf;
+  overflow: hidden;
+  border-radius: 5px;
+}
+.scan-indicator > span {
+  display: block;
+  height: 100%;
+  width: 25%;
+  background: #4e7553;
+  animation: scan-activity 2s ease-in-out infinite alternate;
+}
+@keyframes scan-activity {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .scan-indicator > span {
+    animation: none;
+    width: 100%;
+    opacity: 0.6;
+  }
+}
+:root[data-theme="light"] {
+  --page: #f4f6f8;
+  --surface: #ffffff;
+  --surface-alt: #eef2f5;
+  --ink: #17212b;
+  --soft-ink: #4c5d6b;
+  --edge: #cbd5de;
+  --accent: #276347;
+  --on-accent: #ffffff;
+  --line: var(--edge);
+  --muted: var(--soft-ink);
+  --sidebar: var(--surface);
+}
+:root[data-theme="dark"] {
+  --page: #13191f;
+  --surface: #1c252e;
+  --surface-alt: #26323e;
+  --ink: #e7edf4;
+  --soft-ink: #b2c1ce;
+  --edge: #435364;
+  --accent: #397c57;
+  --on-accent: #ffffff;
+  --line: var(--edge);
+  --muted: var(--soft-ink);
+  --sidebar: #10161c;
+}
+:root:is([data-theme="light"], [data-theme="dark"]) {
+  background: var(--page);
+  color: var(--ink);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(body, .main-shell, main, .login-screen) {
+  background: var(--page);
+  color: var(--ink);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .panel,
+    .topbar,
+    footer,
+    .results-panel,
+    .login-panel,
+    .folder-dialog,
+    .room-list,
+    .conversation,
+    .transfer-list,
+    .stat-card
+  ) {
+  background: var(--surface);
+  color: var(--ink);
+  border-color: var(--edge);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    input,
+    textarea,
+    select,
+    .button.secondary,
+    .tabs,
+    .folder-results > summary,
+    .connectivity-card,
+    .folder-choices button,
+    th,
+    .search-form
+  ) {
+  background: var(--surface-alt);
+  color: var(--ink);
+  border-color: var(--edge);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(.sidebar, .sidebar-bottom) {
+  background: var(--sidebar);
+  color: var(--ink);
+  border-color: var(--edge);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .brand,
+    .nav-item,
+    .nav-item.selected,
+    .nav-label,
+    .version,
+    .workspace,
+    .server-card,
+    .breadcrumb,
+    .breadcrumb > span,
+    .topbar-right,
+    .avatar
+  ) {
+  color: var(--ink);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .nav-item.selected,
+    .nav-item:hover,
+    .avatar,
+    .workspace-avatar,
+    .count,
+    .tab.active,
+    .user-results > summary,
+    .room-item.chosen,
+    .room-item:hover,
+    .offline-banner,
+    .network-signin-prompt,
+    .library-progress,
+    .system-message,
+    .discovery-card,
+    .discovery-art,
+    .discovery-copy
+  ) {
+  background: var(--surface-alt);
+  color: var(--ink);
+  border-color: var(--edge);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .page-header p,
+    .eyebrow,
+    .panel p,
+    .panel label,
+    .hint,
+    .format-filter label,
+    .format-filter small,
+    .results-toolbar span,
+    .results-controls label,
+    .results-selection,
+    .user-results > summary > span,
+    .folder-results > summary > small,
+    .mono,
+    .availability,
+    .table-bottom,
+    .file-name small,
+    .transfer-detail small,
+    .transfer-state small,
+    .room-sort-label,
+    .room-item small,
+    .message-list small,
+    .connection-label,
+    .login-panel p,
+    .login-panel small,
+    .stat-card > span,
+    .search-hints,
+    .feature-strip small,
+    .discovery-copy p,
+    .discovery-copy small,
+    .card-foot,
+    .empty p,
+    small,
+    dt
+  ) {
+  color: var(--soft-ink);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(.button, .button:hover:enabled, .search-form .button) {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .button.secondary,
+    .button.secondary:hover:enabled,
+    .offline-banner .button
+  ) {
+  background: var(--surface-alt);
+  color: var(--ink);
+  border-color: var(--edge);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .icon-button,
+    .text-link,
+    .availability.free,
+    .stat-card strong,
+    .big-stat,
+    .format-tag,
+    .file-icon,
+    .login-panel label,
+    .discovery-copy h2,
+    .feature-strip strong,
+    .message-text,
+    .conversation-header strong
+  ) {
+  color: var(--ink);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .format-tag,
+    .file-icon,
+    .status-tag,
+    .tab-count,
+    .search-form kbd,
+    .message-bubble
+  ) {
+  background: var(--surface-alt);
+  border-color: var(--edge);
+  color: var(--ink);
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(
+    .folder-results,
+    td,
+    th,
+    .tab,
+    .tabs,
+    .results-toolbar,
+    .results-controls,
+    .results-selection,
+    .conversation-header,
+    .message-form,
+    .table-bottom,
+    .transfer-row,
+    .feature-strip,
+    .credentials-form textarea
+  ) {
+  border-color: var(--edge);
+}
+:root:is([data-theme="light"], [data-theme="dark"]) tbody tr:hover {
+  background: var(--surface-alt);
+}
+:root:is([data-theme="light"], [data-theme="dark"]) .login-decoration {
+  opacity: 0.12;
+}
+:root:is([data-theme="light"], [data-theme="dark"]) .scan-indicator {
+  background: var(--edge);
+}
+:root:is([data-theme="light"], [data-theme="dark"]) .scan-indicator > span {
+  background: var(--accent);
+}
+:root[data-theme="dark"] .system-message.message-error {
+  background: #3d2929;
+  color: #ffd0bd;
+  border-color: #9e6151;
+}
+:root[data-theme="light"] .system-message.message-error {
+  background: #fff0e9;
+  color: #823b20;
+  border-color: #c99077;
+}
+:root:is([data-theme="light"], [data-theme="dark"])
+  :is(.panel h2, .panel dd, .message strong, .room-item, .folder-dialog h2) {
+  color: var(--ink);
+}
+:root:is([data-theme="light"], [data-theme="dark"]) .hint {
+  color: var(--soft-ink) !important;
+}
+:root:is([data-theme="light"], [data-theme="dark"]) .button.secondary {
+  background: var(--surface-alt) !important;
+  color: var(--ink) !important;
+}
+
+:root {
+  --dialog-bg: #ffffff;
+  --dialog-text: #272b27;
+}
+:root[data-theme="dark"] {
+  --dialog-bg: #1d242c;
+  --dialog-text: #e5eaf0;
+}
+.user-dialog {
+  color: var(--dialog-text);
+  background: var(--dialog-bg);
+}

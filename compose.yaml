@@ -1,0 +1,35 @@
+services:
+  rustysoul:
+    build: .
+    image: "${RUSTYSOUL_IMAGE:-ghcr.io/salnajjar/rustysoul:beta}"
+    container_name: rustysoul
+    restart: unless-stopped
+
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    stop_grace_period: 90s
+    # Linux: direct incoming peer connections and UPnP multicast discovery.
+    # The daemon binds HTTP to 127.0.0.1; use an HTTPS reverse proxy remotely.
+    network_mode: host
+    environment:
+      RUSTYSOUL_TRANSFER_PORT: "${RUSTYSOUL_TRANSFER_PORT:-2234}"
+      RUSTYSOUL_DEFAULT_USERNAME: "${RUSTYSOUL_DEFAULT_USERNAME:-admin}"
+      RUSTYSOUL_DEFAULT_PASSWORD: "${RUSTYSOUL_DEFAULT_PASSWORD:-change-me-now}"
+      RUST_LOG: rustysoul=info
+    volumes:
+      - ./deploy/container.toml:/etc/rustysoul/rustysoul.toml:ro
+      - rustysoul-data:/var/lib/rustysoul
+      - ${RUSTYSOUL_DOWNLOADS_SOURCE:-rustysoul-downloads}:/downloads
+      - ${RUSTYSOUL_LIBRARY_SOURCE:-rustysoul-library}:/library:ro
+      # Optional: mount your own config. Set *_SOURCE in .env to select host folders.
+      # - ./deploy/container.toml:/etc/rustysoul/rustysoul.toml:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+volumes:
+  rustysoul-data:
+  rustysoul-downloads:
+  rustysoul-library:

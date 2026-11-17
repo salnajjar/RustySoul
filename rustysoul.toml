@@ -1,0 +1,20 @@
+bind = "127.0.0.1:8484"
+# Use "192.0.2.10:8484" for one adapter or "0.0.0.0:8484" / "all:8484" for all IPv4.
+# For non-loopback addresses, also set allow_remote = true and restart the daemon.
+allow_remote = false
+data_dir = "data"
+
+[soulseek]
+server = "server.slsknet.org"
+port = 2242
+listen_port = 2234
+# Set only directories you intend to make public. No files are shared by default.
+shares = []
+auto_connect = true
+
+[limits]
+peers = 64
+upload_slots = 2
+download_bytes_per_second = 0 # 0 means unlimited
+searches = 8
+transfers = 128

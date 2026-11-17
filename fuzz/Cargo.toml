@@ -1,0 +1,29 @@
+[package]
+name = "rustysoul-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+soulseek-rs-lib = { path = "../vendor/soulseek-rs-lib" }
+
+[[bin]]
+name = "protocol_parser"
+path = "fuzz_targets/protocol_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompression"
+path = "fuzz_targets/decompression.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -1,0 +1,20 @@
+# Container deployment
+
+Public beta image: `ghcr.io/salnajjar/rustysoul:beta`; pin a version such as `:0.1.0-beta.1` for reproducible upgrades. Published binaries currently target Linux amd64. Docker Engine with Compose and rootless/rootful Podman are supported deployment options. See the repository README for first sign-in and account setup.
+
+`compose.yaml` uses host networking. `compose.bridge.yaml` publishes loopback HTTP and the selected TCP transfer port. For bridge mode:
+
+```sh
+docker compose -f compose.bridge.yaml pull
+docker compose -f compose.bridge.yaml up -d --no-build
+```
+
+Set `RUSTYSOUL_TRANSFER_PORT` in `.env` before creating bridge containers. Docker/Podman cannot dynamically add published ports to an existing container: update the publication and recreate it if the UI port changes. Host networking permits listener changes without recreating the container and supports UPnP multicast discovery more directly. Router forwarding is separate from container publication; diagnostics describe both.
+
+Three separate volumes hold private state, downloads and shared files. For host folders and multiple libraries, see [storage mapping](STORAGE_MOUNTS.md). The runtime runs as UID/GID 10001 with a read-only root filesystem, dropped capabilities and no new privileges in the supplied manifests. Existing bind folders need appropriate permissions. Rootless Podman uses mapped IDs; named volumes simplify initial setup.
+
+`deploy/rustysoul.container` is a rootless Podman Quadlet example. Install its configuration/environment files as described in the README. Its image can be pinned to a release tag. Configure login lingering if the service must run without an active user session. Avoid starting multiple instances on the same ports or database.
+
+Upgrade by backing up state, pulling the desired image and recreating the existing service while preserving volumes. Do not use `down -v` unless intentionally deleting named-volume data. Never replace an established installation's service-management mechanism with a second competing service.
+
+Build from source with `docker build -t rustysoul:local .`. The build installs frontend dependencies, builds the UI, runs unit tests and compiles a release binary. Runtime needs no Node or Rust toolchain. [Testing](TESTING.md) describes the four host/bridge and named/bind installation cases. Image labels link the exact revision and source repository; licences ship in `/usr/share/doc/rustysoul`.

@@ -1,0 +1,34 @@
+# Rootless Podman Quadlet. Install in ~/.config/containers/systemd/.
+# Pull image first: podman pull ghcr.io/salnajjar/rustysoul:beta
+# Create ~/.config/rustysoul/daemon.env with mode 600 (see .env.example).
+[Unit]
+Description=RustySoul daemon
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/salnajjar/rustysoul:beta
+ContainerName=rustysoul
+User=10001:10001
+Network=host
+Volume=rustysoul-data:/var/lib/rustysoul
+Volume=%h/.config/rustysoul/rustysoul.toml:/etc/rustysoul/rustysoul.toml:ro
+Volume=rustysoul-downloads:/downloads
+Volume=rustysoul-library:/library:ro
+EnvironmentFile=%h/.config/rustysoul/daemon.env
+ReadOnly=true
+HealthCmd=rustysoul --config /etc/rustysoul/rustysoul.toml --healthcheck
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=15s
+HealthRetries=3
+NoNewPrivileges=true
+DropCapability=ALL
+PodmanArgs=--pids-limit=256 --stop-timeout=90
+
+[Service]
+Restart=on-failure
+TimeoutStopSec=95
+
+[Install]
+WantedBy=default.target

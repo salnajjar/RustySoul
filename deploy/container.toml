@@ -1,0 +1,23 @@
+bind = "127.0.0.1:8484"
+# Alternatives: "192.0.2.10:8484" (one adapter), "0.0.0.0:8484" or "all:8484".
+# Changing the binding requires a restart. Keep allow_remote=true for non-loopback addresses.
+# Linux host networking supports SSDP discovery and the UI-selected transfer port.
+# HTTP stays on host loopback. Use an HTTPS reverse proxy for remote access.
+allow_remote = true
+data_dir = "/var/lib/rustysoul"
+download_dir = "/downloads"
+location_roots = ["/downloads", "/library"]
+
+[soulseek]
+server = "server.slsknet.org"
+port = 2242
+listen_port = 2234
+shares = ["/library"] # read-only library volume mounted at installation
+auto_connect = true
+
+[limits]
+peers = 64
+upload_slots = 2
+download_bytes_per_second = 0
+searches = 8
+transfers = 128
