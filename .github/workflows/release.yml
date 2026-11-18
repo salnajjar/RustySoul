@@ -45,7 +45,9 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          # Podman discards Docker's HEALTHCHECK extension from OCI manifests.
+          # Docker media types preserve the health check in both runtimes.
+          outputs: type=image,push=true,oci-mediatypes=false
           tags: |
             ghcr.io/salnajjar/rustysoul:${{ steps.version.outputs.version }}
             ghcr.io/salnajjar/rustysoul:beta
@@ -54,6 +56,13 @@ jobs:
             REVISION=${{ github.sha }}
           cache-from: type=gha,scope=rustysoul-amd64
           cache-to: type=gha,scope=rustysoul-amd64,mode=max
+      - name: Verify published image with Podman
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y podman
+          sudo podman pull "ghcr.io/salnajjar/rustysoul@$IMAGE_DIGEST"
+          sudo python3 scripts/container-matrix.py --engine podman --image "ghcr.io/salnajjar/rustysoul@$IMAGE_DIGEST" --network host --storage named
       - name: Package native executable and release notes
         env:
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
