@@ -236,6 +236,9 @@ def main():
             assert state['network']['port'] == peer_port
             assert state['port_binding']['fixed_port'] == (peer_port if args.network == 'bridge' else None)
             settings = state['network']
+            # Storage protection has dedicated tests. Installation/transport
+            # fixtures must not depend on the build runner's disk budget.
+            settings['minimum_free_space_mib'] = 0
             settings['connect_on_startup'] = True
             settings['upload_slots'] = 3
             request('commands', {'type': 'update_network', 'settings': settings})
