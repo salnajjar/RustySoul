@@ -89,6 +89,9 @@ fn another_users_transfer_fills_slots_when_a_peer_can_only_send_one_file() {
     h.commands
         .send(Command::UpdateNetwork {
             settings: NetworkSettings {
+                // Storage admission has its own fixture; scheduler assertions must
+                // not depend on the CI runner's free space or probe timing.
+                minimum_free_space_mib: 0,
                 port: peer_port,
                 download_slots: 2,
                 download_slots_per_user: 2,
@@ -205,6 +208,9 @@ fn another_users_transfer_fills_slots_when_a_peer_can_only_send_one_file() {
     h.commands
         .send(Command::UpdateNetwork {
             settings: NetworkSettings {
+                // Storage admission has its own fixture; scheduler assertions must
+                // not depend on the CI runner's free space or probe timing.
+                minimum_free_space_mib: 0,
                 port: peer_port,
                 download_slots: 0,
                 download_slots_per_user: 2,
@@ -257,6 +263,9 @@ fn another_users_transfer_fills_slots_when_a_peer_can_only_send_one_file() {
     h.commands
         .send(Command::UpdateNetwork {
             settings: NetworkSettings {
+                // Storage admission has its own fixture; scheduler assertions must
+                // not depend on the CI runner's free space or probe timing.
+                minimum_free_space_mib: 0,
                 port: peer_port,
                 download_slots: 1,
                 download_slots_per_user: 2,

@@ -288,9 +288,13 @@ def main():
                 engine('cp', name + ':/var/lib/rustysoul/rustysoul.sqlite3', str(root / 'state.sqlite3'))
             from contextlib import closing
             with closing(sqlite3.connect(root / 'state.sqlite3')) as db:
-                assert db.execute('PRAGMA user_version').fetchone()[0] == 13
+                assert db.execute('PRAGMA user_version').fetchone()[0] == 14
                 assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
                 assert not db.execute('PRAGMA foreign_key_check').fetchall()
+                for table in ['downloads', 'uploads']:
+                    assert {'started_at', 'finished_at'} <= {row[1] for row in db.execute('PRAGMA table_info('+table+')')}
+                started, finished = db.execute('SELECT started_at,finished_at FROM downloads WHERE username=? AND path=?', ('fixture-peer', remote)).fetchone()
+                assert started is not None and finished is not None and finished >= started
             print(f'{args.engine} rootless={rootless} {args.network}/{args.storage} bind_data={args.bind_data} quadlet={bool(args.quadlet)}: initial account gate, UID/mount permissions, indexing, incoming peer/file connection, empty download, health and restart/session/credentials/settings/media/database persistence passed.', flush=True)
         except Exception:
             import sys
