@@ -48,6 +48,9 @@ jobs:
           # Podman discards Docker's HEALTHCHECK extension from OCI manifests.
           # Docker media types preserve the health check in both runtimes.
           outputs: type=image,push=true,oci-mediatypes=false
+          # In-image attestations require OCI media types. GitHub's immutable
+          # release attestation still covers the tag and native release assets.
+          provenance: false
           tags: |
             ghcr.io/salnajjar/rustysoul:${{ steps.version.outputs.version }}
             ghcr.io/salnajjar/rustysoul:beta
