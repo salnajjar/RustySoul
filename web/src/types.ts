@@ -21,6 +21,8 @@ export interface Transfer {
   detail?: string;
   added_at?: number;
   updated_at?: number;
+  started_at?: number | null;
+  finished_at?: number | null;
 }
 export interface Search {
   id: string;
@@ -74,6 +76,8 @@ export interface PrivilegeStatus {
   error: string | null;
 }
 export interface Snapshot {
+  message_revision?: number;
+  message_reset?: number;
   privileges?: PrivilegeStatus;
   system?: SystemStatus;
   room_management?: RoomManagement;
@@ -298,7 +302,7 @@ export const emptySnapshot: Snapshot = {
   notice: null,
   credentials_configured: false,
   credentials_revision: 0,
-  version: "0.1.0",
+  version: "0.1.0-beta.2",
   connection: "disconnected",
   error: null,
   username: "",

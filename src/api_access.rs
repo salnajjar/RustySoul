@@ -22,6 +22,8 @@ impl Scope {
             return matches!(
                 path,
                 "/status"
+                    | "/messages"
+                    | "/messages/conversations"
                     | "/metrics"
                     | "/events"
                     | "/logs"

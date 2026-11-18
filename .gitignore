@@ -11,6 +11,9 @@
 /ReferenceCode/
 /artifacts/
 /docs/DEPLOYMENT.md
+# Keep only the runtime SVG; retain unused supplied artwork locally.
+/images/*
+!/images/rustysoul.svg
 # Install-specific helpers and historical deployment checks
 /deploy/*homeserver*
 /deploy/upgrade-*

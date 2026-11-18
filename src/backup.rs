@@ -25,7 +25,7 @@ const MAGIC: &[u8; 16] = b"RustySoulBackup1";
 const CHUNK: usize = 64 * 1024;
 pub const MAX_DATABASE: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_UPLOAD: usize = (MAX_DATABASE + 4 * 1024 * 1024) as usize;
-const SCHEMA: u32 = 13;
+const SCHEMA: u32 = 14;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Summary {
@@ -757,7 +757,8 @@ pub fn stage(prepared: &Prepared, config: &crate::config::Config) -> Result<()> 
     network.connect_on_startup = false;
     network.upnp = false;
     state.save_network(&network)?;
-    state.connection.execute_batch("DELETE FROM admin_sessions; DELETE FROM library_cache; DELETE FROM local_files; UPDATE downloads SET status='paused_waiting',speed=0 WHERE status IN ('waiting','waiting_for_space','queued','downloading','retry_waiting'); UPDATE uploads SET status='interrupted',speed=0 WHERE status IN ('queued','uploading','checking_shares'); UPDATE download_retries SET next_at=NULL;")?;
+    state.connection.execute_batch("DELETE FROM admin_sessions; DELETE FROM library_cache; DELETE FROM local_files; UPDATE downloads SET status='paused_waiting',speed=0 WHERE status IN ('waiting','waiting_for_space','queued','downloading','retry_waiting'); UPDATE download_retries SET next_at=NULL;")?;
+    crate::transfers::recover_uploads(&state.connection)?;
     state.connection.execute(
         "UPDATE installation SET identity=?1 WHERE id=1",
         [uuid::Uuid::new_v4().to_string()],
@@ -1104,6 +1105,7 @@ mod tests {
         for path in ["a.flac", "b.flac"] {
             store.connection.execute("INSERT INTO downloads(username,path,directory,size,status) VALUES('queue-user',?1,?2,CASE WHEN ?1='a.flac' THEN 0 ELSE 100 END,'waiting')", rusqlite::params![path, config.download_dir.as_ref().unwrap().to_str().unwrap()]).unwrap();
         }
+        store.connection.execute("UPDATE downloads SET status='completed',started_at=100,finished_at=145 WHERE path='a.flac'", []).unwrap();
         crate::queue_order::update(
             &store.connection,
             "downloads",
@@ -1123,6 +1125,15 @@ mod tests {
         assert_eq!(verified.summary.administrator, "backup-admin");
         assert_eq!(verified.summary.schema, SCHEMA);
         let db = Connection::open(verified.file()).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT started_at,finished_at FROM downloads WHERE path='a.flac'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            (100, 145)
+        );
         let restored = crate::queue_order::load(&db).unwrap();
         assert_eq!(restored.len(), expected.len());
         for (key, rule) in expected {
@@ -1141,10 +1152,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_schema_eleven_and_twelve_archives_restore_before_migration() {
-        for legacy in [11, 12] {
+    fn legacy_schema_eleven_through_thirteen_archives_restore_before_migration() {
+        for legacy in [11, 12, 13] {
             let (_temp, config, _) = fixture_at_schema(legacy);
-            if legacy == 12 {
+            if legacy >= 12 {
                 let db = Connection::open(config.data_dir.join("rustysoul.sqlite3")).unwrap();
                 db.execute("INSERT INTO downloads(username,path,size,status,directory) VALUES('peer','old.flac',100,'waiting',?1)",[config.download_dir.as_ref().unwrap().to_str().unwrap()]).unwrap();
                 crate::queue_order::update(&db, "downloads", "peer", "old.flac", Some(1), None)
@@ -1171,8 +1182,8 @@ mod tests {
                 SCHEMA
             );
             let rules = crate::queue_order::load(&store.connection).unwrap();
-            assert_eq!(rules.len(), if legacy == 12 { 1 } else { 0 });
-            if legacy == 12 {
+            assert_eq!(rules.len(), if legacy >= 12 { 1 } else { 0 });
+            if legacy >= 12 {
                 assert_eq!(rules.values().next().unwrap().priority, 1);
             }
             assert_eq!(

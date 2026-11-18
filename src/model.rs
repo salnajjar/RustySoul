@@ -38,6 +38,8 @@ pub struct Snapshot {
     pub rooms: Vec<RoomView>,
     pub joined_rooms: Vec<String>,
     pub messages: Vec<MessageView>,
+    pub message_revision: u64,
+    pub message_reset: u64,
     pub browse: BTreeMap<String, BrowseView>,
     pub users: BTreeMap<String, UserView>,
     pub buddies: Vec<String>,
@@ -169,6 +171,8 @@ pub struct TransferView {
     pub retry_at: Option<u64>,
     pub added_at: u64,
     pub updated_at: u64,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
     pub local_path: String,
     pub detail: String,
 }
@@ -469,6 +473,10 @@ pub enum Command {
         status: HistoryStatus,
     },
     DismissMessages,
+    ClearMessageHistory {
+        target: String,
+        private: bool,
+    },
     UpdateNetwork {
         settings: NetworkSettings,
     },
@@ -789,6 +797,13 @@ impl Command {
                     crate::validation::room(target)?;
                 }
                 text(content, 2000)
+            }
+            Self::ClearMessageHistory { target, private } => {
+                if *private {
+                    username(target)
+                } else {
+                    crate::validation::room(target)
+                }
             }
             Self::Browse { username: u }
             | Self::LookupUser { username: u }

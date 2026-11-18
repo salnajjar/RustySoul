@@ -130,6 +130,8 @@ pub fn router(state: ApiState) -> Router {
                 .layer(middleware::from_fn_with_state(state.clone(), backups::gate)),
         )
         .route("/logs", get(logs))
+        .route("/messages", get(message_history))
+        .route("/messages/conversations", get(message_conversations))
         .route("/rooms/read", post(read_room))
         .route("/rooms/entries", get(room_entries))
         .route("/downloads/file", get(download_file))
@@ -162,6 +164,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/v1/auth/login", post(login))
         .route("/", get(index))
+        .route("/site.webmanifest", get(web_manifest))
         .route("/assets/{*path}", get(asset))
         .nest("/api/v1", api)
         .layer(middleware::from_fn_with_state(state.clone(), security))
@@ -577,6 +580,46 @@ async fn traffic_history(
         ),
     }
 }
+async fn message_history(
+    State(state): State<ApiState>,
+    Query(query): Query<crate::messages::Query>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let db = rusqlite::Connection::open_with_flags(
+            state.data_dir.join("rustysoul.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        crate::messages::page(&db, &query)
+    })
+    .await
+    {
+        Ok(Ok(page)) => Json(page).into_response(),
+        Ok(Err(e)) => error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not load message history",
+        ),
+    }
+}
+async fn message_conversations(State(state): State<ApiState>) -> Response {
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let db = rusqlite::Connection::open_with_flags(
+            state.data_dir.join("rustysoul.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        crate::messages::conversations(&db)
+    })
+    .await
+    {
+        Ok(Ok(conversations)) => Json(conversations).into_response(),
+        _ => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not load saved conversations",
+        ),
+    }
+}
 async fn browse_tree(
     State(state): State<ApiState>,
     Query(query): Query<crate::browse::TreeQuery>,
@@ -832,7 +875,7 @@ async fn security(State(state): State<ApiState>, request: Request, next: Next) -
         Err(_) => error(StatusCode::REQUEST_TIMEOUT, "Request timed out"),
     };
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; media-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; media-src 'self'; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -1144,6 +1187,9 @@ async fn events(State(state): State<ApiState>, headers: axum::http::HeaderMap) -
 async fn index() -> Response {
     serve_asset("index.html")
 }
+async fn web_manifest() -> Response {
+    serve_asset("site.webmanifest")
+}
 async fn asset(Path(path): Path<String>) -> Response {
     serve_asset(&format!("assets/{path}"))
 }
@@ -1153,6 +1199,10 @@ fn serve_asset(path: &str) -> Response {
     };
     let mime = if path.ends_with(".html") {
         "text/html; charset=utf-8"
+    } else if path.ends_with(".webmanifest") {
+        "application/manifest+json"
+    } else if path.ends_with(".png") {
+        "image/png"
     } else if path.ends_with(".js") {
         "text/javascript; charset=utf-8"
     } else if path.ends_with(".css") {
@@ -1731,6 +1781,76 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn saved_messages_require_auth_and_return_archives_without_an_open_conversation() {
+        use http_body_util::BodyExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::store::Store::open(&dir.path().join("rustysoul.sqlite3")).unwrap();
+        store
+            .save_messages(&[crate::model::MessageView {
+                id: 1,
+                target: "archived-peer".into(),
+                username: "self".into(),
+                text: "saved private message".into(),
+                private: true,
+                timestamp: 1,
+            }])
+            .unwrap();
+        let (_, snapshot) = watch::channel(Snapshot::default());
+        let (tx, _) = mpsc::sync_channel(32);
+        let app = router(ApiState::new(
+            &Config {
+                data_dir: dir.path().into(),
+                ..Default::default()
+            },
+            &"s".repeat(32),
+            tx,
+            snapshot,
+        ));
+        for path in [
+            "/api/v1/messages?target=archived-peer&private=true",
+            "/api/v1/messages/conversations",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req("GET", path, None, ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let response = app
+                .clone()
+                .oneshot(req("GET", path, Some(&"s".repeat(32)), ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("archived-peer"));
+        }
+        for path in [
+            "/api/v1/messages?target=&private=true",
+            "/api/v1/messages?target=archived-peer&private=true&before_id=2&after_id=1",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req("GET", path, Some(&"s".repeat(32)), ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+    #[tokio::test]
     async fn browse_pages_require_auth_and_an_open_listing_and_validate_queries() {
         use http_body_util::BodyExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1781,6 +1901,52 @@ mod tests {
                 .unwrap();
         assert_eq!(page["total"], 1);
         assert_eq!(page["files"][0]["path"], "Music\\album\\song.flac");
+        let tree_path = "/api/v1/browse/tree?username=alice&all=true";
+        assert_eq!(
+            app.clone()
+                .oneshot(req("GET", tree_path, None, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app
+            .clone()
+            .oneshot(req("GET", tree_path, Some(&"s".repeat(32)), ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let tree: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(tree["total"], 2);
+        assert_eq!(tree["folders"].as_array().unwrap().len(), 2);
+        assert!(
+            tree["folders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|folder| folder["path"] == "Music\\album" && folder["parent"] == "Music")
+        );
+        for (path, expected) in [
+            (
+                "/api/v1/browse/tree?username=bob&all=true",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/v1/browse/tree?username=alice&all=true&offset=1",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req("GET", path, Some(&"s".repeat(32)), ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                expected
+            );
+        }
         assert_eq!(
             app.clone()
                 .oneshot(req(
@@ -2148,6 +2314,86 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
         assert_eq!(state.image_jobs.available_permits(), 1);
+    }
+    #[tokio::test]
+    async fn web_app_manifest_and_icons_are_public_typed_and_keep_api_authentication() {
+        use http_body_util::BodyExt;
+        let (app, _) = app();
+        let response = app
+            .clone()
+            .oneshot(req("GET", "/site.webmanifest", None, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/manifest+json"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            response.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("manifest-src 'self'")
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest["name"], "RustySoul");
+        assert_eq!(manifest["id"], "/");
+        assert_eq!(manifest["start_url"], "/");
+        assert_eq!(manifest["scope"], "/");
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["icons"][0]["src"], "/assets/icons/rustysoul.svg");
+        assert_eq!(manifest["icons"][0]["sizes"], "any");
+        assert_eq!(manifest["icons"][0]["type"], "image/svg+xml");
+        let response = app
+            .clone()
+            .oneshot(req("GET", "/assets/icons/rustysoul.svg", None, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let svg = std::str::from_utf8(&body).unwrap();
+        assert!(svg.contains("<svg") && svg.contains("viewBox=\"0 0 40 40\""));
+        assert!(svg.contains("fill=\"#344332\"") && svg.contains("stroke=\"#d7e7ae\""));
+        assert!(!svg.contains("<script") && !svg.contains("href="));
+        for file in [
+            "favicon-16x16.png",
+            "favicon-32x32.png",
+            "favicon-48x48.png",
+            "apple-touch-icon.png",
+            "icon-192.png",
+            "icon-512.png",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req("GET", &format!("/assets/icons/{file}"), None, ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(req("GET", "/assets/icons/original.png", None, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.oneshot(req("GET", "/api/v1/status", None, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
     #[tokio::test]
     async fn bounds_request_bodies_and_does_not_leak_assets() {

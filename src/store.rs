@@ -39,12 +39,12 @@ fn read_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_at_schema(path, 13)
+        Self::open_at_schema(path, 14)
     }
     // Used only to construct a trusted expected schema when validating older
     // backups. Never called on an untrusted backup before exact validation.
     pub(crate) fn open_at_schema(path: &Path, target: u32) -> Result<Self> {
-        ensure!((11..=13).contains(&target), "Unsupported schema target");
+        ensure!((11..=14).contains(&target), "Unsupported schema target");
         let connection = Connection::open(path).context("Cannot open SQLite database")?;
         #[cfg(unix)]
         if path != Path::new(":memory:") {
@@ -186,6 +186,9 @@ impl Store {
                 DROP TABLE downloads;
                 ALTER TABLE downloads_v13 RENAME TO downloads;
                 PRAGMA user_version=13;COMMIT;")?;
+        }
+        if version < 14 && target >= 14 {
+            crate::transfer_timing::migrate(&connection)?;
         }
         Ok(Self {
             connection,
@@ -400,7 +403,7 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         // Live membership resets; persisted room subscriptions are rejoined after login.
         let mut stmt = self.connection.prepare(
-            "SELECT target,username,text,private,timestamp,id FROM messages ORDER BY id LIMIT 500",
+            "SELECT target,username,text,private,timestamp,id FROM messages ORDER BY id DESC LIMIT 500",
         )?;
         view.messages = stmt
             .query_map([], |r| {
@@ -414,6 +417,7 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        view.messages.reverse();
         let mut stmt = self
             .connection
             .prepare("SELECT username,files,truncated FROM browse ORDER BY rowid")?;
@@ -505,28 +509,7 @@ impl Store {
             tx.commit()?;
             self.rooms = rooms;
         }
-        let messages = serde_json::to_string(&view.messages)?;
-        if messages != self.messages {
-            let tx = self
-                .connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            tx.execute("DELETE FROM messages", [])?;
-            for m in &view.messages {
-                let id = if m.id > 0 {
-                    m.id as i64
-                } else {
-                    tx.query_row(
-                        "UPDATE message_clock SET next_id=next_id+1 WHERE id=1 RETURNING next_id-1",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )?
-                };
-                tx.execute("INSERT INTO messages(id,target,username,text,private,timestamp) VALUES(?1,?2,?3,?4,?5,?6)", params![id,m.target,m.username,m.text,m.private,i64::try_from(m.timestamp)?])?;
-            }
-            tx.execute("UPDATE message_clock SET next_id=MAX(next_id,COALESCE((SELECT MAX(id)+1 FROM messages),1)) WHERE id=1",[])?;
-            tx.commit()?;
-            self.messages = messages;
-        }
+        self.save_messages(&view.messages)?;
         let browse = serde_json::to_string(&view.browse)?;
         if browse != self.browse {
             let tx = self
@@ -547,6 +530,50 @@ impl Store {
             self.browse = browse;
         }
         Ok(())
+    }
+    pub fn save_messages(&mut self, view: &[MessageView]) -> Result<bool> {
+        let messages = serde_json::to_string(view)?;
+        if messages == self.messages {
+            return Ok(false);
+        }
+        let tx = crate::store::write_transaction(&self.connection)?;
+        let mut added = 0;
+        for m in view {
+            let id = if m.id > 0 {
+                i64::try_from(m.id)?
+            } else {
+                tx.query_row(
+                    "UPDATE message_clock SET next_id=next_id+1 WHERE id=1 RETURNING next_id-1",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?
+            };
+            added += tx.execute("INSERT INTO messages(id,target,username,text,private,timestamp) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO NOTHING", params![id,m.target,m.username,m.text,m.private,i64::try_from(m.timestamp)?])?;
+        }
+        tx.execute("UPDATE message_clock SET next_id=MAX(next_id,COALESCE((SELECT MAX(id)+1 FROM messages),1)) WHERE id=1",[])?;
+        tx.commit()?;
+        self.messages = messages;
+        Ok(added > 0)
+    }
+    pub fn clear_message_history(
+        &mut self,
+        target: &str,
+        private: bool,
+    ) -> Result<(usize, (u64, u64))> {
+        crate::messages::validate(target, private)?;
+        let tx = crate::store::write_transaction(&self.connection)?;
+        let count = tx.execute(
+            "DELETE FROM messages WHERE private=?1 AND target=?2",
+            params![private, target],
+        )?;
+        let start = tx.query_row(
+            "UPDATE message_clock SET next_id=next_id+1024 WHERE id=1 RETURNING next_id-1024",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as u64;
+        tx.commit()?;
+        self.messages.clear();
+        Ok((count, (start, start + 1024)))
     }
     pub fn index_library(&mut self, directories: &[soulseek_rs::SharedDirectory]) -> Result<()> {
         let tx = self
@@ -595,7 +622,7 @@ mod tests {
         let db = &old.connection;
         db.execute_batch("INSERT INTO downloads(rowid,username,path,size,status,directory,file_name,parent_folder,transferred,speed,queue_position,added_at,updated_at,local_path) VALUES(11,'alice','Music/a.flac',100,'paused','/downloads','a.flac','Music',45,0,7,100,110,''),(71,'bob','Music/b.flac',200,'completed','/downloads','b.flac','Music',200,0,NULL,200,220,'bob/Music/b.flac'); INSERT INTO transfer_queue VALUES('downloads','alice','Music/a.flac',1,0); INSERT INTO download_retries VALUES('alice','Music/a.flac',2,123);").unwrap();
         let snapshot = |db: &Connection| {
-            db.prepare("SELECT rowid,* FROM downloads ORDER BY rowid")
+            db.prepare("SELECT rowid,username,path,size,status,directory,file_name,parent_folder,transferred,speed,queue_position,added_at,updated_at,local_path FROM downloads ORDER BY rowid")
                 .unwrap()
                 .query_map([], |r| {
                     (0..r.as_ref().column_count())

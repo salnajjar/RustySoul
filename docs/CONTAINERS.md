@@ -1,6 +1,6 @@
 # Container deployment
 
-Public beta image: `ghcr.io/salnajjar/rustysoul:beta`; pin a version such as `:0.1.0-beta.1` for reproducible upgrades. Published binaries currently target Linux amd64. Docker Engine with Compose and rootless/rootful Podman are supported deployment options. See the repository README for first sign-in and account setup.
+Public beta image: `ghcr.io/salnajjar/rustysoul:beta`; pin a version such as `:0.1.0-beta.2` for reproducible upgrades. Published binaries currently target Linux amd64. Docker Engine with Compose and rootless/rootful Podman are supported deployment options. See the repository README for first sign-in and account setup.
 
 `compose.yaml` uses host networking. `compose.bridge.yaml` publishes loopback HTTP and the selected TCP transfer port. For bridge mode:
 

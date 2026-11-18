@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import InstallApp from "./InstallApp";
 export type Theme = "original" | "light" | "dark" | "system";
 export interface Preferences {
   theme: Theme;
@@ -36,6 +37,16 @@ export function usePreferences() {
       document.documentElement.dataset.theme = theme;
       document.documentElement.style.colorScheme =
         theme === "dark" ? "dark" : "light";
+      document
+        .querySelector('meta[name="theme-color"]')
+        ?.setAttribute(
+          "content",
+          theme === "dark"
+            ? "#13191f"
+            : theme === "light"
+              ? "#f4f6f8"
+              : "#3d6546",
+        );
     };
     apply();
     media?.addEventListener("change", apply);
@@ -84,6 +95,7 @@ export default function Appearance({
           Library update progress always remains visible in File locations &
           local library.
         </p>
+        <InstallApp />
       </div>
     </section>
   );

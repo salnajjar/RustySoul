@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { AudioLines, ChevronRight, ShieldCheck } from "lucide-react";
+import { ChevronRight, ShieldCheck } from "lucide-react";
 import { api } from "./api";
 import SystemMessage from "./SystemMessage";
 export interface Access {
@@ -36,9 +36,13 @@ export function LoginScreen({
     <div className="login-screen">
       <div className="login-decoration" />
       <form className="login-panel" onSubmit={submit}>
-        <span className="brand-icon">
-          <AudioLines size={32} />
-        </span>
+        <img
+          className="brand-icon"
+          src="/assets/icons/rustysoul.svg"
+          width="55"
+          height="55"
+          alt=""
+        />
         <span className="eyebrow">YOUR MUSIC. YOUR SERVER.</span>
         <h1>Welcome to RustySoul.</h1>
         <p>Sign in to your workspace.</p>

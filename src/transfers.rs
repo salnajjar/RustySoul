@@ -39,13 +39,15 @@ pub fn record_upload(db: &Connection, t: &TransferView) -> Result<bool> {
 }
 /// An unopened retry has unknown progress, so it must not erase saved bytes.
 /// Known zero from a newly opened/truncated partial must reset them.
+/// Queue status stays owned by save_downloads; progress captures only the first
+/// observed active timestamp, so accounting cannot overwrite scheduling state.
 pub fn record_download(db: &Connection, t: &TransferView, progress: Option<u64>) -> Result<bool> {
     let speed = if t.status == "downloading" {
         t.speed
     } else {
         0.
     };
-    Ok(db.execute("UPDATE downloads SET transferred=COALESCE(?1,transferred),speed=?2,queue_position=?3,updated_at=strftime('%s','now') WHERE username=?4 AND path=?5 AND (transferred<>COALESCE(?1,transferred) OR speed<>?2 OR queue_position IS NOT ?3)",params![progress.map(|bytes| bytes.min(t.size) as i64),speed,t.queue_position,t.username,t.path])?>0)
+    Ok(db.execute("UPDATE downloads SET transferred=COALESCE(?1,transferred),speed=?2,queue_position=?3,started_at=CASE WHEN ?6='downloading' THEN COALESCE(started_at,CAST(strftime('%s','now') AS INTEGER)) ELSE started_at END,updated_at=strftime('%s','now') WHERE username=?4 AND path=?5 AND (transferred<>COALESCE(?1,transferred) OR speed<>?2 OR queue_position IS NOT ?3 OR (?6='downloading' AND started_at IS NULL))",params![progress.map(|bytes| bytes.min(t.size) as i64),speed,t.queue_position,t.username,t.path,t.status])?>0)
 }
 pub fn clear_uploads(db: &Connection, status: &HistoryStatus) -> Result<usize> {
     let status = match status {
@@ -61,9 +63,13 @@ pub fn clear_uploads(db: &Connection, status: &HistoryStatus) -> Result<usize> {
 }
 pub fn recover_uploads(db: &Connection) -> Result<()> {
     db.execute(
-        "UPDATE uploads SET status='interrupted',speed=0 WHERE status IN ('queued','uploading')",
+        "UPDATE uploads SET status='interrupted',speed=0,finished_at=CASE WHEN started_at IS NOT NULL THEN MAX(started_at,updated_at) END WHERE status IN ('queued','uploading','checking_shares')",
         [],
     )?;
+    Ok(())
+}
+pub fn recover_downloads(db: &Connection) -> Result<()> {
+    db.execute("UPDATE downloads SET status='interrupted',speed=0,finished_at=CASE WHEN started_at IS NOT NULL THEN MAX(started_at,updated_at) END WHERE status IN ('queued','downloading','finalizing')", [])?;
     Ok(())
 }
 #[derive(Deserialize)]
@@ -207,7 +213,7 @@ pub fn page(db: &Connection, kind: &str, q: &Query) -> Result<Page> {
     let sql = if q.group_users {
         let comma = if cte.is_empty() { "WITH " } else { "," };
         format!(
-            "{cte}{comma}matched AS MATERIALIZED (SELECT *,ROW_NUMBER() OVER (ORDER BY {order},username,path) position FROM {kind} WHERE {where_clause}), user_groups AS (SELECT username,MIN(position) first_position,COUNT(*) files FROM matched GROUP BY username), boundaries AS (SELECT *,COALESCE(SUM(files) OVER (ORDER BY first_position ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),0) start FROM user_groups), selected AS (SELECT username,first_position FROM boundaries WHERE start>=?3 AND start<?3+?4) SELECT username,path,size,CASE WHEN status='completed' THEN size ELSE transferred END,speed,status,queue_position,added_at,updated_at,{},{},{} FROM matched JOIN selected USING(username) ORDER BY first_position,position",
+            "{cte}{comma}matched AS MATERIALIZED (SELECT *,ROW_NUMBER() OVER (ORDER BY {order},username,path) position FROM {kind} WHERE {where_clause}), user_groups AS (SELECT username,MIN(position) first_position,COUNT(*) files FROM matched GROUP BY username), boundaries AS (SELECT *,COALESCE(SUM(files) OVER (ORDER BY first_position ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),0) start FROM user_groups), selected AS (SELECT username,first_position FROM boundaries WHERE start>=?3 AND start<?3+?4) SELECT username,path,size,CASE WHEN status='completed' THEN size ELSE transferred END,speed,status,queue_position,added_at,updated_at,started_at,finished_at,{},{},{} FROM matched JOIN selected USING(username) ORDER BY first_position,position",
             if kind == "downloads" {
                 "local_path"
             } else {
@@ -222,7 +228,7 @@ pub fn page(db: &Connection, kind: &str, q: &Query) -> Result<Page> {
         )
     } else {
         format!(
-            "{cte}SELECT username,path,size,CASE WHEN status='completed' THEN size ELSE transferred END,speed,status,queue_position,added_at,updated_at,{},{},{} FROM {kind} WHERE {where_clause} ORDER BY {order},username,path LIMIT ?4 OFFSET ?3",
+            "{cte}SELECT username,path,size,CASE WHEN status='completed' THEN size ELSE transferred END,speed,status,queue_position,added_at,updated_at,started_at,finished_at,{},{},{} FROM {kind} WHERE {where_clause} ORDER BY {order},username,path LIMIT ?4 OFFSET ?3",
             if kind == "downloads" {
                 "local_path"
             } else {
@@ -267,10 +273,12 @@ pub fn page(db: &Connection, kind: &str, q: &Query) -> Result<Page> {
                     },
                     added_at: r.get::<_, i64>(7)? as u64,
                     updated_at: r.get::<_, i64>(8)? as u64,
-                    local_path: r.get(9)?,
-                    detail: r.get(10)?,
-                    priority: r.get(11)?,
-                    local_queue_order: r.get::<_, i64>(12)? as u64,
+                    started_at: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                    finished_at: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                    local_path: r.get(11)?,
+                    detail: r.get(12)?,
+                    priority: r.get(13)?,
+                    local_queue_order: r.get::<_, i64>(14)? as u64,
                 })
             },
         )?

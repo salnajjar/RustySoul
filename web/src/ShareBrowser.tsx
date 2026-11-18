@@ -5,6 +5,7 @@ import { api } from "./api";
 import GroupedResults from "./GroupedResults";
 import User, { UserStatus } from "./User";
 import FolderTree from "./FolderTree";
+import ShareLayout from "./ShareLayout";
 import type { FileSort } from "./results";
 import { useSelection, fileIdentity, accepted } from "./WorkspaceState";
 type Page = {
@@ -316,33 +317,36 @@ export default function ShareBrowser({
           {listing.error && <p role="alert">{listing.error}</p>}
           {error && <p role="alert">{error}</p>}
           {!listing.pending && (
-            <div className="share-layout">
-              <aside className="share-folders">
-                <h3>Folders</h3>
-                <input
-                  aria-label="Filter share folders"
-                  placeholder="Find a folder…"
-                  value={folderFilter}
-                  onChange={(e) => {
-                    setFolderFilter(e.target.value);
-                  }}
-                />
-                <FolderTree
-                  selectedFiles={[...selection.values()].filter(
-                    (f) => f.username === selected,
-                  )}
-                  selectFiles={self ? undefined : selectTreeFolder}
-                  token={token}
-                  username={selected}
-                  revision={listing.revision || 0}
-                  filter={folderFilter}
-                  selected={folder}
-                  select={(path) => {
-                    setFolder(path);
-                    setOffset(0);
-                  }}
-                />
-              </aside>
+            <ShareLayout
+              folders={
+                <aside className="share-folders" id="share-folders-pane">
+                  <h3>Folders</h3>
+                  <input
+                    aria-label="Filter share folders"
+                    placeholder="Find a folder…"
+                    value={folderFilter}
+                    onChange={(e) => {
+                      setFolderFilter(e.target.value);
+                    }}
+                  />
+                  <FolderTree
+                    selectedFiles={[...selection.values()].filter(
+                      (f) => f.username === selected,
+                    )}
+                    selectFiles={self ? undefined : selectTreeFolder}
+                    token={token}
+                    username={selected}
+                    revision={listing.revision || 0}
+                    filter={folderFilter}
+                    selected={folder}
+                    select={(path) => {
+                      setFolder(path);
+                      setOffset(0);
+                    }}
+                  />
+                </aside>
+              }
+            >
               <div className="share-files">
                 <label>
                   Filter files
@@ -413,7 +417,7 @@ export default function ShareBrowser({
                 }
                 {pager(files, setOffset)}
               </div>
-            </div>
+            </ShareLayout>
           )}
         </section>
       )}

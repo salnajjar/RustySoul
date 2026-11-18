@@ -1,0 +1,21 @@
+{
+  "id": "/",
+  "name": "RustySoul",
+  "short_name": "RustySoul",
+  "description": "Your Soulseek workspace. Search, share and manage your music from your own server.",
+  "lang": "en",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#3d6546",
+  "background_color": "#f8f9f6",
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "/assets/icons/rustysoul.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

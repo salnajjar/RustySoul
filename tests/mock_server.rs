@@ -94,9 +94,16 @@ fn wait_for(
         }
         assert!(
             Instant::now() < deadline,
-            "Timed out waiting for daemon state: {} {:?}",
+            "Timed out waiting for daemon state: {} {:?}; transfers: {:?}",
             handle.snapshot.borrow().connection,
-            handle.snapshot.borrow().error
+            handle.snapshot.borrow().error,
+            handle
+                .snapshot
+                .borrow()
+                .downloads
+                .iter()
+                .map(|t| (&t.username, &t.path, &t.status))
+                .collect::<Vec<_>>()
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -733,6 +740,50 @@ fn login_search_messages_and_room_list_use_reference_wire_format() {
     handle.stop.send(()).unwrap();
     handle.thread.join().unwrap();
     server.join().unwrap();
+    // Wire-received, locally sent, and echoed room messages remain after the
+    // daemon stops; the live preview is not the permanent history.
+    let history_db = rusqlite::Connection::open(dir.path().join("rustysoul.sqlite3")).unwrap();
+    let private_history = rustysoul::messages::page(
+        &history_db,
+        &rustysoul::messages::Query {
+            target: "fixture-peer".into(),
+            private: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        private_history
+            .messages
+            .iter()
+            .any(|m| m.username == "fixture-peer")
+    );
+    assert!(
+        private_history
+            .messages
+            .iter()
+            .any(|m| m.text == "Fixture private message 👍🏾 🎶")
+    );
+    let room_history = rustysoul::messages::page(
+        &history_db,
+        &rustysoul::messages::Query {
+            target: "Fixture room".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        room_history
+            .messages
+            .iter()
+            .any(|m| m.text == "New room activity")
+    );
+    assert!(
+        room_history
+            .messages
+            .iter()
+            .any(|m| m.text == "Fixture room message 🎵 👩🏽‍🎤 ❤️ 🇬🇧")
+    );
     let store = rustysoul::store::Store::open(&dir.path().join("rustysoul.sqlite3")).unwrap();
     let stats = rustysoul::traffic::totals(
         &rusqlite::Connection::open(dir.path().join("rustysoul.sqlite3")).unwrap(),

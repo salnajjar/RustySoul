@@ -1,10 +1,10 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { ChevronRight, ChevronDown, FolderOpen } from "lucide-react";
 import { api } from "./api";
 import type { FileResult } from "./types";
-import LoadMore from "./LoadMore";
 type Folder = {
   path: string;
+  parent?: string;
   name: string;
   files: number;
   direct_files: number;
@@ -24,6 +24,63 @@ type TreeProps = {
   selectFiles?: (path: string, checked: boolean) => void;
 };
 export default function FolderTree(props: TreeProps) {
+  const key = JSON.stringify([props.username, props.revision]);
+  const [retry, setRetry] = useState(0);
+  const [data, setData] = useState<{
+    key: string;
+    folders: Folder[];
+    loading: boolean;
+    error: string;
+  }>({ key: "", folders: [], loading: true, error: "" });
+  useEffect(() => {
+    const abort = new AbortController();
+    setData({ key, folders: [], loading: true, error: "" });
+    const q = new URLSearchParams({ username: props.username, all: "true" });
+    api<Page>(props.token, `browse/tree?${q}`, undefined, abort.signal)
+      .then((page) => {
+        if (abort.signal.aborted) return;
+        if (page.folders.length !== page.total)
+          throw Error(
+            "The complete folder tree was not returned. Refresh the library and retry.",
+          );
+        setData({ key, folders: page.folders, loading: false, error: "" });
+      })
+      .catch((e) => {
+        if (!abort.signal.aborted)
+          setData({ key, folders: [], loading: false, error: e.message });
+      });
+    return () => abort.abort();
+  }, [key, props.username, props.token, retry]);
+  const foldersByParent = useMemo(() => {
+    const folders = data.key === key ? data.folders : [];
+    const parent = (folder: Folder) =>
+      folder.parent ??
+      (folder.path.includes("\\")
+        ? folder.path.slice(0, folder.path.lastIndexOf("\\"))
+        : "");
+    const byPath = new Map(folders.map((folder) => [folder.path, folder]));
+    const query = props.filter.trim().toLowerCase();
+    const visible = new Set<string>();
+    if (query)
+      for (const folder of folders) {
+        if (!folder.path.toLowerCase().includes(query)) continue;
+        let current: Folder | undefined = folder;
+        while (current && !visible.has(current.path)) {
+          visible.add(current.path);
+          current = byPath.get(parent(current));
+        }
+      }
+    const result = new Map<string, Folder[]>();
+    for (const folder of folders) {
+      if (query && !visible.has(folder.path)) continue;
+      const name = parent(folder);
+      const siblings = result.get(name) ?? [];
+      siblings.push(folder);
+      result.set(name, siblings);
+    }
+    return result;
+  }, [data.key, data.folders, key, props.filter]);
+
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [allExpanded, setAllExpanded] = useState(false);
   const [pendingSelection, setPendingSelection] = useState<
@@ -43,7 +100,7 @@ export default function FolderTree(props: TreeProps) {
   }
   useEffect(() => {
     setExpanded(new Set());
-    setAllExpanded(false);
+    setAllExpanded(!!props.filter.trim());
   }, [props.username, props.filter]);
   const isExpanded = (path: string) =>
     allExpanded ? !expanded.has(path) : expanded.has(path);
@@ -55,7 +112,7 @@ export default function FolderTree(props: TreeProps) {
       return next;
     });
   return (
-    <div className="folder-tree">
+    <div className="folder-tree" aria-busy={data.key !== key || data.loading}>
       <div className="button-row">
         <button
           className="button small secondary"
@@ -116,17 +173,37 @@ export default function FolderTree(props: TreeProps) {
           parent=""
           isExpanded={isExpanded}
           allExpanded={allExpanded}
+          foldersByParent={foldersByParent}
           toggle={toggle}
           pendingSelection={pendingSelection}
           chooseFiles={chooseFiles}
         />
       </ul>
+      {(data.key !== key || data.loading) && (
+        <p role="status" className="hint">
+          Loading all folders…
+        </p>
+      )}
+      {data.key === key && data.error && (
+        <>
+          <p role="alert">{data.error}</p>
+          <button className="text-link" onClick={() => setRetry((n) => n + 1)}>
+            Retry
+          </button>
+        </>
+      )}
+      {data.key === key && !data.loading && !data.error && (
+        <p className="hint">
+          {data.folders.length.toLocaleString()} folders loaded
+        </p>
+      )}
     </div>
   );
 }
 function Children(
   props: TreeProps & {
     parent: string;
+    foldersByParent: Map<string, Folder[]>;
     isExpanded: (path: string) => boolean;
     allExpanded: boolean;
     pendingSelection: Map<string, boolean>;
@@ -134,80 +211,9 @@ function Children(
     toggle: (path: string) => void;
   },
 ) {
-  const marker = useRef<HTMLLIElement>(null);
-  const [ready, setReady] = useState(!props.allExpanded || !props.parent);
-  useEffect(() => {
-    if (ready) return;
-    if (!props.allExpanded || typeof IntersectionObserver === "undefined") {
-      setReady(true);
-      return;
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setReady(true);
-          observer.disconnect();
-        }
-      },
-      { rootMargin: "300px" },
-    );
-    if (marker.current) observer.observe(marker.current);
-    return () => observer.disconnect();
-  }, [ready, props.allExpanded]);
-  const [data, setData] = useState<Page>({ folders: [], offset: 0, total: 0 });
-  const [offset, setOffset] = useState(0);
-  const [retry, setRetry] = useState(0);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  useEffect(() => {
-    setOffset(0);
-    setData({ folders: [], total: 0, offset: 0 });
-  }, [props.username, props.parent, props.filter, props.revision]);
-  useEffect(() => {
-    if (!ready) return;
-    const abort = new AbortController();
-    setLoading(true);
-    setError("");
-    const q = new URLSearchParams({
-      username: props.username,
-      parent: props.parent,
-      filter: props.filter,
-      offset: String(offset),
-    });
-    api<Page>(props.token, `browse/tree?${q}`, undefined, abort.signal)
-      .then((page) => {
-        if (!abort.signal.aborted)
-          setData((old) => ({
-            ...page,
-            folders: offset ? [...old.folders, ...page.folders] : page.folders,
-          }));
-      })
-      .catch((e) => {
-        if (!abort.signal.aborted) setError(e.message);
-      })
-      .finally(() => {
-        if (!abort.signal.aborted) setLoading(false);
-      });
-    return () => abort.abort();
-  }, [
-    ready,
-    props.token,
-    props.username,
-    props.parent,
-    props.filter,
-    props.revision,
-    offset,
-    retry,
-  ]);
-  if (!ready)
-    return (
-      <li role="none" ref={marker}>
-        <span className="hint">Folders load as you scroll…</span>
-      </li>
-    );
   return (
     <>
-      {data.folders.map((folder) => (
+      {(props.foldersByParent.get(props.parent) ?? []).map((folder) => (
         <li
           role="treeitem"
           key={folder.path}
@@ -282,42 +288,6 @@ function Children(
           )}
         </li>
       ))}
-      {loading && (
-        <li role="none">
-          <span role="status" className="hint">
-            Loading folders…
-          </span>
-        </li>
-      )}
-      {error && (
-        <li role="none">
-          <p role="alert">{error}</p>
-          <button className="text-link" onClick={() => setRetry((n) => n + 1)}>
-            Retry
-          </button>
-        </li>
-      )}
-      {!loading && data.folders.length < data.total && (
-        <li role="none">
-          {props.allExpanded ? (
-            <LoadMore
-              loading={loading}
-              trigger={data.folders.length}
-              load={() => setOffset((n) => n + 100)}
-            >
-              Load more folders
-            </LoadMore>
-          ) : (
-            <button
-              className="button small secondary"
-              onClick={() => setOffset((n) => n + 100)}
-            >
-              Load more folders ({data.folders.length}/
-              {data.total.toLocaleString()})
-            </button>
-          )}
-        </li>
-      )}
     </>
   );
 }

@@ -1,6 +1,314 @@
 import { test, expect, type Page } from "@playwright/test";
 import { emptySnapshot, type Snapshot, type RoomSummary } from "../src/types";
 
+test.beforeEach(async ({ page }) => {
+  // These UI tests run without a daemon. Per-test routes registered later can
+  // override these two baseline responses with their own session/history data.
+  await page.route("**/api/v1/auth/me", (route) =>
+    route.fulfill({ status: 401, json: { error: "Sign in" } }),
+  );
+  await page.route(
+    /\/api\/v1\/transfers\/uploads\?status=blocked&order=updated$/,
+    (route) => route.fulfill({ json: { transfers: [], total: 0 } }),
+  );
+});
+
+test("web app manifest, branded icons and installation controls work together", async ({
+  page,
+}) => {
+  await fixture(page, emptySnapshot);
+  const response = await page.request.get("/site.webmanifest");
+  expect(response.ok()).toBe(true);
+  const manifest = await response.json();
+  expect(manifest).toMatchObject({
+    id: "/",
+    name: "RustySoul",
+    start_url: "/",
+    scope: "/",
+    display: "standalone",
+  });
+  expect(manifest.icons).toEqual([
+    {
+      src: "/assets/icons/rustysoul.svg",
+      sizes: "any",
+      type: "image/svg+xml",
+      purpose: "any",
+    },
+  ]);
+  const session = await page.context().newCDPSession(page);
+  const parsed = await session.send("Page.getAppManifest");
+  expect(parsed.errors).toEqual([]);
+  expect(parsed.url).toContain("/site.webmanifest");
+  const iconResponse = await page.request.get(manifest.icons[0].src);
+  expect(iconResponse.headers()["content-type"]).toContain("image/svg+xml");
+  const pixels = await page.evaluate(async (src) => {
+    const icon = new Image();
+    icon.src = src;
+    await icon.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 40;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(icon, 0, 0, 40, 40);
+    const pixel = (x: number, y: number) => [
+      ...ctx.getImageData(x, y, 1, 1).data,
+    ];
+    return {
+      width: icon.naturalWidth,
+      height: icon.naturalHeight,
+      corner: pixel(0, 0),
+      background: pixel(4, 20),
+      waveform: pixel(17, 20),
+    };
+  }, manifest.icons[0].src);
+  expect(pixels).toEqual({
+    width: 512,
+    height: 512,
+    corner: [0, 0, 0, 0],
+    background: [52, 67, 50, 255],
+    waveform: [215, 231, 174, 255],
+  });
+  for (const rel of ["icon", "apple-touch-icon"]) {
+    await expect(page.locator(`link[rel="${rel}"]`)).toHaveAttribute(
+      "href",
+      "/assets/icons/rustysoul.svg",
+    );
+    await expect(page.locator(`link[rel="${rel}"]`)).toHaveAttribute(
+      "type",
+      "image/svg+xml",
+    );
+    await expect(page.locator(`link[rel="${rel}"]`)).toHaveAttribute(
+      "sizes",
+      "any",
+    );
+  }
+  await expect(page.locator(".brand-icon")).toHaveAttribute(
+    "src",
+    "/assets/icons/rustysoul.svg",
+  );
+  await page.evaluate(() => {
+    const win = window as Window & { fixtureInstallPrompts?: number };
+    win.fixtureInstallPrompts = 0;
+    const event = Object.assign(
+      new Event("beforeinstallprompt", { cancelable: true }),
+      {
+        prompt: async () => {
+          win.fixtureInstallPrompts! += 1;
+        },
+        userChoice: Promise.resolve({ outcome: "dismissed" }),
+      },
+    );
+    window.dispatchEvent(event);
+  });
+  await page
+    .getByRole("button", { name: "Open settings", exact: true })
+    .click();
+  await page.getByRole("tab", { name: "Appearance", exact: true }).click();
+  const installButton = page.getByRole("button", {
+    name: "Install RustySoul",
+    exact: true,
+  });
+  await installButton.scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: `../artifacts/pwa-install-${test.info().project.name}.png`,
+    fullPage: false,
+  });
+  await installButton.click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as Window & { fixtureInstallPrompts?: number })
+          .fixtureInstallPrompts,
+    ),
+  ).toBe(1);
+  await expect(
+    page.getByRole("button", { name: "Install RustySoul", exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByText(/On iPhone or iPad, open Safari/)).toBeVisible();
+  await page.getByLabel("Theme", { exact: true }).selectOption("dark");
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute(
+    "content",
+    "#13191f",
+  );
+  await page.getByLabel("Theme", { exact: true }).selectOption("original");
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute(
+    "content",
+    "#3d6546",
+  );
+  await page.evaluate(() => window.dispatchEvent(new Event("appinstalled")));
+  await expect(
+    page.getByText("RustySoul is installed on this device."),
+  ).toBeVisible();
+});
+
+for (const privateChat of [true, false]) {
+  test(`${privateChat ? "private chat" : "room"} history survives reopening and refresh until explicitly deleted`, async ({
+    page,
+  }) => {
+    const target = privateChat ? "archived-peer" : "Closed room";
+    let revision = 1,
+      reset = 0;
+    let saved = Array.from({ length: 301 }, (_, i) => ({
+      id: i + 1,
+      target,
+      username: "self",
+      text: `saved message ${String(i + 1).padStart(3, "0")}`,
+      private: privateChat,
+      timestamp: 1700000000 + i,
+    }));
+    const snapshot = (): Snapshot => ({
+      ...emptySnapshot,
+      message_revision: revision,
+      message_reset: reset,
+      messages: [],
+      username: "self",
+    });
+    await fixture(page, snapshot(), true);
+    await page.route("**/api/v1/messages/conversations", (r) =>
+      r.fulfill({
+        json: [
+          { target: "other", private: true },
+          ...(saved.length ? [{ target, private: privateChat }] : []),
+        ],
+      }),
+    );
+    await page.route("**/api/v1/messages?**", (r) => {
+      const q = new URL(r.request().url()).searchParams;
+      const ascending = q.has("after_id");
+      let rows = saved.filter(
+        (m) =>
+          m.target === q.get("target") &&
+          String(m.private) === q.get("private") &&
+          (!q.has("before_id") || m.id < Number(q.get("before_id"))) &&
+          (!ascending || m.id > Number(q.get("after_id"))),
+      );
+      const more = rows.length > 100;
+      rows = ascending ? rows.slice(0, 100) : rows.slice(-100);
+      return r.fulfill({ json: { messages: rows, has_more: more } });
+    });
+    const commands: object[] = [];
+    await page.route("**/api/v1/commands", async (r) => {
+      const command = r.request().postDataJSON();
+      if (command.type === "clear_message_history") {
+        commands.push(command);
+        saved = saved.filter(
+          (m) => m.target !== command.target || m.private !== command.private,
+        );
+        revision++;
+        reset++;
+      }
+      await r.fulfill({ json: { status: "queued" } });
+      if (command.type === "clear_message_history")
+        await page.evaluate(
+          (s) =>
+            (
+              window as unknown as { pushFixtureState: (s: Snapshot) => void }
+            ).pushFixtureState(s),
+          snapshot(),
+        );
+    });
+    const open = async () => {
+      await page
+        .getByRole("button", {
+          name: privateChat ? "Messages" : "Rooms",
+          exact: true,
+        })
+        .click();
+      if (privateChat)
+        await page
+          .getByRole("button", { name: `Open conversation with ${target}` })
+          .click();
+      else {
+        const archive = page.locator("details").filter({
+          has: page.locator("summary", { hasText: "Saved room history" }),
+        });
+        await expect(archive).toBeVisible();
+        if (!(await archive.evaluate((el) => (el as HTMLDetailsElement).open)))
+          await archive.locator("summary").click();
+        await archive
+          .getByRole("button", { name: target, exact: true })
+          .click();
+      }
+    };
+    await open();
+    const log = page.getByRole("log", { name: "Conversation" });
+    await expect(log).toContainText("saved message 301");
+    for (let i = 0; i < 3; i++) {
+      const older = page.getByRole("button", {
+        name: "Load older messages",
+        exact: true,
+      });
+      await expect(older).toBeEnabled();
+      await older.click();
+      await expect(log).toContainText(
+        `saved message ${i === 0 ? "102" : i === 1 ? "002" : "001"}`,
+      );
+    }
+    if (privateChat)
+      await page
+        .getByRole("button", { name: "Close chat", exact: true })
+        .click();
+    else
+      await page.getByRole("button", { name: "Search", exact: true }).click();
+    await open();
+    await expect(log).toContainText("saved message 301");
+    await page.reload();
+    await open();
+    await expect(log).toContainText("saved message 301");
+    const newMessage = {
+      id: 1001,
+      target,
+      username: privateChat ? target : "room-peer",
+      text: "new arrival with saved history",
+      private: privateChat,
+      timestamp: 1700002000,
+    };
+    saved.push(newMessage);
+    revision++;
+    await page.evaluate(
+      (s) =>
+        (
+          window as unknown as { pushFixtureState: (s: Snapshot) => void }
+        ).pushFixtureState(s),
+      { ...snapshot(), messages: [newMessage] },
+    );
+    await expect(log).toContainText("new arrival with saved history");
+    await expect(log).toContainText("saved message 301");
+    await page
+      .getByRole("button", { name: "Delete history", exact: true })
+      .click();
+    await page
+      .getByRole("alertdialog")
+      .getByRole("button", { name: "Cancel", exact: true })
+      .click();
+    expect(commands).toHaveLength(0);
+    await page
+      .getByRole("button", { name: "Delete history", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Delete history permanently", exact: true })
+      .click();
+    await expect(log).not.toContainText("saved message");
+    await expect(log).not.toContainText("new arrival");
+    expect(commands).toEqual([
+      { type: "clear_message_history", target, private: privateChat },
+    ]);
+    await page.reload();
+    await page
+      .getByRole("button", {
+        name: privateChat ? "Messages" : "Rooms",
+        exact: true,
+      })
+      .click();
+    if (privateChat) {
+      await page.getByLabel("Message username", { exact: true }).fill(target);
+      await expect(log).not.toContainText("saved message");
+    } else
+      await expect(
+        page.getByText("Saved room history", { exact: true }),
+      ).toHaveCount(0);
+  });
+}
+
 const roomSummary = (change: Partial<RoomSummary> = {}): RoomSummary => ({
   private: true,
   owner: "fixture-self",
@@ -21,6 +329,178 @@ const roomSummary = (change: Partial<RoomSummary> = {}): RoomSummary => ({
   pending: null,
   error: null,
   ...change,
+});
+
+for (const paged of [false, true]) {
+  test(`transfer header speeds use a five-second average (${paged ? "full history" : "preview"})`, async ({
+    page,
+  }) => {
+    const now = Date.parse("2026-11-18T12:00:00Z");
+    await page.clock.install({ time: new Date(now - 60000) });
+    let rate = 100 * 1024;
+    let revision = 1;
+    const file = (uploads: boolean, speed: number) => ({
+      username: "alice",
+      path: "Album/active.flac",
+      size: 1024 ** 3,
+      transferred: 100,
+      speed,
+      status: uploads ? "uploading" : "downloading",
+      queue_position: null,
+    });
+    const snapshot = (): Snapshot => ({
+      ...emptySnapshot,
+      transfer_revision: revision,
+      ...(paged ? { downloads_total: 1, uploads_total: 1 } : {}),
+      // In full-history mode the preview may be older than the complete summary.
+      downloads: [file(false, paged ? 10 * 1024 : rate)],
+      uploads: [file(true, paged ? 10 * 1024 : rate)],
+    });
+    await fixture(page, snapshot());
+    if (paged)
+      await page.route(/\/api\/v1\/transfers\/(downloads|uploads)\?/, (route) =>
+        route.fulfill({
+          json: {
+            transfers: [
+              file(route.request().url().includes("/uploads?"), rate),
+            ],
+            total: 1,
+            offset: 0,
+            next_offset: 1,
+            summary: { total: 1, active: 1, speed: rate, clearable: {} },
+          },
+        }),
+      );
+    await page.clock.pauseAt(new Date(now));
+    for (const direction of ["Downloads", "Uploads"]) {
+      rate = 100 * 1024;
+      revision++;
+      await page.evaluate(
+        (s) =>
+          (
+            window as unknown as { pushFixtureState: (s: Snapshot) => void }
+          ).pushFixtureState(s),
+        snapshot(),
+      );
+      await page.getByRole("button", { name: direction, exact: true }).click();
+      const speed = page.getByTitle(
+        "Average transfer speed over the last 5 seconds",
+      );
+      await expect(speed).toHaveText("100 KiB/s");
+      await page.clock.runFor(4000);
+      rate = 500 * 1024;
+      revision++;
+      await page.evaluate(
+        (s) =>
+          (
+            window as unknown as { pushFixtureState: (s: Snapshot) => void }
+          ).pushFixtureState(s),
+        snapshot(),
+      );
+      if (paged) await page.clock.runFor(2000);
+      await expect(page.locator(".transfer-row")).toContainText("500 KiB/s");
+      await expect(speed).toHaveText("100 KiB/s");
+      await page.clock.runFor(1000);
+      await expect(speed).toHaveText("180 KiB/s");
+      rate = 0;
+      revision++;
+      await page.evaluate(
+        (s) =>
+          (
+            window as unknown as { pushFixtureState: (s: Snapshot) => void }
+          ).pushFixtureState(s),
+        snapshot(),
+      );
+      if (paged) await page.clock.runFor(2000);
+      await expect(page.locator(".transfer-row")).toContainText("0 B/s");
+      await page.clock.runFor(5000);
+      await expect(speed).toHaveText("0 B/s");
+    }
+  });
+}
+
+test("upload and download rows show start dates, tick elapsed time and retain final totals", async ({
+  page,
+}) => {
+  const started = 1795000000;
+  const now = (started + 65) * 1000;
+  await page.clock.install({ time: new Date(now - 60000) });
+  const row = (status: string, name: string) => ({
+    username: "alice",
+    path: `Album/${name}.flac`,
+    size: 100,
+    transferred: status === "completed" ? 100 : 50,
+    speed: 10,
+    status,
+    queue_position: null,
+    started_at: started,
+    finished_at: status === "completed" ? started + 22 : null,
+  });
+  const state: Snapshot = {
+    ...emptySnapshot,
+    downloads: [
+      row("downloading", "download-active"),
+      row("completed", "download-done"),
+    ],
+    uploads: [
+      row("uploading", "upload-active"),
+      row("completed", "upload-done"),
+    ],
+  };
+  await fixture(page, state);
+  await page.clock.pauseAt(new Date(now));
+  for (const direction of ["uploads", "downloads"] as const) {
+    await page.clock.setSystemTime(new Date(now));
+    await page
+      .getByRole("button", {
+        name: direction === "uploads" ? "Uploads" : "Downloads",
+        exact: true,
+      })
+      .click();
+    const prefix = direction === "uploads" ? "upload" : "download";
+    const active = page.locator(".transfer-row").filter({
+      has: page.getByText(`${prefix}-active.flac`, { exact: true }),
+    });
+    const complete = page
+      .locator(".transfer-row")
+      .filter({ has: page.getByText(`${prefix}-done.flac`, { exact: true }) });
+    await expect(active.locator("time")).toHaveAttribute(
+      "datetime",
+      new Date(started * 1000).toISOString(),
+    );
+    await expect(active).toContainText("Elapsed 00:01:05");
+    await expect(complete).toContainText("Total time 00:00:22");
+    await page.clock.runFor(3000);
+    await expect(active).toContainText("Elapsed 00:01:08");
+    const finished = state[direction].map((file, index) =>
+      index
+        ? file
+        : {
+            ...file,
+            status: direction === "uploads" ? "cancelled" : "timed_out",
+            speed: 0,
+            finished_at: started + 68,
+          },
+    );
+    await pushRoomState(page, { ...state, [direction]: finished });
+    await expect(active).toContainText("Total time 00:01:08");
+    await page.clock.runFor(5000);
+    await expect(active).toContainText("Total time 00:01:08");
+    await expect(complete).toContainText("Total time 00:00:22");
+    await active.scrollIntoViewIfNeeded();
+    await expect(
+      active.getByText("Total time 00:01:08", { exact: true }),
+    ).toBeVisible();
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    await page.screenshot({
+      path: `../artifacts/transfer-timing-${direction}-${test.info().project.name}.png`,
+      fullPage: false,
+    });
+  }
 });
 const roomState = (summary = roomSummary()): Snapshot => ({
   ...emptySnapshot,
@@ -1368,7 +1848,12 @@ test("infinite search scrolling passes 2500 files and retains selections and use
   // Move through the automatic sentinel; no manual page number or pagination action.
   for (let i = 0; i < 35 && !offsets.includes(3000); i++) {
     const footer = page.locator(".infinite-sentinel").last();
-    await footer.evaluate((el) => el.scrollIntoView({ block: "end" }));
+    // The final response can remove the marker after the loop condition is
+    // checked. Query and scroll atomically; result assertions below still wait
+    // for all pages, without waiting for a marker that no longer exists.
+    await footer.evaluateAll((elements) =>
+      elements[0]?.scrollIntoView({ block: "end" }),
+    );
     await page.waitForTimeout(300);
   }
   await expect.poll(() => offsets.includes(3000)).toBe(true);
@@ -1377,7 +1862,10 @@ test("infinite search scrolling passes 2500 files and retains selections and use
     exact: true,
   });
   for (let i = 0; i < 35 && (await last.count()) === 0; i++) {
-    await page.locator(".infinite-sentinel").last().scrollIntoViewIfNeeded();
+    await page
+      .locator(".infinite-sentinel")
+      .last()
+      .evaluateAll((elements) => elements[0]?.scrollIntoView({ block: "end" }));
     await page.waitForTimeout(100);
   }
   await last.check();
@@ -1489,6 +1977,165 @@ test("wishlist and sharing controls dispatch explicit persistent choices", async
   });
 });
 
+test("the complete share folder tree loads once without pagination", async ({
+  page,
+}) => {
+  await fixture(page, {
+    ...emptySnapshot,
+    username: "myself",
+    browse: {
+      myself: {
+        pending: false,
+        total: 2601,
+        files: [],
+        truncated: false,
+        revision: 1,
+      },
+    },
+  });
+  await page.route("**/api/v1/commands", (r) =>
+    r.fulfill({ json: { status: "queued" } }),
+  );
+  await page.route("**/api/v1/browse/files?**", (r) =>
+    r.fulfill({ json: { files: [], folders: [], total: 0, offset: 0 } }),
+  );
+  let requests = 0;
+  await page.route("**/api/v1/browse/tree?**", (r) => {
+    requests++;
+    const query = new URL(r.request().url()).searchParams;
+    expect(query.get("all")).toBe("true");
+    expect(query.has("offset")).toBe(false);
+    const folders = [
+      {
+        path: "Music",
+        parent: "",
+        name: "Music",
+        files: 2601,
+        direct_files: 0,
+        has_children: true,
+        subfolders: 2601,
+      },
+      ...Array.from({ length: 2601 }, (_, i) => ({
+        path: `Music\\Album ${String(i).padStart(4, "0")}`,
+        parent: "Music",
+        name: `Album ${String(i).padStart(4, "0")}`,
+        files: 1,
+        direct_files: 1,
+        has_children: false,
+        subfolders: 0,
+      })),
+    ];
+    return r.fulfill({ json: { folders, total: folders.length, offset: 0 } });
+  });
+  await page.getByRole("button", { name: "Browse users", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Browse my shares", exact: true })
+    .click();
+  const pane = page.locator(".share-folders");
+  await expect(pane).toContainText("2,602 folders loaded");
+  // React's development StrictMode can abort and restart the initial fetch.
+  // Expanding and filtering the loaded tree must not make any further requests.
+  const loadedRequests = requests;
+  await page
+    .getByRole("button", { name: "Expand all folders", exact: true })
+    .click();
+  await expect(page.getByRole("treeitem")).toHaveCount(2602);
+  const last = page.getByTitle("Music\\Album 2600", { exact: true });
+  await last.scrollIntoViewIfNeeded();
+  await expect(last).toBeVisible();
+  await page.getByLabel("Filter share folders").fill("Album 2600");
+  await expect(page.getByRole("treeitem")).toHaveCount(2);
+  await expect(last).toBeVisible();
+  await expect(page.getByTitle("Music", { exact: true })).toBeVisible();
+  await page.getByLabel("Filter share folders").fill("");
+  await expect(page.getByRole("treeitem")).toHaveCount(1);
+  await expect(
+    pane.getByRole("button", { name: /Load more|Next|Previous/ }),
+  ).toHaveCount(0);
+  expect(requests).toBe(loadedRequests);
+});
+
+test("share folder width is adjustable and remembered for every peer and refresh", async ({
+  page,
+}, info) => {
+  await fixture(
+    page,
+    {
+      ...emptySnapshot,
+      browse: Object.fromEntries(
+        ["alice", "bob"].map((username) => [
+          username,
+          {
+            pending: false,
+            total: 0,
+            files: [],
+            truncated: false,
+            revision: 1,
+          },
+        ]),
+      ),
+    },
+    true,
+  );
+  await page.route("**/api/v1/browse/files?**", (r) =>
+    r.fulfill({ json: { files: [], folders: [], total: 0, offset: 0 } }),
+  );
+  await page.getByRole("button", { name: "Browse users", exact: true }).click();
+  await page.getByRole("button", { name: /^alice Unknown$/ }).click();
+  const separator = page.getByRole("separator", {
+    name: "Resize folders pane",
+  });
+  const pane = page.locator(".share-folders");
+  if (info.project.name === "mobile") {
+    await expect(separator).toBeHidden();
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    await page.setViewportSize({ width: 1280, height: 900 });
+  }
+  await expect(separator).toBeVisible();
+  await expect(pane).toHaveCSS("width", "240px");
+  await separator.scrollIntoViewIfNeeded();
+  const handle = (await separator.boundingBox())!;
+  await page.mouse.move(handle.x + handle.width / 2, handle.y + 30);
+  await page.mouse.down();
+  await page.mouse.move(handle.x + handle.width / 2 + 100, handle.y + 30, {
+    steps: 10,
+  });
+  await page.mouse.up();
+  await expect(pane).toHaveCSS("width", "340px");
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem("rustysoul.shareFolders.width"),
+    ),
+  ).toBe("340");
+  await page.getByRole("button", { name: /^bob Unknown$/ }).click();
+  await expect(pane).toHaveCSS("width", "340px");
+  await page.reload();
+  await page.getByRole("button", { name: /^bob Unknown$/ }).click();
+  await expect(pane).toHaveCSS("width", "340px");
+  await separator.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(pane).toHaveCSS("width", "356px");
+  await page.setViewportSize({ width: 412, height: 915 });
+  await expect(separator).toBeHidden();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(pane).toHaveCSS("width", "356px");
+  await separator.dblclick();
+  await expect(pane).toHaveCSS("width", "240px");
+  await page.screenshot({
+    path: `../artifacts/share-pane-${info.project.name}.png`,
+    fullPage: true,
+  });
+});
+
 test("nested share folders expand and collapse independently", async ({
   page,
 }, info) => {
@@ -1513,28 +2160,49 @@ test("nested share folders expand and collapse independently", async ({
   );
   await fixture(page, state);
   await page.route("**/api/v1/browse/tree?**", (r) => {
-    const parent = new URL(r.request().url()).searchParams.get("parent");
-    const names =
-      parent === ""
-        ? ["Music"]
-        : parent === "Music"
-          ? ["Artist A", "Artist B"]
-          : parent === "Music\\Artist A"
-            ? ["Album One", "Album Two"]
-            : [];
-    return r.fulfill({
-      json: {
-        folders: names.map((name) => ({
-          name,
-          path: parent ? `${parent}\\${name}` : name,
-          files: 1000,
-          direct_files: 0,
-          has_children: parent === "" || parent === "Music",
-        })),
-        total: names.length,
-        offset: 0,
+    const folders = [
+      {
+        parent: "",
+        name: "Music",
+        path: "Music",
+        files: 4000,
+        direct_files: 0,
+        has_children: true,
       },
-    });
+      {
+        parent: "Music",
+        name: "Artist A",
+        path: "Music\\Artist A",
+        files: 2000,
+        direct_files: 0,
+        has_children: true,
+      },
+      {
+        parent: "Music",
+        name: "Artist B",
+        path: "Music\\Artist B",
+        files: 1000,
+        direct_files: 1000,
+        has_children: false,
+      },
+      {
+        parent: "Music\\Artist A",
+        name: "Album One",
+        path: "Music\\Artist A\\Album One",
+        files: 1000,
+        direct_files: 1000,
+        has_children: false,
+      },
+      {
+        parent: "Music\\Artist A",
+        name: "Album Two",
+        path: "Music\\Artist A\\Album Two",
+        files: 1000,
+        direct_files: 1000,
+        has_children: false,
+      },
+    ];
+    return r.fulfill({ json: { folders, total: folders.length, offset: 0 } });
   });
   await page.getByRole("button", { name: "Browse users", exact: true }).click();
   await page
@@ -3578,42 +4246,28 @@ test("share selections persist across filters and folders, include sizes, and cl
     },
   });
   await page.route("**/api/v1/browse/tree?**", (r) => {
-    const parent = new URL(r.request().url()).searchParams.get("parent");
-    const folders =
-      parent === ""
-        ? [
-            {
-              path: "Music",
-              name: "Music",
-              files: 2,
-              direct_files: 0,
-              has_children: true,
-              subfolders: 2,
-              direct_folders: 2,
-            },
-          ]
-        : parent === "Music"
-          ? [
-              {
-                path: "Music\\Album A",
-                name: "Album A",
-                files: 1,
-                direct_files: 1,
-                has_children: false,
-                subfolders: 0,
-                direct_folders: 0,
-              },
-              {
-                path: "Music\\Album B",
-                name: "Album B",
-                files: 1,
-                direct_files: 1,
-                has_children: false,
-                subfolders: 0,
-                direct_folders: 0,
-              },
-            ]
-          : [];
+    const folders = [
+      {
+        parent: "",
+        path: "Music",
+        name: "Music",
+        files: 2,
+        direct_files: 0,
+        has_children: true,
+        subfolders: 2,
+        direct_folders: 2,
+      },
+      ...["A", "B"].map((name) => ({
+        parent: "Music",
+        path: `Music\\Album ${name}`,
+        name: `Album ${name}`,
+        files: 1,
+        direct_files: 1,
+        has_children: false,
+        subfolders: 0,
+        direct_folders: 0,
+      })),
+    ];
     return r.fulfill({ json: { folders, total: folders.length, offset: 0 } });
   });
   await page.getByRole("button", { name: "Browse users", exact: true }).click();
@@ -4744,140 +5398,160 @@ test("disliked interests explore a verified shared-dislike cohort instead of top
   ).toBeVisible();
 });
 
-test("whole transfer user groups inherit collapse and expand defaults as new users load", async ({
-  page,
-}) => {
-  const record = (username: string, i: number) => ({
-    username,
-    path: `${username}-${i}.flac`,
-    size: 100,
-    transferred: 100,
-    speed: 0,
-    status: "completed",
-    queue_position: null,
-  });
-  for (const direction of ["uploads", "downloads"] as const) {
-    const requests: URLSearchParams[] = [];
-    let releaseDave!: () => void;
-    const daveReady = new Promise<void>((resolve) => {
-      releaseDave = resolve;
+for (const responseDelayMs of [0, 150]) {
+  test(`whole transfer user groups inherit collapse and expand defaults as new users load (${responseDelayMs}ms final response)`, async ({
+    page,
+  }) => {
+    const record = (username: string, i: number) => ({
+      username,
+      path: `${username}-${i}.flac`,
+      size: 100,
+      transferred: 100,
+      speed: 0,
+      status: "completed",
+      queue_position: null,
     });
-    await page.route(`**/api/v1/transfers/${direction}?**`, async (r) => {
-      const q = new URL(r.request().url()).searchParams;
-      requests.push(q);
-      const offset = Number(q.get("offset"));
-      if (offset >= 290) await daveReady;
-      // Initial user crosses the normal file budget. Subsequent users arrive
-      // only after that entire group, and each group is represented once.
-      const users =
-        offset === 0
-          ? ([["alice", 130]] as const)
-          : offset === 130
-            ? ([
-                ["bob", 80],
-                ["carol", 80],
-              ] as const)
-            : ([["dave", 120]] as const);
-      const transfers = users.flatMap(([u, n]) =>
-        Array.from({ length: n }, (_, i) => record(u, i)),
-      );
-      await r.fulfill({
-        json: {
-          transfers,
-          total: 410,
-          offset,
-          next_offset: offset + transfers.length,
-          summary: {
+    for (const direction of ["uploads", "downloads"] as const) {
+      const requests: URLSearchParams[] = [];
+      let releaseDave!: () => void;
+      const daveReady = new Promise<void>((resolve) => {
+        releaseDave = resolve;
+      });
+      await page.route(`**/api/v1/transfers/${direction}?**`, async (r) => {
+        const q = new URL(r.request().url()).searchParams;
+        requests.push(q);
+        const offset = Number(q.get("offset"));
+        if (offset >= 290) {
+          await daveReady;
+          // Exercise both the immediate-response race seen on GitHub and a
+          // slower peer/API. This delays the mocked network, not UI assertions.
+          if (responseDelayMs)
+            await new Promise((resolve) =>
+              setTimeout(resolve, responseDelayMs),
+            );
+        }
+        // Initial user crosses the normal file budget. Subsequent users arrive
+        // only after that entire group, and each group is represented once.
+        const users =
+          offset === 0
+            ? ([["alice", 130]] as const)
+            : offset === 130
+              ? ([
+                  ["bob", 80],
+                  ["carol", 80],
+                ] as const)
+              : ([["dave", 120]] as const);
+        const transfers = users.flatMap(([u, n]) =>
+          Array.from({ length: n }, (_, i) => record(u, i)),
+        );
+        await r.fulfill({
+          json: {
+            transfers,
             total: 410,
-            active: 0,
-            speed: 0,
-            clearable: { all: 410, completed: 410 },
+            offset,
+            next_offset: offset + transfers.length,
+            summary: {
+              total: 410,
+              active: 0,
+              speed: 0,
+              clearable: { all: 410, completed: 410 },
+            },
           },
-        },
+        });
       });
+      if (direction === "uploads")
+        await fixture(page, {
+          ...emptySnapshot,
+          uploads_total: 410,
+          downloads_total: 410,
+          uploads: [],
+          downloads: [],
+        });
+      await page
+        .getByRole("button", {
+          name: direction === "uploads" ? "Uploads" : "Downloads",
+          exact: true,
+        })
+        .click();
+      if (direction === "downloads")
+        await page.getByLabel("Group by user", { exact: true }).check();
+      await expect(
+        page.getByRole("button", {
+          name: `Collapse ${direction} for alice`,
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(page.locator(".upload-group-heading").first()).toContainText(
+        "130 files",
+      );
+      await page
+        .getByRole("button", { name: "Collapse all users", exact: true })
+        .click();
+      await expect(
+        page.getByRole("button", {
+          name: `Expand ${direction} for bob`,
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(
+        page.getByRole("button", {
+          name: `Expand ${direction} for carol`,
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(page.locator(".transfer-row")).toHaveCount(0);
+      expect(
+        requests.some(
+          (q) => q.get("group_users") === "true" && q.get("offset") === "130",
+        ),
+      ).toBe(true);
+      await page
+        .getByRole("button", {
+          name: `Expand ${direction} for bob`,
+          exact: true,
+        })
+        .click();
+      await expect(page.getByText("bob-0.flac", { exact: true })).toBeVisible();
+      await expect(
+        page.getByRole("button", {
+          name: `Expand ${direction} for alice`,
+          exact: true,
+        }),
+      ).toBeVisible();
+      await page
+        .getByRole("button", { name: "Expand all users", exact: true })
+        .click();
+      // Keep the last response held until scrolling has requested it. Releasing
+      // it first races removal of the sentinel against Playwright's locator.
+      await page.locator(".infinite-sentinel").scrollIntoViewIfNeeded();
+      await expect
+        .poll(() => requests.some((q) => q.get("offset") === "290"))
+        .toBe(true);
+      await expect(page.locator(".upload-group")).toHaveCount(3);
+      await expect(
+        page.getByRole("button", {
+          name: `Collapse ${direction} for dave`,
+          exact: true,
+        }),
+      ).toHaveCount(0);
+      releaseDave();
+      await expect(
+        page.getByRole("button", {
+          name: `Collapse ${direction} for dave`,
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(page.locator(".upload-group")).toHaveCount(4);
+      await expect(page.locator(".result-pagination")).toContainText(
+        "410 loaded",
+      );
+    }
+    await page.screenshot({
+      path: `../artifacts/transfer-scroll-${responseDelayMs}ms-${test.info().project.name}-${test.info().repeatEachIndex}.png`,
+      fullPage: false,
     });
-    if (direction === "uploads")
-      await fixture(page, {
-        ...emptySnapshot,
-        uploads_total: 410,
-        downloads_total: 410,
-        uploads: [],
-        downloads: [],
-      });
-    await page
-      .getByRole("button", {
-        name: direction === "uploads" ? "Uploads" : "Downloads",
-        exact: true,
-      })
-      .click();
-    if (direction === "downloads")
-      await page.getByLabel("Group by user", { exact: true }).check();
-    await expect(
-      page.getByRole("button", {
-        name: `Collapse ${direction} for alice`,
-        exact: true,
-      }),
-    ).toBeVisible();
-    await expect(page.locator(".upload-group-heading").first()).toContainText(
-      "130 files",
-    );
-    await page
-      .getByRole("button", { name: "Collapse all users", exact: true })
-      .click();
-    await expect(
-      page.getByRole("button", {
-        name: `Expand ${direction} for bob`,
-        exact: true,
-      }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("button", {
-        name: `Expand ${direction} for carol`,
-        exact: true,
-      }),
-    ).toBeVisible();
-    await expect(page.locator(".transfer-row")).toHaveCount(0);
-    expect(
-      requests.some(
-        (q) => q.get("group_users") === "true" && q.get("offset") === "130",
-      ),
-    ).toBe(true);
-    await page
-      .getByRole("button", { name: `Expand ${direction} for bob`, exact: true })
-      .click();
-    await expect(page.getByText("bob-0.flac", { exact: true })).toBeVisible();
-    await expect(
-      page.getByRole("button", {
-        name: `Expand ${direction} for alice`,
-        exact: true,
-      }),
-    ).toBeVisible();
-    await page
-      .getByRole("button", { name: "Expand all users", exact: true })
-      .click();
-    // Keep the last response held until scrolling has requested it. Releasing
-    // it first races removal of the sentinel against Playwright's locator.
-    await page.locator(".infinite-sentinel").scrollIntoViewIfNeeded();
-    await expect
-      .poll(() => requests.some((q) => q.get("offset") === "290"))
-      .toBe(true);
-    releaseDave();
-    await expect(
-      page.getByRole("button", {
-        name: `Collapse ${direction} for dave`,
-        exact: true,
-      }),
-    ).toBeVisible();
-    await expect(page.locator(".upload-group")).toHaveCount(4);
-    await expect(page.locator(".result-pagination")).toContainText(
-      "410 loaded",
-    );
-  }
-  await page.screenshot({
-    path: `../artifacts/transfer-scroll-${test.info().project.name}.png`,
-    fullPage: false,
   });
-});
+}
 
 test("settings sections follow the requested order including all existing sections", async ({
   page,

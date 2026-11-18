@@ -28,3 +28,10 @@ Retained progress: each download attempt now shares an exact file-byte counter w
 
 
 Empty files use the same offer, file-token and zero resume-offset handshake as other files, then complete without waiting for any payload or another EOF. Sharing, selection, history and readable destination paths include zero-byte files. They consume no payload bandwidth. The schema-13 download-table migration retains original rowids and every history field so default FIFO/manual queue order stays intact. Completed empty files show 100% progress; Open offers Save file without an audio decoder.
+
+
+## Transfer timing
+
+Upload and download rows display a local date/time beneath their status and a live `Elapsed HH:MM:SS` counter, with days for longer transfers. Completed, cancelled, failed, timed-out, blocked and interrupted transfers display a frozen total. Timestamps are persisted in SQLite and included in backups. The first observed active transfer starts the clock; pending queue time is excluded. Pauses and automatic retry waits are included as wall-clock time. A manual retry after a terminal result resets timing for the new attempt. Recovered interrupted transfers stop at the last saved live update, so daemon downtime is not added.
+
+Older records are not backfilled from added/updated dates because those do not establish a real start. The UI shows timing as unavailable for that history. One shared browser clock updates mounted live rows; finished/collapsed rows do not add timers or API polling.

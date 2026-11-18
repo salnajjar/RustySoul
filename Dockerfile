@@ -4,6 +4,7 @@ WORKDIR /build/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/ ./
+COPY images/ /build/images/
 RUN npm run build && npm test
 
 FROM rust:1.100-bookworm AS build
@@ -20,7 +21,7 @@ COPY --from=web /build/web/dist ./web/dist
 RUN cargo test --locked --all-targets && cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime
-ARG VERSION=0.1.0-beta.1
+ARG VERSION=0.1.0-beta.2
 ARG REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/salnajjar/RustySoul" \
       org.opencontainers.image.title="RustySoul" \

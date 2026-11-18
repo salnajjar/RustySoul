@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { Message } from "./types";
 
@@ -8,12 +8,14 @@ export function useRoomRead({
   messages,
   readTo,
   token,
+  acknowledge = true,
 }: {
   enabled: boolean;
   room: string;
   messages: Message[];
   readTo: number;
   token: string;
+  acknowledge?: boolean;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLDivElement>(null);
@@ -23,6 +25,12 @@ export function useRoomRead({
   const pending = useRef({ key: "", at: 0 });
   const [bottom, setBottom] = useState(true);
   const latest = messages.at(-1)?.id || 0;
+  const preserved = useRef<{
+    room: string;
+    first: number;
+    height: number;
+    top: number;
+  } | null>(null);
   const current = useRef({ room, latest, readTo });
   current.current = { room, latest, readTo };
   const atBottom = () => {
@@ -34,6 +42,30 @@ export function useRoomRead({
     follow.current = value;
     setBottom(value);
   };
+  const preserve = () => {
+    const el = viewport.current;
+    if (!el) return;
+    follow.current = false;
+    preserved.current = {
+      room,
+      first: messages[0]?.id || 0,
+      height: el.scrollHeight,
+      top: el.scrollTop,
+    };
+  };
+  useLayoutEffect(() => {
+    const saved = preserved.current,
+      el = viewport.current;
+    if (!saved || !el) return;
+    if (saved.room !== room) {
+      preserved.current = null;
+      return;
+    }
+    if ((messages[0]?.id || 0) >= saved.first) return;
+    el.scrollTop = saved.top + el.scrollHeight - saved.height;
+    preserved.current = null;
+    onScroll();
+  }, [room, messages[0]?.id]);
   useEffect(() => {
     if (!enabled) return;
     const marker = end.current;
@@ -73,7 +105,7 @@ export function useRoomRead({
     return () => cancelAnimationFrame(frame);
   }, [enabled, room, latest, messages.length]);
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || !acknowledge) return;
     const timer = setInterval(() => {
       const c = current.current;
       if (
@@ -98,7 +130,7 @@ export function useRoomRead({
       });
     }, 750);
     return () => clearInterval(timer);
-  }, [enabled, token]);
+  }, [enabled, token, acknowledge]);
   const jump = () => {
     if (viewport.current) {
       viewport.current.scrollTop = viewport.current.scrollHeight;
@@ -106,5 +138,5 @@ export function useRoomRead({
       onScroll();
     }
   };
-  return { viewport, end, onScroll, bottom, jump };
+  return { viewport, end, onScroll, bottom, jump, preserve };
 }

@@ -148,12 +148,8 @@ small {
 .brand-icon {
   width: 40px;
   height: 40px;
-  border-radius: 11px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: #d7e7ae;
-  background: #344332;
+  display: block;
+  object-fit: contain;
   margin-right: 10px;
   flex-shrink: 0;
 }
@@ -1072,6 +1068,30 @@ tbody tr:hover {
   margin-top: 8px;
   font-size: 9px;
 }
+.transfer-timing {
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+  max-width: 230px;
+  color: var(--soft-ink, #65705f);
+}
+.transfer-timing > span {
+  display: block;
+}
+.install-app {
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+  padding-top: 18px;
+}
+.install-app h3 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 10px;
+}
+.install-app p {
+  font-size: 11px;
+  line-height: 1.8;
+  margin: 8px 0;
+}
 .compact {
   margin-bottom: 24px;
 }
@@ -1170,6 +1190,8 @@ tbody tr:hover {
 }
 .conversation-header {
   display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
   justify-content: space-between;
   align-items: center;
   padding: 19px 21px;
@@ -1177,6 +1199,10 @@ tbody tr:hover {
   border-bottom: 1px solid var(--line);
   font-size: 12px;
   color: #6e7e5d;
+}
+.chat-history-confirmation {
+  padding: 16px 21px;
+  border-bottom: 1px solid var(--line);
 }
 .message-list {
   flex: 1;
@@ -1322,8 +1348,6 @@ tbody tr:hover {
   margin-bottom: 30px;
   width: 55px;
   height: 55px;
-  border: 1px solid #566746;
-  border-radius: 14px;
 }
 .login-panel .eyebrow {
   color: #94a67a;
@@ -2231,16 +2255,37 @@ tbody tr:hover {
 }
 .share-layout {
   display: grid;
-  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
-  gap: 24px;
+  grid-template-columns: var(--share-folder-width, 240px) 12px minmax(0, 1fr);
+  gap: 12px;
   margin-top: 22px;
 }
 .share-folders {
   min-width: 0;
-  border-right: 1px solid var(--line);
-  padding-right: 16px;
   max-height: 700px;
   overflow: auto;
+}
+.share-resizer {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  max-height: 700px;
+  border-radius: 6px;
+}
+.share-resizer::before {
+  content: "";
+  position: absolute;
+  inset: 0 5px;
+  background: var(--line);
+  border-radius: 2px;
+}
+.share-resizer:hover::before,
+.share-resizer:focus-visible::before {
+  background: var(--accent);
+}
+.share-resizer:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .share-folders .room-item {
   align-items: flex-start;
@@ -2470,6 +2515,9 @@ tbody tr:hover {
 @media (max-width: 800px) {
   .share-layout {
     grid-template-columns: 1fr;
+  }
+  .share-resizer {
+    display: none;
   }
   .share-folders {
     border-right: 0;

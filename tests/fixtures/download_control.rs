@@ -143,6 +143,12 @@ fn partial_downloads_pause_cancel_resume_and_restart_without_changing_bytes_or_t
             .iter()
             .any(|t| t.path == path && t.status == "completed")
     });
+    {
+        let snapshot = h.snapshot.borrow();
+        let timing = snapshot.downloads.iter().find(|t| t.path == path).unwrap();
+        assert!(timing.started_at.is_some());
+        assert!(timing.finished_at >= timing.started_at);
+    }
     assert_eq!(
         std::fs::read(root.join("fixture-peer/Album/pause.flac")).unwrap(),
         payload

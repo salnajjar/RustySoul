@@ -193,10 +193,12 @@ pub struct TreeQuery {
     pub parent: String,
     pub filter: String,
     pub offset: usize,
+    pub all: bool,
 }
 #[derive(Serialize)]
 pub struct TreeFolder {
     pub path: String,
+    pub parent: String,
     pub name: String,
     pub files: usize,
     pub direct_files: usize,
@@ -216,6 +218,21 @@ pub fn tree(db: &Connection, q: &TreeQuery) -> Result<TreePage> {
         q.parent.len() <= 4096 && q.filter.len() <= 256 && q.offset <= 2_000_000,
         "Invalid folder tree query"
     );
+    if q.all {
+        ensure!(
+            q.parent.is_empty() && q.filter.is_empty() && q.offset == 0,
+            "A complete folder tree cannot be paged or filtered"
+        );
+        let mut stmt = db.prepare("SELECT path,name,files,direct_files,direct_folders>0,subfolders,direct_folders,parent FROM browse_folders WHERE username=?1 ORDER BY name COLLATE NOCASE,name,path")?;
+        let folders = stmt
+            .query_map([&q.username], read_tree_folder)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(TreePage {
+            total: folders.len(),
+            folders,
+            offset: 0,
+        });
+    }
     let condition = "f.username=?1 AND f.parent=?2 AND (?3='' OR instr(f.search_key,?3)>0 OR EXISTS(SELECT 1 FROM browse_folders d WHERE d.username=f.username AND substr(d.path,1,length(f.path)+1)=f.path||char(92) AND instr(d.search_key,?3)>0))";
     let filter = q.filter.to_lowercase();
     let total = db.query_row(
@@ -223,27 +240,29 @@ pub fn tree(db: &Connection, q: &TreeQuery) -> Result<TreePage> {
         params![q.username, q.parent, filter],
         |r| r.get::<_, i64>(0),
     )? as usize;
-    let mut stmt=db.prepare(&format!("SELECT f.path,f.name,f.files,f.direct_files,f.direct_folders>0,f.subfolders,f.direct_folders FROM browse_folders f WHERE {condition} ORDER BY f.name COLLATE NOCASE,f.name LIMIT 100 OFFSET ?4"))?;
+    let mut stmt=db.prepare(&format!("SELECT f.path,f.name,f.files,f.direct_files,f.direct_folders>0,f.subfolders,f.direct_folders,f.parent FROM browse_folders f WHERE {condition} ORDER BY f.name COLLATE NOCASE,f.name LIMIT 100 OFFSET ?4"))?;
     let folders = stmt
         .query_map(
             params![q.username, q.parent, filter, q.offset as i64],
-            |r| {
-                Ok(TreeFolder {
-                    path: r.get(0)?,
-                    name: r.get(1)?,
-                    files: r.get::<_, i64>(2)? as usize,
-                    direct_files: r.get::<_, i64>(3)? as usize,
-                    has_children: r.get(4)?,
-                    subfolders: r.get::<_, i64>(5)? as usize,
-                    direct_folders: r.get::<_, i64>(6)? as usize,
-                })
-            },
+            read_tree_folder,
         )?
         .collect::<rusqlite::Result<_>>()?;
     Ok(TreePage {
         folders,
         total,
         offset: q.offset,
+    })
+}
+fn read_tree_folder(r: &rusqlite::Row<'_>) -> rusqlite::Result<TreeFolder> {
+    Ok(TreeFolder {
+        path: r.get(0)?,
+        parent: r.get(7)?,
+        name: r.get(1)?,
+        files: r.get::<_, i64>(2)? as usize,
+        direct_files: r.get::<_, i64>(3)? as usize,
+        has_children: r.get(4)?,
+        subfolders: r.get::<_, i64>(5)? as usize,
+        direct_folders: r.get::<_, i64>(6)? as usize,
     })
 }
 pub fn page(db: &Connection, query: &BrowseQuery) -> Result<Page> {
@@ -356,6 +375,80 @@ mod tests {
         assert!(root.folders[0].has_children);
         assert_eq!(root.folders[0].subfolders, 5602);
         assert_eq!(root.folders[0].direct_folders, 2801);
+        let complete = tree(
+            &store.connection,
+            &TreeQuery {
+                username: "alice".into(),
+                all: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (complete.total, complete.folders.len(), complete.offset),
+            (5603, 5603, 0)
+        );
+        assert!(
+            complete
+                .folders
+                .iter()
+                .any(|f| f.path == "Music" && f.parent.is_empty())
+        );
+        assert!(
+            complete
+                .folders
+                .iter()
+                .any(|f| f.path == "Music\\Artist 2800\\Album" && f.parent == "Music\\Artist 2800")
+        );
+        assert_eq!(
+            tree(
+                &store.connection,
+                &TreeQuery {
+                    username: "bob".into(),
+                    all: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .total,
+            0
+        );
+        for query in [
+            TreeQuery {
+                parent: "Music".into(),
+                ..Default::default()
+            },
+            TreeQuery {
+                filter: "Artist".into(),
+                ..Default::default()
+            },
+            TreeQuery {
+                offset: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                tree(
+                    &store.connection,
+                    &TreeQuery {
+                        username: "alice".into(),
+                        all: true,
+                        ..query
+                    }
+                )
+                .is_err()
+            );
+        }
+        let siblings = tree(
+            &store.connection,
+            &TreeQuery {
+                username: "alice".into(),
+                parent: "Music".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((siblings.total, siblings.folders.len()), (2801, 100));
         let tail = tree(
             &store.connection,
             &TreeQuery {

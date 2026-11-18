@@ -5,6 +5,7 @@ on:
     paths:
       - "site/**"
       - "screens/**"
+      - "images/**"
       - "scripts/build-site.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:

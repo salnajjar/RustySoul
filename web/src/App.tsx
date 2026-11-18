@@ -56,6 +56,8 @@ import Profile from "./Profile";
 import Traffic from "./Traffic";
 import LoadMore from "./LoadMore";
 import TransferRows from "./TransferRows";
+import TransferTiming from "./TransferTiming";
+import TransferSpeed from "./TransferSpeed";
 import TransferQueueControls from "./TransferQueueControls";
 import {
   useTransferSelection,
@@ -72,6 +74,7 @@ import RoomTools, { RoomJoin } from "./RoomTools";
 import ChatComposer from "./ChatComposer";
 import SystemStatus from "./SystemStatus";
 import ConversationMessages from "./ConversationMessages";
+import { useConversations, useMessageHistory } from "./useMessageHistory";
 import { SelectionProvider, useChoice, accepted } from "./WorkspaceState";
 import { useRoomRead } from "./RoomRead";
 import {
@@ -314,11 +317,15 @@ export default function App() {
                 setPage("search");
               }}
             >
-              <span className="brand-icon">
-                <AudioLines size={25} />
-              </span>
+              <img
+                className="brand-icon"
+                src="/assets/icons/rustysoul.svg"
+                width="40"
+                height="40"
+                alt=""
+              />
               rusty<span>soul</span>
-              <span className="beta">ALPHA</span>
+              <span className="beta">BETA</span>
             </a>
             <div className="workspace">
               <span className="workspace-avatar">RS</span>
@@ -1402,8 +1409,20 @@ function TransfersPage({
           icon={<RefreshCw size={18} />}
         />
         <Stat
-          label="Current speed"
-          value={`${bytes(data?.summary.speed ?? items.reduce((n, t) => n + t.speed, 0))}/s`}
+          label="Current speed (5s average)"
+          value={
+            <TransferSpeed
+              speed={
+                paged
+                  ? data?.summary.speed
+                  : items
+                      .filter((t) =>
+                        ["downloading", "uploading"].includes(t.status),
+                      )
+                      .reduce((n, t) => n + t.speed, 0)
+              }
+            />
+          }
           icon={uploads ? <ArrowUp size={18} /> : <ArrowDown size={18} />}
         />
       </div>
@@ -1861,6 +1880,7 @@ function TransfersPage({
                                     ? "Paused in local queue"
                                     : t.status.replaceAll("_", " ")}
                           </span>
+                          <TransferTiming transfer={t} />
                           <small>{bytes(t.speed)}/s</small>
                           {t.detail && (
                             <small className="transfer-reason">
@@ -2027,7 +2047,7 @@ function Stat({
   icon,
 }: {
   label: string;
-  value: string;
+  value: ReactNode;
   icon: ReactNode;
 }) {
   return (
@@ -2104,20 +2124,44 @@ function ChatPage({
         last_activity: null,
       });
   }
+  const savedConversations = useConversations(
+    token,
+    state.message_revision !== undefined,
+    state.message_reset || 0,
+    state.message_revision,
+  );
   const conversations = [
-    ...new Set(state.messages.filter((m) => m.private).map((m) => m.target)),
+    ...new Set([
+      ...state.messages.filter((m) => m.private).map((m) => m.target),
+      ...savedConversations.data.filter((c) => c.private).map((c) => c.target),
+    ]),
   ];
-  const messages = state.messages.filter(
+  const liveMessages = state.messages.filter(
+    (m) => m.private === privateChat && m.target === target,
+  );
+  const history = useMessageHistory(
+    token,
+    target,
+    privateChat,
+    state.message_revision,
+    state.message_reset || 0,
+    liveMessages,
+  );
+  const messages = history.messages.filter(
     (m) =>
-      m.private === privateChat &&
-      m.target === target &&
       !state.user_rules.some((r) => r.ignored && r.username === m.username),
   );
+  const [deleteHistory, setDeleteHistory] = useState(false);
+  const [deletingHistory, setDeletingHistory] = useState(false);
+  useEffect(() => setDeleteHistory(false), [target, privateChat]);
   const read = useRoomRead({
-    enabled: !privateChat && readingEnabled && roomPane === "chat",
+    enabled: readingEnabled && (privateChat || roomPane === "chat"),
+    acknowledge: !privateChat,
     room: target,
     messages,
-    readTo: state.room_read?.[target] || 0,
+    readTo: privateChat
+      ? Number.MAX_SAFE_INTEGER
+      : state.room_read?.[target] || 0,
     token,
   });
   return (
@@ -2318,6 +2362,34 @@ function ChatPage({
                       </small>
                     </button>
                   ))}
+            {savedConversations.error && (
+              <p role="alert">
+                {savedConversations.error}{" "}
+                <button
+                  className="text-link"
+                  onClick={savedConversations.retry}
+                >
+                  Retry saved conversations
+                </button>
+              </p>
+            )}
+            {!privateChat &&
+              savedConversations.data.some((c) => !c.private) && (
+                <details>
+                  <summary>Saved room history</summary>
+                  {savedConversations.data
+                    .filter((c) => !c.private)
+                    .map((c) => (
+                      <button
+                        key={c.target}
+                        className="room-item"
+                        onClick={() => setTarget(c.target)}
+                      >
+                        {c.target}
+                      </button>
+                    ))}
+                </details>
+              )}
           </section>
         )}
         <section className="panel conversation">
@@ -2330,6 +2402,22 @@ function ChatPage({
                 (privateChat ? "Start a conversation" : "Choose a room")
               )}
             </strong>
+            {target && (
+              <button
+                className="button small secondary"
+                onClick={() => setDeleteHistory(true)}
+              >
+                Delete history
+              </button>
+            )}
+            {privateChat && target && (
+              <button
+                className="button small secondary"
+                onClick={() => setTarget("")}
+              >
+                Close chat
+              </button>
+            )}
             {!privateChat && target && (
               <button
                 className="button small secondary"
@@ -2358,6 +2446,50 @@ function ChatPage({
               </button>
             )}
           </div>
+          {deleteHistory && target && (
+            <div
+              className="chat-history-confirmation"
+              role="alertdialog"
+              aria-label="Delete conversation history"
+            >
+              <p>
+                Permanently delete all saved{" "}
+                {privateChat ? "private chat" : "room"} messages{" "}
+                {privateChat ? "with" : "in"} {target}, including older history?
+                New messages will still be saved.
+              </p>
+              <div className="button-row">
+                <button
+                  className="button small"
+                  disabled={deletingHistory}
+                  onClick={async () => {
+                    setDeletingHistory(true);
+                    try {
+                      if (
+                        (await send({
+                          type: "clear_message_history",
+                          target,
+                          private: privateChat,
+                        })) !== false
+                      )
+                        setDeleteHistory(false);
+                    } finally {
+                      setDeletingHistory(false);
+                    }
+                  }}
+                >
+                  Delete history permanently
+                </button>
+                <button
+                  className="button small secondary"
+                  disabled={deletingHistory}
+                  onClick={() => setDeleteHistory(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
           {!privateChat && target && (
             <div
               className="room-view-tabs"
@@ -2481,6 +2613,27 @@ function ChatPage({
               ref={read.viewport}
               onScroll={read.onScroll}
             >
+              {history.older && (
+                <button
+                  className="button small secondary"
+                  disabled={history.loading}
+                  onClick={() => {
+                    read.preserve();
+                    history.loadOlder();
+                  }}
+                >
+                  Load older messages
+                </button>
+              )}
+              {history.loading && <p role="status">Loading message history…</p>}
+              {history.error && (
+                <p role="alert">
+                  {history.error}{" "}
+                  <button className="text-link" onClick={history.retry}>
+                    Retry message history
+                  </button>
+                </p>
+              )}
               {messages.length ? (
                 <ConversationMessages messages={messages} />
               ) : (

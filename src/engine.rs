@@ -85,6 +85,7 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
     lock.try_lock()
         .context("Another daemon is already using this data directory")?;
     let store = Store::open(&config.data_dir.join("rustysoul.sqlite3"))?;
+    crate::transfers::recover_downloads(&store.connection)?;
     let mut network = store.network()?.unwrap_or(NetworkSettings {
         port: config.soulseek.listen_port,
         connect_on_startup: config.soulseek.auto_connect,
@@ -248,6 +249,9 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
     let retries = automation::load_retries(&store.connection)?;
     let queue_rules = crate::queue_order::load(&store.connection)?;
     let message_ids = store.reserve_message_ids()?;
+    // A reserved ID block also identifies the history cache generation. It is
+    // different after every restart, even if a client missed a deletion event.
+    view.message_reset = message_ids.0;
     let (updates, snapshot) = watch::channel(view.clone());
     let storage = std::sync::Arc::new(crate::storage::Guard::new(network.minimum_free_space_mib));
     let system = crate::system::Monitor::start_with_storage(
@@ -564,6 +568,7 @@ impl Engine {
             Command::SetRoomTicker { .. } => "Update room-board message",
             Command::SetRoomInvitations { .. } => "Update room invitation preference",
             Command::SendMessage { .. } => "Send message",
+            Command::ClearMessageHistory { .. } => "Delete message history",
             Command::WatchUsers { .. } | Command::ReadRoom { .. } => "",
             _ => "Update settings or user controls",
         };
@@ -604,6 +609,9 @@ impl Engine {
             if !library_notice {
                 self.notice_deadline = Some(Instant::now() + Duration::from_secs(6));
             }
+        }
+        if let Err(error) = self.flush_messages() {
+            self.view.error = Some(format!("Save messages: {error:#}"));
         }
         self.publish();
     }
@@ -759,6 +767,14 @@ impl Engine {
                 .map(|u| (u.username.clone(), kib(u.upload_limit_kib)))
                 .collect(),
         );
+    }
+    fn flush_messages(&mut self) -> Result<()> {
+        if self.store.save_messages(&self.view.messages)? {
+            self.view.message_revision += 1;
+        }
+        let overflow = self.view.messages.len().saturating_sub(500);
+        self.view.messages.drain(..overflow);
+        Ok(())
     }
     fn persist(&mut self) -> Result<()> {
         self.store
@@ -1064,14 +1080,11 @@ impl Engine {
                 return Ok(());
             }
             Command::ReadRoom { room, through_id } => {
-                let latest = self
-                    .view
-                    .messages
-                    .iter()
-                    .filter(|m| !m.private && m.target == room)
-                    .map(|m| m.id)
-                    .max()
-                    .unwrap_or(0);
+                let latest = self.store.connection.query_row(
+                    "SELECT COALESCE(MAX(id),0) FROM messages WHERE private=0 AND target=?1",
+                    [&room],
+                    |r| r.get::<_, i64>(0),
+                )? as u64;
                 if latest == 0 {
                     return Ok(());
                 }
@@ -1612,6 +1625,18 @@ impl Engine {
                         self.view.notice = Some(format!("Cleared {n} upload history records"));
                     }
                 }
+                return Ok(());
+            }
+            Command::ClearMessageHistory { target, private } => {
+                self.flush_messages()?;
+                let (count, ids) = self.store.clear_message_history(&target, private)?;
+                self.message_ids = ids;
+                self.view
+                    .messages
+                    .retain(|m| m.private != private || m.target != target);
+                self.view.message_reset = ids.0;
+                self.view.message_revision += 1;
+                self.view.notice = Some(format!("Deleted {count} saved messages from {target}"));
                 return Ok(());
             }
             Command::DismissMessages => {
@@ -2806,8 +2831,6 @@ impl Engine {
                 timestamp: now(),
             });
         }
-        let overflow = self.view.messages.len().saturating_sub(500);
-        self.view.messages.drain(..overflow);
         let pending: Vec<_> = self.browsing.keys().cloned().collect();
         for username in pending {
             if let Some(dirs) = c.take_browse_result(&username) {
@@ -2885,6 +2908,9 @@ impl Engine {
         }
         if let Err(e) = self.pump_downloads() {
             self.view.error = Some(format!("{e:#}"));
+        }
+        if let Err(error) = self.flush_messages() {
+            self.view.error = Some(format!("Save messages: {error:#}"));
         }
         if self.last_save.elapsed() >= Duration::from_secs(2) {
             if let Err(e) = self
@@ -2973,6 +2999,78 @@ mod tests {
         assert_eq!(h.snapshot.borrow().browse.len(), 41);
         h.stop.send(()).unwrap();
         h.thread.join().unwrap();
+    }
+    #[test]
+    fn archived_chat_history_and_offline_deletion_survive_daemon_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.path().join("rustysoul.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        let mut view = Snapshot::default();
+        for id in 1..=1201 {
+            view.messages.push(MessageView {
+                id,
+                target: if id == 1 { "archived-peer" } else { "room" }.into(),
+                username: "self".into(),
+                text: format!("message {id}"),
+                private: id == 1,
+                timestamp: 1,
+            });
+        }
+        store.save_snapshot(&view).unwrap();
+        drop(store);
+        let mut config = Config {
+            data_dir: dir.path().into(),
+            ..Default::default()
+        };
+        config.soulseek.auto_connect = false;
+        let secrets = || Secrets::new("s".repeat(32), "self".into(), "password".into()).unwrap();
+        let h = start(config.clone(), secrets()).unwrap();
+        assert_eq!(h.snapshot.borrow().messages.len(), 500);
+        assert!(!h.snapshot.borrow().messages.iter().any(|m| m.private));
+        let previous_reset = h.snapshot.borrow().message_reset;
+        h.commands
+            .send(Command::ClearMessageHistory {
+                target: "archived-peer".into(),
+                private: true,
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(4);
+        while h.snapshot.borrow().message_reset == previous_reset {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(h.snapshot.borrow().error.is_none());
+        h.stop.send(()).unwrap();
+        h.thread.join().unwrap();
+        let h = start(config, secrets()).unwrap();
+        h.stop.send(()).unwrap();
+        h.thread.join().unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1200
+        );
+        assert!(
+            crate::messages::page(
+                &store.connection,
+                &crate::messages::Query {
+                    target: "archived-peer".into(),
+                    private: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .messages
+            .is_empty()
+        );
     }
     #[test]
     fn room_read_cursors_are_independent_durable_and_message_ids_do_not_restart() {
