@@ -1,6 +1,8 @@
 # RustySoul
 
-A Rust Soulseek daemon for Linux with a modern React browser interface, an authenticated API and SQLite persistence. Run it with Docker, Podman or as a native Linux service.
+RustySoul is a Rust based Soulseek daemon with a focus on speed, low resource use, security and full compatibility with other Soulseek clients.
+
+It has a modern React browser interface, an authenticated API and SQLite persistence. and it runs with Docker, Podman or as a native Linux service.
 
 **[Explore the project website →](https://salnajjar.github.io/RustySoul/)** — screenshots, features and installation options.
 
