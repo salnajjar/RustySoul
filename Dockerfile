@@ -21,7 +21,7 @@ COPY --from=web /build/web/dist ./web/dist
 RUN cargo test --locked --all-targets && cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime
-ARG VERSION=0.1.0-beta.2
+ARG VERSION=0.1.0-beta.3
 ARG REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/salnajjar/RustySoul" \
       org.opencontainers.image.title="RustySoul" \

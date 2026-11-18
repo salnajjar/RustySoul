@@ -6,7 +6,7 @@ It has a modern React browser interface, an authenticated API and SQLite persist
 
 **[Explore the project website →](https://salnajjar.github.io/RustySoul/)** — screenshots, features and installation options.
 
-**Current beta: v0.1.0-beta.2.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
+**Current beta: v0.1.0-beta.3.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
 
 ## Quick start with Docker
 
@@ -19,10 +19,10 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
-The public image is `ghcr.io/salnajjar/rustysoul:beta`. For a pinned version, set `RUSTYSOUL_IMAGE=ghcr.io/salnajjar/rustysoul:0.1.0-beta.2` in `.env`. No registry login is required for public pulls:
+The public image is `ghcr.io/salnajjar/rustysoul:beta`. For a pinned version, set `RUSTYSOUL_IMAGE=ghcr.io/salnajjar/rustysoul:0.1.0-beta.3` in `.env`. No registry login is required for public pulls:
 
 ```sh
-docker pull ghcr.io/salnajjar/rustysoul:0.1.0-beta.2
+docker pull ghcr.io/salnajjar/rustysoul:0.1.0-beta.3
 ```
 
 Open **http://127.0.0.1:8484**. Initial administrator credentials are **admin / change-me-now**, unless changed in `.env` before installation. On first sign-in you must replace **both** the username and password (minimum eight characters). Soulseek account credentials are separate: enter and verify them under **Settings -> Accounts**. Verified credentials can connect automatically on startup.

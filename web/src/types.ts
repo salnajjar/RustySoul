@@ -302,7 +302,7 @@ export const emptySnapshot: Snapshot = {
   notice: null,
   credentials_configured: false,
   credentials_revision: 0,
-  version: "0.1.0-beta.2",
+  version: "0.1.0-beta.3",
   connection: "disconnected",
   error: null,
   username: "",
