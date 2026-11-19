@@ -9,6 +9,7 @@ import {
 import { FolderOpen, MessageCircle, RefreshCw, Star, X } from "lucide-react";
 import type { Snapshot } from "./types";
 import { bytes } from "./api";
+import { userKey } from "./chatState";
 
 type UserActions = { state: Snapshot; open: (username: string) => void };
 export const UserContext = createContext<UserActions | null>(null);
@@ -73,7 +74,7 @@ export function UserDialog({
   username: string;
   state: Snapshot;
   close: () => void;
-  send: (command: object) => void;
+  send: (command: object) => unknown;
   browse: () => void;
   message: () => void;
   search?: () => void;
@@ -94,13 +95,75 @@ export function UserDialog({
       previous?.focus();
     };
   }, []);
-  const user = state.users?.[username];
-  const self = username === state.username;
+  const user =
+    state.users?.[username] ??
+    (userKey(username) === userKey(state.username)
+      ? state.users?.[state.username]
+      : undefined);
+  const self = userKey(username) === userKey(state.username);
   const online = state.connection === "connected";
   const buddy = state.buddies?.includes(username);
   const rule = state.user_rules.find(
-    (r) => r.username.toLowerCase() === username.toLowerCase(),
+    (r) => userKey(r.username) === userKey(username),
   );
+  const [controls, setControls] = useState({
+    ignored: rule?.ignored ?? false,
+    banned: rule?.banned ?? false,
+  });
+  const [savingControls, setSavingControls] = useState(false);
+  const [controlsError, setControlsError] = useState("");
+  const actualControls = useRef(controls);
+  actualControls.current = {
+    ignored: rule?.ignored ?? false,
+    banned: rule?.banned ?? false,
+  };
+  const pendingControls = useRef<typeof controls | null>(null);
+  const matches = (a: typeof controls, b: typeof controls) =>
+    a.ignored === b.ignored && a.banned === b.banned;
+  useEffect(() => {
+    const pending = pendingControls.current;
+    if (pending && !matches(actualControls.current, pending)) return;
+    pendingControls.current = null;
+    setControls(actualControls.current);
+    setSavingControls(false);
+    setControlsError("");
+  }, [username, rule?.ignored, rule?.banned]);
+  useEffect(() => {
+    if (!savingControls) return;
+    const timer = setTimeout(() => {
+      if (!pendingControls.current) return;
+      pendingControls.current = null;
+      setControls(actualControls.current);
+      setSavingControls(false);
+      setControlsError(
+        "Could not confirm user controls. Check the connection and try again.",
+      );
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [savingControls, username]);
+  async function updateControls(next: typeof controls) {
+    pendingControls.current = next;
+    setControls(next);
+    setSavingControls(true);
+    setControlsError("");
+    try {
+      if ((await send({ type: "set_user_rule", username, ...next })) === false)
+        throw Error("Could not save user controls. Please try again.");
+      if (
+        pendingControls.current === next &&
+        matches(actualControls.current, next)
+      ) {
+        pendingControls.current = null;
+        setSavingControls(false);
+      }
+    } catch (error) {
+      if (pendingControls.current !== next) return;
+      pendingControls.current = null;
+      setControls(actualControls.current);
+      setControlsError((error as Error).message);
+      setSavingControls(false);
+    }
+  }
   const detail = (label: string, value: ReactNode) => (
     <>
       <dt>{label}</dt>
@@ -173,18 +236,16 @@ export function UserDialog({
         </button>
       </div>
       {!self && (
-        <details className="user-controls">
-          <summary>Message & sharing controls</summary>
+        <fieldset className="user-controls" disabled={savingControls}>
+          <legend>Message & sharing controls</legend>
           <label className="checkbox-label">
             <input
               type="checkbox"
-              checked={rule?.ignored ?? false}
+              checked={controls.ignored}
               onChange={(e) =>
-                send({
-                  type: "set_user_rule",
-                  username,
+                void updateControls({
                   ignored: e.target.checked,
-                  banned: rule?.banned ?? false,
+                  banned: controls.banned,
                 })
               }
             />
@@ -193,12 +254,10 @@ export function UserDialog({
           <label className="checkbox-label">
             <input
               type="checkbox"
-              checked={rule?.banned ?? false}
+              checked={controls.banned}
               onChange={(e) =>
-                send({
-                  type: "set_user_rule",
-                  username,
-                  ignored: rule?.ignored ?? false,
+                void updateControls({
+                  ignored: controls.ignored,
                   banned: e.target.checked,
                 })
               }
@@ -206,11 +265,15 @@ export function UserDialog({
             Ban this user from my shares
           </label>
           <p className="hint">
-            Ignoring hides messages. Banning denies share lists and new upload
-            requests, and cancels current uploads to this username. Soulseek
-            usernames are not cryptographically authenticated.
+            Ignoring hides this user's messages in every room and private chat,
+            including saved history, and suppresses their unread alerts.
+            Existing history is retained. Banning denies share lists and new
+            upload requests, and cancels current uploads to this username.
+            Soulseek usernames are not cryptographically authenticated.
           </p>
-        </details>
+          {savingControls && <p role="status">Saving user controls…</p>}
+          {controlsError && <p role="alert">{controlsError}</p>}
+        </fieldset>
       )}
       {user?.pending && <p role="status">Looking up this exact username…</p>}
       {user?.error && <p role="alert">{user.error}</p>}
@@ -219,7 +282,11 @@ export function UserDialog({
         {detail("Shared folders", user?.shared_folders?.toLocaleString())}
         {detail(
           "Average upload speed",
-          user?.average_speed == null ? null : `${bytes(user.average_speed)}/s`,
+          self && state.profile?.report_upload_speed === false
+            ? "Not reported"
+            : user?.average_speed == null
+              ? null
+              : `${bytes(user.average_speed)}/s`,
         )}
         {detail("Upload slots", user?.upload_slots)}
         {detail("Queued transfers", user?.queue_size)}

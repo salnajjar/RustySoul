@@ -9,6 +9,10 @@ concurrency:
   cancel-in-progress: false
 jobs:
   verify:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
     uses: ./.github/workflows/ci.yml
   publish:
     needs: verify
@@ -66,6 +70,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y podman
           sudo podman pull "ghcr.io/salnajjar/rustysoul@$IMAGE_DIGEST"
           sudo python3 scripts/container-matrix.py --engine podman --image "ghcr.io/salnajjar/rustysoul@$IMAGE_DIGEST" --network host --storage named
+          sudo python3 scripts/container-matrix.py --engine podman --image "ghcr.io/salnajjar/rustysoul@$IMAGE_DIGEST" --network host --storage named --env-only
       - name: Package native executable and release notes
         env:
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}

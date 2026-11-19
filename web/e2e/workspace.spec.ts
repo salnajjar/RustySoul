@@ -2,6 +2,9 @@ import { test, expect, type Page } from "@playwright/test";
 import { emptySnapshot, type Snapshot, type RoomSummary } from "../src/types";
 
 test.beforeEach(async ({ page }) => {
+  await page.route("**/api/v1/messages/read", (route) =>
+    route.fulfill({ status: 202, json: { status: "queued" } }),
+  );
   // These UI tests run without a daemon. Per-test routes registered later can
   // override these two baseline responses with their own session/history data.
   await page.route("**/api/v1/auth/me", (route) =>
@@ -11,6 +14,240 @@ test.beforeEach(async ({ page }) => {
     /\/api\/v1\/transfers\/uploads\?status=blocked&order=updated$/,
     (route) => route.fulfill({ json: { transfers: [], total: 0 } }),
   );
+});
+
+test("private unread alerts clear only when the selected chat reaches its latest message", async ({
+  page,
+}) => {
+  let state: Snapshot = {
+    ...emptySnapshot,
+    connection: "connected",
+    username: "myself",
+    private_read: { peer: 0, other: 0 },
+    private_unread: { peer: 80, other: 1 },
+    room_unread: { club: 1 },
+    messages: [
+      ...Array.from({ length: 80 }, (_, i) => ({
+        id: i + 1,
+        target: "Peer",
+        username: "Peer",
+        text: `Unread private message ${i + 1}`,
+        private: true,
+        timestamp: i + 1,
+      })),
+      {
+        id: 81,
+        target: "other",
+        username: "other",
+        text: "Another conversation",
+        private: true,
+        timestamp: 81,
+      },
+    ],
+  };
+  const reads: { username: string; through_id: number }[] = [];
+  await page.route("**/api/v1/messages/read", async (route) => {
+    const read = route.request().postDataJSON();
+    reads.push(read);
+    state = {
+      ...state,
+      private_read: {
+        ...state.private_read,
+        [read.username.toLowerCase()]: read.through_id,
+      },
+      private_unread: {
+        ...state.private_unread,
+        [read.username.toLowerCase()]: 0,
+      },
+    };
+    await route.fulfill({ status: 202, json: { status: "queued" } });
+    await page.evaluate(
+      (next) => (window as any).pushFixtureState(next),
+      state,
+    );
+  });
+  await fixture(page, state);
+  await expect(
+    page.getByLabel("81 unread private messages", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByLabel("1 unread room messages", { exact: true }),
+  ).toBeVisible();
+  expect(reads).toHaveLength(0);
+  await page.getByRole("button", { name: "Messages", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Open conversation with Peer", exact: true })
+    .click();
+  await page.locator(".message-list").scrollIntoViewIfNeeded();
+  const jump = page.getByRole("button", {
+    name: "New messages · Jump to latest",
+    exact: true,
+  });
+  await expect(jump).toBeVisible();
+  await page.waitForTimeout(1000);
+  expect(reads).toHaveLength(0);
+  await jump.click();
+  await expect
+    .poll(() => reads.some((r) => r.username === "Peer" && r.through_id === 80))
+    .toBe(true);
+  await expect(
+    page.getByLabel("1 unread private messages", { exact: true }),
+  ).toBeVisible();
+  expect(reads.some((r) => r.username === "other")).toBe(false);
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  state = {
+    ...state,
+    private_unread: { peer: 1, other: 1 },
+    messages: [
+      ...state.messages,
+      {
+        id: 82,
+        target: "Peer",
+        username: "Peer",
+        text: "New private while elsewhere",
+        private: true,
+        timestamp: 82,
+      },
+    ],
+  };
+  await page.evaluate((next) => (window as any).pushFixtureState(next), state);
+  await expect(
+    page.getByLabel("2 unread private messages", { exact: true }),
+  ).toBeVisible();
+  expect(reads.some((r) => r.through_id === 82)).toBe(false);
+});
+
+test("room user controls hide mixed-case messages in rooms and direct chats while retaining share bans", async ({
+  page,
+}, info) => {
+  let state: Snapshot = {
+    ...roomState(),
+    username: "myself",
+    user_rules: [],
+    messages: [
+      {
+        id: 1,
+        target: "club",
+        username: "Peer",
+        text: "Visible before ignoring",
+        private: false,
+        timestamp: 1,
+      },
+      {
+        id: 2,
+        target: "club",
+        username: "PEER",
+        text: "Mixed case room history",
+        private: false,
+        timestamp: 2,
+      },
+      {
+        id: 3,
+        target: "club",
+        username: "other",
+        text: "Keep this room message",
+        private: false,
+        timestamp: 3,
+      },
+      {
+        id: 4,
+        target: "Peer",
+        username: "pEeR",
+        text: "Private history from same user",
+        private: true,
+        timestamp: 4,
+      },
+    ],
+  };
+  const commands: any[] = [];
+  await fixture(page, state);
+  await page.route("**/api/v1/commands", async (route) => {
+    const command = route.request().postDataJSON();
+    commands.push(command);
+    if (command.type === "set_user_rule")
+      state = {
+        ...state,
+        user_rules: [
+          {
+            username: command.username,
+            ignored: command.ignored,
+            banned: command.banned,
+          },
+        ],
+      };
+    await route.fulfill({ status: 202, json: { status: "queued" } });
+    await page.evaluate(
+      (next) => (window as any).pushFixtureState(next),
+      state,
+    );
+  });
+  await page.getByRole("button", { name: "Rooms", exact: true }).click();
+  await expect(
+    page.getByText("Mixed case room history", { exact: true }),
+  ).toBeVisible();
+  await page
+    .locator(".message-list")
+    .getByRole("button", { name: "User options for Peer", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  const ignore = dialog.getByRole("checkbox", {
+    name: "Ignore messages from this user",
+    exact: true,
+  });
+  const ban = dialog.getByRole("checkbox", {
+    name: "Ban this user from my shares",
+    exact: true,
+  });
+  await expect(ignore).toBeVisible();
+  await expect(ban).toBeVisible();
+  await ban.check();
+  await expect(ban).toBeEnabled();
+  await ignore.check();
+  await expect
+    .poll(() => commands.filter((c) => c.type === "set_user_rule").at(-1))
+    .toMatchObject({ ignored: true, banned: true });
+  await dialog
+    .getByRole("button", { name: "Close user details", exact: true })
+    .click();
+  await expect(
+    page.getByText("Visible before ignoring", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Mixed case room history", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Keep this room message", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Messages", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Open conversation with Peer", exact: true })
+    .click();
+  await expect(
+    page.getByText("Private history from same user", { exact: true }),
+  ).toHaveCount(0);
+  await page
+    .locator(".conversation-header")
+    .getByRole("button", { name: "User options for Peer", exact: true })
+    .click();
+  await page.screenshot({
+    path: `../artifacts/chat-user-controls-${info.project.name}.png`,
+    fullPage: true,
+  });
+  await dialog
+    .getByRole("checkbox", {
+      name: "Ignore messages from this user",
+      exact: true,
+    })
+    .uncheck();
+  await expect
+    .poll(() => commands.filter((c) => c.type === "set_user_rule").at(-1))
+    .toMatchObject({ ignored: false, banned: true });
+  await dialog
+    .getByRole("button", { name: "Close user details", exact: true })
+    .click();
+  await expect(
+    page.getByText("Private history from same user", { exact: true }),
+  ).toBeVisible();
 });
 
 test("web app manifest, branded icons and installation controls work together", async ({
@@ -214,9 +451,7 @@ for (const privateChat of [true, false]) {
         })
         .click();
       if (privateChat)
-        await page
-          .getByRole("button", { name: `Open conversation with ${target}` })
-          .click();
+        await page.getByLabel("Message username", { exact: true }).fill(target);
       else {
         const archive = page.locator("details").filter({
           has: page.locator("summary", { hasText: "Saved room history" }),
@@ -3460,6 +3695,104 @@ test("transfer history loads just in time beyond 2500 records and resets on sort
     .toBe(true);
 });
 
+test("speed reporting overrides and automatic download parallelism are editable", async ({
+  page,
+}) => {
+  const posts: any[] = [];
+  const commands: any[] = [];
+  await page.route("**/api/v1/profile", async (r) => {
+    if (r.request().method() === "POST") {
+      posts.push(r.request().postDataJSON());
+      await r.fulfill({ status: 202, json: { status: "queued" } });
+    } else
+      await r.fulfill({
+        json: {
+          description: "",
+          picture: null,
+          likes: [],
+          dislikes: [],
+          away_on_startup: false,
+          away_message: "",
+          report_upload_speed: true,
+          reported_upload_speed_kib: null,
+        },
+      });
+  });
+  await page.route("**/api/v1/commands", (r) => {
+    commands.push(r.request().postDataJSON());
+    return r.fulfill({ status: 202, json: { status: "queued" } });
+  });
+  await fixture(page, emptySnapshot);
+  await page
+    .getByRole("button", { name: "Open settings", exact: true })
+    .click();
+  await page.getByRole("tab", { name: "Profile", exact: true }).click();
+  const custom = page.getByLabel("Custom reported upload speed (KiB/s)", {
+    exact: true,
+  });
+  const report = page.getByRole("checkbox", {
+    name: "Report my upload speed to other users",
+    exact: true,
+  });
+  await expect(report).toBeChecked();
+  await custom.fill("250");
+  await page.getByRole("button", { name: "Save profile", exact: true }).click();
+  await expect.poll(() => posts.length).toBe(1);
+  expect(posts[0]).toMatchObject({
+    reported_upload_speed_kib: 250,
+    report_upload_speed: true,
+  });
+  await report.uncheck();
+  await expect(custom).toBeDisabled();
+  await page.getByRole("button", { name: "Save profile", exact: true }).click();
+  await expect.poll(() => posts.length).toBe(2);
+  expect(posts[1]).toMatchObject({
+    reported_upload_speed_kib: 250,
+    report_upload_speed: false,
+  });
+  await report.check();
+  await custom.fill("");
+  await page.getByRole("button", { name: "Save profile", exact: true }).click();
+  await expect.poll(() => posts.length).toBe(3);
+  expect(posts[2]).toMatchObject({
+    reported_upload_speed_kib: null,
+    report_upload_speed: true,
+  });
+  await page
+    .getByRole("tab", { name: "Network settings", exact: true })
+    .click();
+  const auto = page.getByRole("checkbox", {
+    name: "Automatically use simultaneous downloads offered by a user",
+    exact: true,
+  });
+  await expect(auto).toBeChecked();
+  await expect(
+    page.getByLabel("Maximum downloads per user", { exact: true }),
+  ).toBeDisabled();
+  await auto.uncheck();
+  await page
+    .getByLabel("Maximum downloads per user", { exact: true })
+    .fill("2");
+  await page
+    .getByRole("button", { name: "Save connection settings", exact: true })
+    .click();
+  await expect
+    .poll(() =>
+      commands.some(
+        (c) =>
+          c.type === "update_network" &&
+          c.settings.automatic_download_parallelism === false &&
+          c.settings.download_slots_per_user === 2,
+      ),
+    )
+    .toBe(true);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
+
 test("profile settings save supported public fields and format precedes wishlist", async ({
   page,
 }) => {
@@ -6057,3 +6390,634 @@ test("empty search results queue normally and completed empty files offer saving
     page.getByRole("region", { name: "Empty file", exact: true }),
   ).toHaveCount(0);
 });
+
+test("whole private-conversation rows switch chats by pointer and keyboard", async ({
+  page,
+}) => {
+  await page.route("**/api/v1/commands", (r) =>
+    r.fulfill({ status: 202, json: { status: "queued" } }),
+  );
+  await fixture(page, {
+    ...emptySnapshot,
+    messages: [
+      {
+        id: 1,
+        target: "Alice",
+        username: "Alice",
+        text: "Alice conversation",
+        private: true,
+        timestamp: 1,
+      },
+      {
+        id: 2,
+        target: "Bob",
+        username: "Bob",
+        text: "Bob conversation",
+        private: true,
+        timestamp: 2,
+      },
+    ],
+  });
+  await page.getByRole("button", { name: "Messages", exact: true }).click();
+  const alice = page.getByRole("button", {
+    name: "Open conversation with Alice",
+    exact: true,
+  });
+  await alice.click({ position: { x: 5, y: 5 } });
+  await expect(page.getByRole("log", { name: "Conversation" })).toContainText(
+    "Alice conversation",
+  );
+  await expect(alice).toHaveAttribute("aria-pressed", "true");
+  const bob = page.getByRole("button", {
+    name: "Open conversation with Bob",
+    exact: true,
+  });
+  await bob.focus();
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("log", { name: "Conversation" })).toContainText(
+    "Bob conversation",
+  );
+  await expect(
+    page.getByRole("log", { name: "Conversation" }),
+  ).not.toContainText("Alice conversation");
+  await page
+    .locator(".conversation-header")
+    .getByRole("button", { name: "User options for Bob" })
+    .click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+});
+
+test("room-message search reaches saved history and sender filters without acknowledging unseen arrivals", async ({
+  page,
+}) => {
+  const reads: object[] = [],
+    queries: URLSearchParams[] = [];
+  const state: Snapshot = {
+    ...roomState(),
+    room_read: { club: 10 },
+    room_unread: { club: 0 },
+    messages: [
+      {
+        id: 10,
+        target: "club",
+        username: "peer",
+        text: "Current live conversation",
+        private: false,
+        timestamp: 10,
+      },
+    ],
+  };
+  await page.route("**/api/v1/rooms/read", (r) => {
+    reads.push(r.request().postDataJSON());
+    return r.fulfill({ status: 202, json: { status: "queued" } });
+  });
+  await page.route("**/api/v1/messages?**", (r) => {
+    const q = new URL(r.request().url()).searchParams;
+    queries.push(q);
+    const older = q.has("before_id");
+    return r.fulfill({
+      json: {
+        messages: [
+          {
+            id: older ? 2 : 200,
+            target: "club",
+            username: "Alice",
+            text: older
+              ? "Earliest stored jazz match"
+              : "Archived jazz recommendation",
+            private: false,
+            timestamp: older ? 2 : 200,
+          },
+        ],
+        has_more: !older,
+      },
+    });
+  });
+  await fixture(page, state);
+  await page.getByRole("button", { name: "Rooms", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Search messages", exact: true })
+    .click();
+  await page.getByLabel("Search message text", { exact: true }).fill("jazz");
+  await page
+    .getByLabel("Search messages from user", { exact: true })
+    .fill("Alice");
+  await page
+    .getByRole("button", { name: "Search saved messages", exact: true })
+    .click();
+  await expect(
+    page.getByText("Archived jazz recommendation", { exact: true }),
+  ).toBeVisible();
+  expect(queries[0].get("target")).toBe("club");
+  expect(queries[0].get("filter")).toBe("jazz");
+  expect(queries[0].get("username")).toBe("Alice");
+  await page
+    .getByRole("button", { name: "Load older matches", exact: true })
+    .click();
+  await expect(
+    page.getByText("Earliest stored jazz match", { exact: true }),
+  ).toBeVisible();
+  expect(queries[1].get("before_id")).toBe("200");
+  await pushRoomState(page, {
+    ...state,
+    room_unread: { club: 1 },
+    messages: [
+      ...state.messages,
+      {
+        id: 11,
+        target: "club",
+        username: "peer",
+        text: "Unseen arrival while searching",
+        private: false,
+        timestamp: 11,
+      },
+    ],
+  });
+  await page.waitForTimeout(1100);
+  expect(reads).toHaveLength(0);
+  await expect(page.getByRole("log", { name: "Conversation" })).toBeHidden();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: `../artifacts/message-search-${test.info().project.name}.png`,
+    fullPage: true,
+  });
+  await page
+    .getByRole("button", { name: "Back to conversation", exact: true })
+    .click();
+  await expect(page.getByRole("log", { name: "Conversation" })).toContainText(
+    "Unseen arrival while searching",
+  );
+});
+
+test("advanced attributes filter all paged results and persist in infinite-scroll requests", async ({
+  page,
+}) => {
+  const requests: URLSearchParams[] = [];
+  const files = Array.from({ length: 330 }, (_, i) => ({
+    username: "alice",
+    path: `Music/track-${String(i).padStart(4, "0")}.flac`,
+    size: 2 * 1048576,
+    free_slots: 1,
+    speed: 1024,
+    attributes: {
+      "1": 120,
+      "4": i < 100 ? 44100 : 96000,
+      "5": i < 100 ? 16 : 24,
+    },
+  }));
+  await page.route("**/api/v1/searches/quality-paged/results?**", (r) => {
+    const q = new URL(r.request().url()).searchParams;
+    requests.push(q);
+    const matching = q.has("min_sample_rate") ? files.slice(100) : files;
+    const offset = Number(q.get("offset") || 0);
+    return r.fulfill({
+      json: {
+        files: matching.slice(offset, offset + 100),
+        total: matching.length,
+        offset,
+        users: {
+          alice: { count: matching.length, folders: 1, speed: 1024, slots: 1 },
+        },
+      },
+    });
+  });
+  await fixture(page, {
+    ...emptySnapshot,
+    connection: "connected",
+    searches: [
+      {
+        id: "quality-paged",
+        query: "music",
+        collecting: true,
+        total: 330,
+        revision: 1,
+        results: [],
+      },
+    ],
+  });
+  await page.locator(".advanced-search summary").click();
+  await page
+    .getByLabel("Minimum Sample rate (Hz)", { exact: true })
+    .fill("48000");
+  await page.getByLabel("Minimum Bit depth (bits)", { exact: true }).fill("24");
+  await page
+    .getByRole("checkbox", {
+      name: "Only users with a free upload slot",
+      exact: true,
+    })
+    .check();
+  await page
+    .getByRole("button", { name: "Apply advanced filters", exact: true })
+    .click();
+  await expect(page.getByText(/230 matching files/)).toBeVisible();
+  await expect
+    .poll(() =>
+      requests.some(
+        (q) =>
+          q.get("min_sample_rate") === "48000" &&
+          q.get("min_bit_depth") === "24" &&
+          q.get("free_slots") === "true",
+      ),
+    )
+    .toBe(true);
+  await expect(page.locator(".file-attributes").first()).toContainText(
+    "24-bit · 96 kHz · 2:00",
+  );
+  await page
+    .getByRole("button", { name: "Load more results", exact: true })
+    .scrollIntoViewIfNeeded();
+  await expect
+    .poll(() =>
+      requests.some(
+        (q) =>
+          Number(q.get("offset")) >= 100 &&
+          q.get("min_sample_rate") === "48000",
+      ),
+    )
+    .toBe(true);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: `../artifacts/advanced-search-${test.info().project.name}.png`,
+    fullPage: true,
+  });
+  await page
+    .getByRole("button", { name: "Clear advanced filters", exact: true })
+    .click();
+  await expect(page.getByText(/330 matching files/)).toBeVisible();
+});
+
+test("Soulseek sign-up validates confirmation and waits for daemon verification", async ({
+  page,
+}) => {
+  let submitted: any;
+  await page.route("**/api/v1/commands", (r) => {
+    submitted = r.request().postDataJSON();
+    return r.fulfill({ status: 202, json: { status: "queued" } });
+  });
+  await fixture(page, emptySnapshot);
+  await page
+    .getByRole("button", { name: "Open settings", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Create a Soulseek account", exact: true })
+    .click();
+  await page
+    .getByLabel("Soulseek username", { exact: true })
+    .fill("human-chosen-name");
+  await page
+    .getByLabel("Soulseek password", { exact: true })
+    .fill("chosen-passphrase");
+  await page
+    .getByLabel("Confirm Soulseek password", { exact: true })
+    .fill("wrong-passphrase");
+  await page
+    .getByRole("button", { name: "Create account and connect", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toContainText("same password twice");
+  expect(submitted).toBeUndefined();
+  await page
+    .getByLabel("Confirm Soulseek password", { exact: true })
+    .fill("chosen-passphrase");
+  await page
+    .getByRole("button", { name: "Create account and connect", exact: true })
+    .click();
+  await expect
+    .poll(() => submitted)
+    .toEqual({
+      type: "update_credentials",
+      username: "human-chosen-name",
+      password: "chosen-passphrase",
+    });
+  await expect(
+    page.getByLabel("Soulseek password", { exact: true }),
+  ).toHaveValue("chosen-passphrase");
+  await pushRoomState(page, {
+    ...emptySnapshot,
+    username: "human-chosen-name",
+    credentials_configured: true,
+    credentials_revision: 1,
+    connection: "connected",
+  });
+  await expect(
+    page.getByText("Login verified. Account saved and connected to Soulseek.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByLabel("Soulseek password", { exact: true }),
+  ).toHaveValue("");
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: `../artifacts/account-signup-${test.info().project.name}.png`,
+    fullPage: true,
+  });
+});
+
+test("file searches submit the selected user or room scope", async ({
+  page,
+}) => {
+  const commands: any[] = [];
+  await page.route("**/api/v1/commands", (r) => {
+    commands.push(r.request().postDataJSON());
+    return r.fulfill({ status: 202, json: { status: "queued" } });
+  });
+  await fixture(page, { ...emptySnapshot, connection: "connected" });
+  await page.getByLabel("Search scope", { exact: true }).selectOption("user");
+  await page.getByLabel("Search username", { exact: true }).fill("alice");
+  await page
+    .getByLabel("Search the Soulseek network", { exact: true })
+    .fill("ambient");
+  await page
+    .getByRole("button", { name: "Search network", exact: true })
+    .click();
+  await expect
+    .poll(() => commands.at(-1))
+    .toEqual({
+      type: "search_scoped",
+      query: "ambient",
+      scope: { type: "user", username: "alice" },
+    });
+  await page.getByLabel("Search scope", { exact: true }).selectOption("room");
+  await page.getByLabel("Search room name", { exact: true }).fill("club");
+  await page
+    .getByRole("button", { name: "Search network", exact: true })
+    .click();
+  await expect
+    .poll(() => commands.at(-1))
+    .toEqual({
+      type: "search_scoped",
+      query: "ambient",
+      scope: { type: "room", room: "club" },
+    });
+});
+
+test("closing chats removes rows and selects unread then above then below then empty", async ({
+  page,
+}) => {
+  await page.route("**/api/v1/commands", (r) =>
+    r.fulfill({ status: 202, json: { status: "queued" } }),
+  );
+  await fixture(page, {
+    ...emptySnapshot,
+    username: "self",
+    private_unread: { dave: 1 },
+    messages: ["Alice", "Bob", "Carol", "Dave"].map((target, i) => ({
+      id: i + 1,
+      target,
+      username: target,
+      text: `Saved ${target}`,
+      private: true,
+      timestamp: i + 1,
+    })),
+  });
+  await page.getByRole("button", { name: "Messages", exact: true }).click();
+  const row = (name: string) =>
+    page.getByRole("button", {
+      name: `Open conversation with ${name}`,
+      exact: true,
+    });
+  const close = page.getByRole("button", { name: "Close chat", exact: true });
+  const log = page.getByRole("log", { name: "Conversation" });
+  await row("Bob").click();
+  await close.click();
+  await expect(row("Bob")).toHaveCount(0);
+  await expect(row("Dave")).toHaveAttribute("aria-pressed", "true");
+  await expect(log).toContainText("Saved Dave");
+  await close.click();
+  await expect(row("Dave")).toHaveCount(0);
+  await expect(row("Carol")).toHaveAttribute("aria-pressed", "true");
+  await expect(log).toContainText("Saved Carol");
+  await row("Alice").click();
+  await close.click();
+  await expect(row("Alice")).toHaveCount(0);
+  await expect(row("Carol")).toHaveAttribute("aria-pressed", "true");
+  await close.click();
+  await expect(page.locator(".room-list .room-item")).toHaveCount(0);
+  await expect(
+    page.getByLabel("Message username", { exact: true }),
+  ).toHaveValue("");
+  await expect(
+    page.getByText("Start a conversation", { exact: true }),
+  ).toBeVisible();
+  await expect(log).not.toContainText("Saved");
+  // Closing preserves all history and explicit reopening restores its row.
+  await page.getByLabel("Message username", { exact: true }).fill("Bob");
+  await expect(row("Bob")).toHaveAttribute("aria-pressed", "true");
+  await expect(log).toContainText("Saved Bob");
+});
+
+test("closed chats stay hidden on refresh and reopen on a new archived message", async ({
+  page,
+}) => {
+  await page.route("**/api/v1/commands", (r) =>
+    r.fulfill({ status: 202, json: { status: "queued" } }),
+  );
+  let latest = 7;
+  await fixture(
+    page,
+    { ...emptySnapshot, username: "self", message_revision: 1, messages: [] },
+    true,
+  );
+  await page.route("**/api/v1/messages/conversations", (r) =>
+    r.fulfill({
+      json: [{ target: "Alice", private: true, latest_id: latest }],
+    }),
+  );
+  await page.route("**/api/v1/messages?**", (r) =>
+    r.fulfill({
+      json: {
+        messages: [
+          {
+            id: latest,
+            target: "Alice",
+            username: "Alice",
+            text: "Saved Alice history",
+            private: true,
+            timestamp: latest,
+          },
+        ],
+        has_more: false,
+      },
+    }),
+  );
+  await page.getByRole("button", { name: "Messages", exact: true }).click();
+  const row = page.getByRole("button", {
+    name: "Open conversation with Alice",
+    exact: true,
+  });
+  await row.click();
+  await expect(page.getByRole("log", { name: "Conversation" })).toContainText(
+    "Saved Alice history",
+  );
+  await page.getByRole("button", { name: "Close chat", exact: true }).click();
+  await expect(row).toHaveCount(0);
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Conversations", exact: true }),
+  ).toBeVisible();
+  await expect(row).toHaveCount(0);
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  latest = 8;
+  await page.getByRole("button", { name: "Messages", exact: true }).click();
+  await expect(row).toBeVisible();
+  await row.click();
+  await expect(page.getByRole("log", { name: "Conversation" })).toContainText(
+    "Saved Alice history",
+  );
+});
+
+for (const mode of ["topic", "dislikes"] as const) {
+  test(`exploring a profile ${mode} interest offers confirmed like/dislike controls for that topic`, async ({
+    page,
+  }, info) => {
+    let state: Snapshot = {
+      ...emptySnapshot,
+      connection: "connected",
+      username: "self",
+      discovery: discoveryFixture(),
+      profile: {
+        description: "Preserve my description",
+        likes: ["blues"],
+        dislikes: ["spam"],
+        away_on_startup: false,
+        away_message: "",
+        has_picture: true,
+        revision: 1,
+      },
+      users: {
+        alice: {
+          ...profileFixture(),
+          interests: {
+            likes: ["jazz"],
+            dislikes: ["noise"],
+            updated_at: 1700000000,
+          },
+        },
+      },
+    };
+    const item = mode === "topic" ? "jazz" : "noise";
+    const commands: Record<string, unknown>[] = [];
+    await fixture(page, state);
+    await page.route("**/api/v1/commands", async (r) => {
+      const command = r.request().postDataJSON();
+      commands.push(command);
+      if (command.type === "discover")
+        state = {
+          ...state,
+          discovery: {
+            ...discoveryFixture(),
+            query: command.query,
+            recommendations: [],
+            against: [],
+            people: [],
+            recommendations_pending: true,
+            people_pending: true,
+          },
+        };
+      if (command.type === "set_interest") {
+        const likes = state.profile!.likes.filter((v) => v !== command.item);
+        const dislikes = state.profile!.dislikes.filter(
+          (v) => v !== command.item,
+        );
+        if (command.disposition === "like") likes.push(command.item);
+        if (command.disposition === "dislike") dislikes.push(command.item);
+        state = {
+          ...state,
+          profile: {
+            ...state.profile!,
+            likes,
+            dislikes,
+            revision: state.profile!.revision + 1,
+          },
+        };
+      }
+      await r.fulfill({ status: 202, json: { status: "queued" } });
+      await page.evaluate(
+        (next) => (window as any).pushFixtureState(next),
+        state,
+      );
+    });
+    await page.getByRole("button", { name: "Discover", exact: true }).click();
+    await page
+      .getByRole("button", { name: "User options for alice", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: `Explore ${item} from alice`, exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", {
+        name:
+          mode === "topic" ? `Related to ${item}` : `Shared dislike: ${item}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    const controls = page.getByRole("group", {
+      name: `Your preference for ${item}`,
+      exact: true,
+    });
+    await controls
+      .getByRole("button", { name: `Like ${item}`, exact: true })
+      .click();
+    await expect(
+      controls.getByRole("button", {
+        name: `Remove like for ${item}`,
+        exact: true,
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await controls
+      .getByRole("button", { name: `Dislike ${item}`, exact: true })
+      .click();
+    await expect(
+      controls.getByRole("button", {
+        name: `Remove dislike for ${item}`,
+        exact: true,
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await expect(
+      controls.getByRole("button", { name: `Like ${item}`, exact: true }),
+    ).toHaveAttribute("aria-pressed", "false");
+    expect(state.profile!.likes).toEqual(["blues"]);
+    expect(state.profile!.dislikes).toEqual(["spam", item]);
+    expect(state.profile!.description).toBe("Preserve my description");
+    expect(state.profile!.has_picture).toBe(true);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    await page.screenshot({
+      path: `../artifacts/discovery-interest-${mode}-${info.project.name}.png`,
+      fullPage: true,
+    });
+    // The same controls can edit saved interests while disconnected.
+    state = { ...state, connection: "disconnected" };
+    await page.evaluate(
+      (next) => (window as any).pushFixtureState(next),
+      state,
+    );
+    await controls
+      .getByRole("button", { name: `Remove dislike for ${item}`, exact: true })
+      .click();
+    await expect(
+      controls.getByRole("button", { name: `Dislike ${item}`, exact: true }),
+    ).toHaveAttribute("aria-pressed", "false");
+    expect(state.profile!.dislikes).toEqual(["spam"]);
+    expect(commands.filter((c) => c.type === "set_interest")).toEqual([
+      { type: "set_interest", item, disposition: "like" },
+      { type: "set_interest", item, disposition: "dislike" },
+      { type: "set_interest", item, disposition: "remove" },
+    ]);
+  });
+}

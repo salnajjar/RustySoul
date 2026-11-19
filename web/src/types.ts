@@ -48,6 +48,8 @@ export interface Message {
   timestamp: number;
 }
 export interface ProfileSettings {
+  report_upload_speed?: boolean;
+  reported_upload_speed_kib?: number | null;
   description: string;
   picture: string | null;
   likes: string[];
@@ -85,10 +87,14 @@ export interface Snapshot {
   sharing_policy?: SharingSettings;
   room_read?: Record<string, number>;
   room_unread?: Record<string, number>;
+  private_read?: Record<string, number>;
+  private_unread?: Record<string, number>;
   subscribed_rooms?: string[];
   effective_peer_limit?: number;
   profile?: Omit<ProfileSettings, "picture"> & {
     has_picture: boolean;
+    measured_upload_speed?: number;
+    upload_speed_measured?: boolean;
     revision: number;
   };
   traffic?: { downloaded: number; uploaded: number; since: number };
@@ -131,6 +137,7 @@ export interface Snapshot {
     upload_per_user_limit_kib: number;
     download_slots: number;
     download_slots_per_user: number;
+    automatic_download_parallelism?: boolean;
     upload_slots_per_user: number;
     connect_on_startup: boolean;
     user_limits: {
@@ -266,6 +273,7 @@ export const emptySnapshot: Snapshot = {
     upload_per_user_limit_kib: 0,
     download_slots: 4,
     download_slots_per_user: 1,
+    automatic_download_parallelism: true,
     upload_slots_per_user: 1,
     connect_on_startup: true,
     user_limits: [],
@@ -302,7 +310,7 @@ export const emptySnapshot: Snapshot = {
   notice: null,
   credentials_configured: false,
   credentials_revision: 0,
-  version: "0.1.0-beta.3",
+  version: "0.1.0-beta.4",
   connection: "disconnected",
   error: null,
   username: "",

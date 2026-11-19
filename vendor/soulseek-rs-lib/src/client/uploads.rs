@@ -11,6 +11,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 impl Client {
+    /// None measures normally; a positive value overrides it; zero withholds speed.
+    /// Configuration alone sends no server report and does not inflate upload counts.
+    pub fn configure_upload_speed_reporting(&self, override_speed:Option<u32>, measured:u32) {
+        if let Ok(mut ctx)=self.context.write_safe() {ctx.reported_upload_speed=override_speed;ctx.measured_upload_speed=Some(measured);}
+    }
+    pub fn own_upload_availability(&self)->(u32,bool) {
+        self.context.read_safe().map(|ctx|(ctx.upload_queue.len() as u32,ctx.has_free_upload_slot())).unwrap_or((0,false))
+    }
     /// Local manual preferences apply within the protocol's privilege classes;
     /// already offered/streaming transfers are not interrupted.
     pub fn set_upload_queue_order(&self, rules: Vec<(String,String,i8,u64)>) {
@@ -380,6 +388,7 @@ impl Client {
         result: std::io::Result<u64>,
     ) {
         let streamed = result.as_ref().ok().copied();
+        let mut completed_now = false;
         let mut report = None;
         if let Ok(mut ctx) = context.write_safe()
             && let Some(upload) = ctx.active_uploads.get_mut(&token)
@@ -390,7 +399,7 @@ impl Client {
                 upload.status=UploadStatus::Cancelled;
             } else if matches!(upload.status,UploadStatus::InProgress) {
                 upload.status=match &result {
-                    Ok(_) => UploadStatus::Completed,
+                    Ok(_) => { completed_now = true; UploadStatus::Completed },
                     Err(e) if e.kind()==std::io::ErrorKind::Interrupted => UploadStatus::Cancelled,
                     Err(e) if e.kind()==std::io::ErrorKind::TimedOut => {
                         let reason=e.to_string();
@@ -409,9 +418,10 @@ impl Client {
                 };
             }
             let secs = upload.started.elapsed().as_secs_f64();
-            if let Some(bytes) = streamed && secs>0.0 && matches!(upload.status,UploadStatus::Completed) {
+            if let Some(bytes) = streamed && secs>0.0 && completed_now {
                 let speed=(bytes as f64/secs) as u32;ctx.last_upload_speed=speed;
-                report=ctx.server_sender.clone().map(|s|(s,speed));
+                let advertised=ctx.advertised_upload_speed();
+                report=ctx.server_sender.clone().map(|s|(s,advertised));
             }
         }
         // The server folds each finished upload's rate into the average
@@ -467,6 +477,38 @@ impl Client {
 #[cfg(test)]
 mod outcomes {
     use super::*;
+    #[test]
+    fn configured_rates_are_reported_once_per_completed_upload_including_hidden_zero() {
+        for (override_speed,expected) in [(None,123456),(Some(555000),555000),(Some(0),0)] {
+            let client=client_with_upload(UploadStatus::InProgress);
+            let (tx,rx)=std::sync::mpsc::channel();
+            client.context.write().unwrap().server_sender=Some(tx);
+            client.configure_upload_speed_reporting(override_speed,123456);
+            assert!(rx.try_recv().is_err(),"Configuration must not add phantom uploaded files");
+            assert_eq!(client.context.read().unwrap().advertised_upload_speed(),expected);
+            Client::finish_upload(&client.context,7,Path::new("a.flac"),Ok(10));
+            let ServerMessage::SendMessage(message)=rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() else {panic!("expected rate report")};
+            assert_eq!(message,MessageFactory::build_send_upload_speed(expected));
+            Client::finish_upload(&client.context,7,Path::new("a.flac"),Ok(10));
+            assert!(rx.try_recv().is_err(),"Duplicate completion must not count twice");
+            client.configure_upload_speed_reporting(None,321000);
+            assert_eq!(client.context.read().unwrap().advertised_upload_speed(),321000);
+        }
+    }
+    #[test]
+    fn own_queue_statistics_cover_the_entire_queue_without_preview_limits() {
+        let client=Client::new("fixture","password");
+        assert_eq!(client.own_upload_availability().0,0);
+        {
+            let mut ctx=client.context.write().unwrap();
+            for seq in 0..900 {
+                ctx.upload_queue.push(super::super::upload_queue::QueuedUpload {
+                    downloader:"alice".into(),virtual_path:format!("{seq}.flac"),real_path:Path::new("unused").into(),size:10,privileged:false,seq,manual_order:None
+                });
+            }
+        }
+        assert_eq!(client.own_upload_availability().0,900);
+    }
     fn client_with_upload(status:UploadStatus)->Client {
         let client=Client::new("fixture","password");
         client.context.write().unwrap().active_uploads.insert(7,ActiveUpload{payload_bytes:Arc::new(AtomicU64::new(0)),username:"alice".into(),filename:"a.flac".into(),size:10,bytes_sent:Arc::new(AtomicU64::new(4)),cancel:Arc::new(AtomicBool::new(false)),status,started:std::time::Instant::now()});client

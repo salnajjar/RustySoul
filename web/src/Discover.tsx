@@ -56,6 +56,44 @@ export default function Discover({
     state.profile?.likes.includes(item.toLowerCase());
   const disliked = (item: string) =>
     state.profile?.dislikes.includes(item.toLowerCase());
+  function interestButtons(item: string, labelled = false) {
+    return (
+      <>
+        <button
+          className={labelled ? "button small secondary" : "icon-button"}
+          aria-pressed={Boolean(liked(item))}
+          onClick={() =>
+            void send({
+              type: "set_interest",
+              item,
+              disposition: liked(item) ? "remove" : "like",
+            })
+          }
+          aria-label={`${liked(item) ? "Remove like for" : "Like"} ${item}`}
+          title="Add or remove a like"
+        >
+          <ThumbsUp size={16} aria-hidden="true" />
+          {labelled && "Like"}
+        </button>
+        <button
+          className={labelled ? "button small secondary" : "icon-button"}
+          aria-pressed={Boolean(disliked(item))}
+          onClick={() =>
+            void send({
+              type: "set_interest",
+              item,
+              disposition: disliked(item) ? "remove" : "dislike",
+            })
+          }
+          aria-label={`${disliked(item) ? "Remove dislike for" : "Dislike"} ${item}`}
+          title="Add or remove a dislike"
+        >
+          <ThumbsDown size={16} aria-hidden="true" />
+          {labelled && "Dislike"}
+        </button>
+      </>
+    );
+  }
   function itemRow(
     r: { item: string; rating: number },
     dislikeContext = false,
@@ -92,36 +130,7 @@ export default function Discover({
           >
             <Search size={16} />
           </button>
-          <button
-            className="icon-button"
-            aria-pressed={Boolean(liked(r.item))}
-            onClick={() =>
-              void send({
-                type: "set_interest",
-                item: r.item,
-                disposition: liked(r.item) ? "remove" : "like",
-              })
-            }
-            aria-label={`${liked(r.item) ? "Remove like for" : "Like"} ${r.item}`}
-            title="Add or remove a like"
-          >
-            <ThumbsUp size={16} />
-          </button>
-          <button
-            className="icon-button"
-            aria-pressed={Boolean(disliked(r.item))}
-            onClick={() =>
-              void send({
-                type: "set_interest",
-                item: r.item,
-                disposition: disliked(r.item) ? "remove" : "dislike",
-              })
-            }
-            aria-label={`${disliked(r.item) ? "Remove dislike for" : "Dislike"} ${r.item}`}
-            title="Add or remove a dislike"
-          >
-            <ThumbsDown size={16} />
-          </button>
+          {interestButtons(r.item)}
         </div>
       </li>
     );
@@ -261,10 +270,23 @@ export default function Discover({
               recommendations and similar listeners.
             </p>
           )}
-        {query.mode === "topic" && <h2>Related to {query.item}</h2>}
+        {(query.mode === "topic" || query.mode === "dislikes") && (
+          <div className="discovery-interest-heading">
+            <h2>
+              {query.mode === "topic" ? "Related to" : "Shared dislike:"}{" "}
+              {query.item}
+            </h2>
+            <div
+              className="discovery-actions"
+              role="group"
+              aria-label={`Your preference for ${query.item}`}
+            >
+              {interestButtons(query.item, true)}
+            </div>
+          </div>
+        )}
         {query.mode === "dislikes" && (
           <>
-            <h2>Shared dislike: {query.item}</h2>
             <p className="hint">
               People and topics are matched against published dislikes. We check
               a sample from server suggestions, your rooms, buddies and recently

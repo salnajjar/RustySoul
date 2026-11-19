@@ -41,7 +41,10 @@ impl Scope {
         }
         self == Self::Control
             && method == "POST"
-            && matches!(path, "/commands" | "/downloads/batch" | "/profile")
+            && matches!(
+                path,
+                "/commands" | "/downloads/batch" | "/profile" | "/rooms/read" | "/messages/read"
+            )
     }
 }
 #[derive(Clone, Serialize)]
@@ -80,6 +83,8 @@ fn now() -> u64 {
         .as_secs()
 }
 fn digest(token: &str) -> [u8; 32] {
+    // API keys contain 256 bits from the OS CSPRNG, not human passwords.
+    // A fast digest is appropriate here; administrator passwords use Argon2id.
     Sha256::digest(token.as_bytes()).into()
 }
 impl Manager {

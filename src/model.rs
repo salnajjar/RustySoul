@@ -10,6 +10,8 @@ pub struct Snapshot {
     pub sharing_policy: crate::sharing::Settings,
     pub room_read: BTreeMap<String, u64>,
     pub room_unread: BTreeMap<String, usize>,
+    pub private_read: BTreeMap<String, u64>,
+    pub private_unread: BTreeMap<String, usize>,
     pub subscribed_rooms: Vec<String>,
     pub profile: crate::profile::View,
     pub effective_peer_limit: usize,
@@ -228,6 +230,7 @@ pub struct NetworkSettings {
     pub upload_per_user_limit_kib: u32,
     pub download_slots: usize,
     pub download_slots_per_user: usize,
+    pub automatic_download_parallelism: bool,
     pub upload_slots_per_user: usize,
     pub connect_on_startup: bool,
     pub user_limits: Vec<UserLimit>,
@@ -258,6 +261,7 @@ impl Default for NetworkSettings {
             upload_per_user_limit_kib: 0,
             download_slots: 4,
             download_slots_per_user: 1,
+            automatic_download_parallelism: true,
             upload_slots_per_user: 1,
             connect_on_startup: true,
             user_limits: vec![],
@@ -265,6 +269,13 @@ impl Default for NetworkSettings {
     }
 }
 impl NetworkSettings {
+    pub fn effective_download_slots_per_user(&self) -> usize {
+        if self.automatic_download_parallelism {
+            self.download_slots.max(1)
+        } else {
+            self.download_slots_per_user
+        }
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.minimum_free_space_mib > crate::storage::MAX_MINIMUM_MIB {
             return Err("Choose a free-space reserve from 0 to 1,000,000 GiB".into());
@@ -408,6 +419,10 @@ pub enum Command {
         room: String,
         through_id: u64,
     },
+    ReadPrivate {
+        username: String,
+        through_id: u64,
+    },
     UpdateProfile {
         settings: crate::profile::Profile,
     },
@@ -476,6 +491,8 @@ pub enum Command {
     ClearMessageHistory {
         target: String,
         private: bool,
+        #[serde(default)]
+        range: crate::messages::DeleteRange,
     },
     UpdateNetwork {
         settings: NetworkSettings,
@@ -666,6 +683,16 @@ impl Command {
                 }
                 Ok(())
             }
+            Self::ReadPrivate {
+                username,
+                through_id,
+            } => {
+                crate::validation::username(username)?;
+                if *through_id > i64::MAX as u64 {
+                    return Err("Invalid private message cursor".into());
+                }
+                Ok(())
+            }
             Self::UpdateProfile { settings } | Self::UpdateProfilePrepared { settings, .. } => {
                 settings.validate().map_err(|e| e.to_string())
             }
@@ -798,7 +825,12 @@ impl Command {
                 }
                 text(content, 2000)
             }
-            Self::ClearMessageHistory { target, private } => {
+            Self::ClearMessageHistory {
+                target,
+                private,
+                range,
+            } => {
+                range.bounds(0).map_err(|e| e.to_string())?;
                 if *private {
                     username(target)
                 } else {

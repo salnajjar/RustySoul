@@ -1,0 +1,1 @@
+Synthetic 440 Hz test tones, 1.2 seconds, stereo, 48000 Hz. Generated with FFmpeg from lavfi; no third-party recordings. WAV is 24-bit PCM; AIFF is 16-bit PCM; the MP3 is CBR 192 kbps. These fixtures exercise metadata probing, not audio playback.

@@ -47,6 +47,139 @@ fn offer(
 }
 
 #[test]
+fn automatic_parallelism_accepts_multiple_files_from_one_peer_but_obeys_global_slots() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        while let Ok((code, _)) = receive(&mut s) {
+            if code == 1 {
+                let mut r = vec![1];
+                r.extend(string("Parallel fixture"));
+                r.extend([1, 0, 0, 127]);
+                r.extend(string("checksum"));
+                r.push(0);
+                send(&mut s, 1, &r);
+            }
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: temp.path().into(),
+        ..Default::default()
+    };
+    config.soulseek.server = "127.0.0.1".into();
+    config.soulseek.port = server_port;
+    config.soulseek.listen_port = peer_port;
+    config.soulseek.auto_connect = false;
+    let h = engine::start(
+        config,
+        Secrets::new("s".repeat(32), "self".into(), "password".into()).unwrap(),
+    )
+    .unwrap();
+    h.commands
+        .send(Command::UpdateNetwork {
+            settings: NetworkSettings {
+                port: peer_port,
+                minimum_free_space_mib: 0,
+                download_slots: 2,
+                // The saved manual cap must not prevent automatic offers.
+                download_slots_per_user: 1,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    h.commands.send(Command::Connect).unwrap();
+    wait_for(&h, |s| s.connection == "connected");
+    let mut alice = control(peer_port, "alice");
+    h.commands
+        .send(Command::DownloadBatch {
+            files: ["a.flac", "b.flac", "c.flac"]
+                .map(|p| DownloadFile {
+                    username: "alice".into(),
+                    path: p.into(),
+                    size: 4096,
+                })
+                .to_vec(),
+        })
+        .unwrap();
+    assert_eq!(receive_code(&mut alice, 43), string("a.flac"));
+    let mut a = offer(&mut alice, peer_port, "alice", "a.flac", 8101, true).unwrap();
+    assert_eq!(receive_code(&mut alice, 43), string("b.flac"));
+    let mut b = offer(&mut alice, peer_port, "alice", "b.flac", 8102, true).unwrap();
+    wait_for(&h, |s| {
+        s.downloads
+            .iter()
+            .filter(|d| d.status == "downloading")
+            .count()
+            == 2
+    });
+    // An eager peer must not overrun the local global maximum.
+    offer(&mut alice, peer_port, "alice", "c.flac", 8103, false);
+    a.write_all(&vec![1; 4096]).unwrap();
+    drop(a);
+    assert_eq!(receive_code(&mut alice, 43), string("c.flac"));
+    let mut c = offer(&mut alice, peer_port, "alice", "c.flac", 8104, true).unwrap();
+    wait_for(&h, |s| {
+        s.downloads
+            .iter()
+            .filter(|d| d.status == "downloading")
+            .count()
+            == 2
+    });
+    b.write_all(&vec![2; 4096]).unwrap();
+    drop(b);
+    c.write_all(&vec![3; 4096]).unwrap();
+    drop(c);
+    wait_for(&h, |s| {
+        s.downloads
+            .iter()
+            .filter(|d| d.status == "completed")
+            .count()
+            == 3
+    });
+    assert!(h.snapshot.borrow().error.is_none());
+    assert_eq!(h.snapshot.borrow().users["self"].queue_size, Some(0));
+    assert_eq!(
+        h.snapshot.borrow().users["self"].average_speed,
+        Some(1048576)
+    );
+    let mut profile = rustysoul::profile::Profile {
+        reported_upload_speed_kib: Some(128),
+        ..Default::default()
+    };
+    h.commands
+        .send(Command::UpdateProfile {
+            settings: profile.clone(),
+        })
+        .unwrap();
+    wait_for(&h, |s| s.users["self"].average_speed == Some(131072));
+    profile.report_upload_speed = false;
+    h.commands
+        .send(Command::UpdateProfile {
+            settings: profile.clone(),
+        })
+        .unwrap();
+    wait_for(&h, |s| {
+        !s.profile.report_upload_speed && s.users["self"].average_speed.is_none()
+    });
+    profile.report_upload_speed = true;
+    profile.reported_upload_speed_kib = None;
+    h.commands
+        .send(Command::UpdateProfile { settings: profile })
+        .unwrap();
+    wait_for(&h, |s| s.users["self"].average_speed == Some(1048576));
+    h.stop.send(()).unwrap();
+    h.thread.join().unwrap();
+    drop(alice);
+    server.join().unwrap();
+}
+
+#[test]
 fn another_users_transfer_fills_slots_when_a_peer_can_only_send_one_file() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let server_port = listener.local_addr().unwrap().port();

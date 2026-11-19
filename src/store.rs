@@ -39,12 +39,12 @@ fn read_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_at_schema(path, 14)
+        Self::open_at_schema(path, 16)
     }
     // Used only to construct a trusted expected schema when validating older
     // backups. Never called on an untrusted backup before exact validation.
     pub(crate) fn open_at_schema(path: &Path, target: u32) -> Result<Self> {
-        ensure!((11..=14).contains(&target), "Unsupported schema target");
+        ensure!((11..=16).contains(&target), "Unsupported schema target");
         let connection = Connection::open(path).context("Cannot open SQLite database")?;
         #[cfg(unix)]
         if path != Path::new(":memory:") {
@@ -189,6 +189,15 @@ impl Store {
         }
         if version < 14 && target >= 14 {
             crate::transfer_timing::migrate(&connection)?;
+        }
+        if version < 15 && target >= 15 {
+            connection.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE private_reads(username TEXT PRIMARY KEY COLLATE NOCASE,last_id INTEGER NOT NULL);
+                INSERT INTO private_reads SELECT lower(target),MAX(id) FROM messages WHERE private=1 GROUP BY target COLLATE NOCASE;
+                PRAGMA user_version=15;COMMIT;")?;
+        }
+        if version < 16 && target >= 16 {
+            connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE upload_speed_estimate(id INTEGER PRIMARY KEY CHECK(id=1),rate REAL NOT NULL CHECK(rate>0)); PRAGMA user_version=16; COMMIT;")?;
         }
         Ok(Self {
             connection,
@@ -560,11 +569,22 @@ impl Store {
         target: &str,
         private: bool,
     ) -> Result<(usize, (u64, u64))> {
+        self.clear_message_history_filtered(target, private, &crate::messages::DeleteRange::All, 0)
+    }
+    pub fn clear_message_history_filtered(
+        &mut self,
+        target: &str,
+        private: bool,
+        range: &crate::messages::DeleteRange,
+        now: u64,
+    ) -> Result<(usize, (u64, u64))> {
         crate::messages::validate(target, private)?;
+        let (from, to) = range.bounds(now)?;
+        let collation = if private { "COLLATE NOCASE" } else { "" };
         let tx = crate::store::write_transaction(&self.connection)?;
         let count = tx.execute(
-            "DELETE FROM messages WHERE private=?1 AND target=?2",
-            params![private, target],
+            &format!("DELETE FROM messages WHERE private=?1 AND target=?2 {collation} AND (?3 IS NULL OR timestamp>=?3) AND (?4 IS NULL OR timestamp<?4)"),
+            params![private, target,from.map(|v|v as i64),to.map(|v|v as i64)],
         )?;
         let start = tx.query_row(
             "UPDATE message_clock SET next_id=next_id+1024 WHERE id=1 RETURNING next_id-1024",

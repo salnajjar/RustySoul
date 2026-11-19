@@ -8,9 +8,9 @@ COPY images/ /build/images/
 RUN npm run build && npm test
 
 FROM rust:1.100-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends zlib1g-dev pkg-config clang && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends zlib1g-dev pkg-config && rm -rf /var/lib/apt/lists/*
 ARG BUILD_JOBS=4
-ENV CC=clang CXX=clang++ CARGO_BUILD_JOBS=${BUILD_JOBS} RUST_TEST_THREADS=4
+ENV CC=gcc CXX=g++ CARGO_BUILD_JOBS=${BUILD_JOBS} RUST_TEST_THREADS=4
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
@@ -21,7 +21,7 @@ COPY --from=web /build/web/dist ./web/dist
 RUN cargo test --locked --all-targets && cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime
-ARG VERSION=0.1.0-beta.3
+ARG VERSION=0.1.0-beta.4
 ARG REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/salnajjar/RustySoul" \
       org.opencontainers.image.title="RustySoul" \

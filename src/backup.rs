@@ -25,7 +25,7 @@ const MAGIC: &[u8; 16] = b"RustySoulBackup1";
 const CHUNK: usize = 64 * 1024;
 pub const MAX_DATABASE: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_UPLOAD: usize = (MAX_DATABASE + 4 * 1024 * 1024) as usize;
-const SCHEMA: u32 = 14;
+const SCHEMA: u32 = 16;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Summary {
@@ -102,6 +102,26 @@ pub(crate) fn regular(path: &Path) -> Result<()> {
     );
     Ok(())
 }
+/// Open the checked file without following a replacement symlink or blocking on
+/// a replacement FIFO. Check the opened handle as well as the directory entry.
+pub(crate) fn regular_reader(path: &Path) -> Result<File> {
+    regular(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    let file = options.open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "Backup state must use regular files"
+    );
+    Ok(file)
+}
 pub(crate) fn workspace(data: &Path) -> Result<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
         .prefix(".rustysoul-backup-")
@@ -117,7 +137,10 @@ pub(crate) fn workspace(data: &Path) -> Result<tempfile::TempDir> {
 
 fn open_read(path: &Path, cancel: &Cancel) -> Result<Connection> {
     regular(path)?;
-    let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
     db.busy_timeout(Duration::from_secs(5))?;
     db.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
@@ -194,10 +217,15 @@ fn derive(pass: &str, salt: &[u8; 16]) -> Result<ChaCha20Poly1305> {
     Ok(cipher)
 }
 fn nonce(prefix: &[u8; 8], index: u32) -> [u8; 12] {
-    let mut n = [0; 12];
-    n[..8].copy_from_slice(prefix);
-    n[8..].copy_from_slice(&index.to_le_bytes());
-    n
+    // The random per-backup prefix and unique chunk counter fill every byte.
+    let counter = index.to_le_bytes();
+    std::array::from_fn(|i| {
+        if i < prefix.len() {
+            prefix[i]
+        } else {
+            counter[i - prefix.len()]
+        }
+    })
 }
 fn header(pass: &str, mut out: impl Write) -> Result<(ChaCha20Poly1305, Vec<u8>, [u8; 8])> {
     let mut salt = [0; 16];
@@ -395,7 +423,7 @@ fn inspect(
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    crate::auth::validate(&admin, "validation-password")?;
+    crate::auth::validate_username(&admin)?;
     let parsed = argon2::password_hash::PasswordHash::new(&hash)
         .map_err(|_| anyhow::anyhow!("Invalid administrator password hash"))?;
     ensure!(
@@ -974,11 +1002,16 @@ fn result_record(config: &crate::config::Config, status: &str, message: &str) ->
 }
 pub(crate) fn last_result(data: &Path) -> Option<serde_json::Value> {
     let path = data.join("restore-last-result.json");
-    regular(&path).ok()?;
-    if fs::metadata(&path).ok()?.len() > 8192 {
+    let file = regular_reader(&path).ok()?;
+    if file.metadata().ok()?.len() > 8192 {
         return None;
     }
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 8192 {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 pub fn apply_pending(config: &crate::config::Config) -> Result<Option<String>> {
     match apply_pending_inner(config) {
@@ -1045,6 +1078,45 @@ pub(crate) fn check_upload_space(data: &Path, bytes: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nonce_layout_is_compatible_and_each_chunk_is_distinct() {
+        let prefix = [9, 8, 7, 6, 5, 4, 3, 2];
+        assert_eq!(
+            nonce(&prefix, 0x01020304),
+            [9, 8, 7, 6, 5, 4, 3, 2, 4, 3, 2, 1]
+        );
+        assert_ne!(nonce(&prefix, 0), nonce(&prefix, 1));
+        assert_ne!(nonce(&prefix, u32::MAX), nonce(&prefix, 0));
+    }
+    #[test]
+    fn restore_status_is_bounded_and_uses_only_regular_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restore-last-result.json");
+        fs::write(&path, br#"{"status":"restored"}"#).unwrap();
+        assert_eq!(last_result(temp.path()).unwrap()["status"], "restored");
+        fs::write(&path, vec![b' '; 8193]).unwrap();
+        assert!(last_result(temp.path()).is_none());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(regular_reader(&path).is_err());
+        assert!(last_result(temp.path()).is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn restore_status_rejects_symlinks_and_socket_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("outside.json");
+        fs::write(&secret, br#"{"status":"outside"}"#).unwrap();
+        let path = temp.path().join("restore-last-result.json");
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        assert!(regular_reader(&path).is_err());
+        assert!(last_result(temp.path()).is_none());
+        fs::remove_file(&path).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(regular_reader(&path).is_err());
+        assert!(last_result(temp.path()).is_none());
+    }
     fn fixture() -> (tempfile::TempDir, crate::config::Config, String) {
         fixture_at_schema(SCHEMA)
     }
@@ -1152,8 +1224,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_schema_eleven_through_thirteen_archives_restore_before_migration() {
-        for legacy in [11, 12, 13] {
+    fn legacy_schema_eleven_through_fifteen_archives_restore_before_migration() {
+        for legacy in [11, 12, 13, 14, 15] {
             let (_temp, config, _) = fixture_at_schema(legacy);
             if legacy >= 12 {
                 let db = Connection::open(config.data_dir.join("rustysoul.sqlite3")).unwrap();

@@ -2349,10 +2349,17 @@ tbody tr:hover {
   color: var(--muted);
   font-size: 11px;
 }
-.user-controls summary {
-  cursor: pointer;
-  font-size: 13px;
+.user-controls {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0 14px 10px;
   margin: 16px 0;
+}
+.user-controls legend {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0 6px;
 }
 .user-controls .checkbox-label {
   margin: 15px 0;
@@ -3291,6 +3298,23 @@ body:has(.audio-player) main {
   flex-wrap: wrap;
   align-items: center;
 }
+.discovery-interest-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 20px;
+}
+.discovery-interest-heading h2 {
+  flex: 1 1 200px;
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.discovery-interest-heading .discovery-actions {
+  gap: 8px;
+}
 .discovery-topic {
   margin: 20px 0;
   align-items: end;
@@ -3791,3 +3815,22 @@ body:has(.audio-player) main {
   flex-wrap: wrap;
   margin: 8px 0;
 }
+
+.room-item[role="button"] {cursor:pointer;}
+.room-item[role="button"]:focus-visible {outline:2px solid var(--accent,#486849);outline-offset:2px;}
+.search-history-form {display:flex;flex-wrap:wrap;gap:12px;padding:16px 0;}
+.search-history-form label {display:flex;flex:1 1 220px;flex-direction:column;gap:6px;}
+.search-history-form .button-row {align-self:end;}
+.message-search-results {max-height:60vh;overflow:auto;overscroll-behavior:contain;}
+.message-list[hidden] {display:none;}
+
+.advanced-search {margin:12px 0;padding:12px 16px;border:1px solid var(--border,#dce2d6);border-radius:12px;}
+.advanced-search summary {cursor:pointer;font-weight:600;}
+.advanced-search form {padding-top:12px;}
+.advanced-ranges {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:12px;}
+.advanced-ranges fieldset {min-width:0;border:1px solid var(--border,#dce2d6);border-radius:8px;padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.advanced-ranges label {display:flex;flex-direction:column;gap:4px;min-width:0;}
+.advanced-ranges input {width:100%;min-width:0;}
+.file-attributes {display:block;white-space:normal;overflow-wrap:anywhere;}
+
+.message-search {padding:0 18px 18px;min-width:0;}

@@ -109,7 +109,7 @@ export default function ConnectionSettings({
           )}
           <p className="hint">
             {fixed !== null
-              ? `This container publishes TCP ${fixed}. To change it, set RUSTYSOUL_TRANSFER_PORT in the deployment and recreate the container. The port shown here always matches the published port.`
+              ? `This container publishes TCP ${fixed}. To change it, set RUSTYSOUL_PUBLISHED_TRANSFER_PORT and the matching published TCP port in the deployment and recreate the container. The port shown here always matches the published port.`
               : "With Linux host networking or a native installation, this port listens directly on the server while connected. It follows this setting without recreating the container. The host firewall and router must also allow this TCP port."}
           </p>
           {state.connection !== "disconnected" && (
@@ -146,8 +146,27 @@ export default function ConnectionSettings({
               "download_slots_per_user",
               1,
               32,
+              settings.automatic_download_parallelism ?? true,
             )}
           </div>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={settings.automatic_download_parallelism ?? true}
+              onChange={(e) =>
+                setSettings({
+                  ...settings,
+                  automatic_download_parallelism: e.target.checked,
+                })
+              }
+            />
+            Automatically use simultaneous downloads offered by a user
+          </label>
+          <p className="hint">
+            Uses additional slots when a peer accepts more files, up to your
+            total download limit. Peers still control their own upload limits.
+            Turn this off to set a manual per-user maximum.
+          </p>
           <p className="hint">
             Zero total slots pauses new transfers. Lowering a limit lets
             existing reservations finish. Active downloads, paused connections

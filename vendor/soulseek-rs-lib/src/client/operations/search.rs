@@ -72,7 +72,7 @@ impl Client {
                     token,
                     &query,
                     ctx.has_free_upload_slot(),
-                    ctx.last_upload_speed,
+                    ctx.advertised_upload_speed(),
                     ctx.upload_queue.len() as u32,
                     &ctx.excluded_search_phrases,
                 ),

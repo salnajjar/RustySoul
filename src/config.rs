@@ -95,21 +95,78 @@ impl Default for Limits {
     }
 }
 impl Config {
+    pub fn load_optional(path: Option<&Path>) -> Result<Self> {
+        if let Some(path) = path {
+            return Self::load(path);
+        }
+        let default = Path::new("rustysoul.toml");
+        if default
+            .try_exists()
+            .context("Cannot check rustysoul.toml")?
+        {
+            return Self::load(default);
+        }
+        Self::finish(Self::default())
+    }
     pub fn load(path: &Path) -> Result<Self> {
-        let mut config: Self = toml::from_str(
+        let config: Self = toml::from_str(
             &std::fs::read_to_string(path)
                 .with_context(|| format!("Cannot read {}", path.display()))?,
         )
         .context("Invalid configuration")?;
-        config.apply_deployment_env(
-            std::env::var("RUSTYSOUL_TRANSFER_PORT").ok().as_deref(),
-            std::env::var("RUSTYSOUL_PUBLISHED_TRANSFER_PORT")
-                .ok()
-                .as_deref(),
-            std::env::var("RUSTYSOUL_BIND").ok().as_deref(),
-        )?;
+        Self::finish(config)
+    }
+    fn finish(mut config: Self) -> Result<Self> {
+        config.apply_environment(|key| std::env::var(key).ok())?;
         config.validate()?;
         Ok(config)
+    }
+    fn apply_environment(&mut self, get: impl Fn(&str) -> Option<String>) -> Result<()> {
+        self.apply_deployment_env(
+            get("RUSTYSOUL_TRANSFER_PORT").as_deref(),
+            get("RUSTYSOUL_PUBLISHED_TRANSFER_PORT").as_deref(),
+            get("RUSTYSOUL_BIND").as_deref(),
+        )?;
+        macro_rules! scalar {
+            ($key:literal, $field:expr) => {
+                if let Some(value) = get($key) {
+                    $field = value.parse().with_context(|| concat!("Invalid ", $key))?;
+                }
+            };
+        }
+        scalar!("RUSTYSOUL_ALLOW_REMOTE", self.allow_remote);
+        scalar!("RUSTYSOUL_SOULSEEK_PORT", self.soulseek.port);
+        scalar!("RUSTYSOUL_AUTO_CONNECT", self.soulseek.auto_connect);
+        scalar!("RUSTYSOUL_MAX_PEERS", self.limits.peers);
+        scalar!("RUSTYSOUL_UPLOAD_SLOTS", self.limits.upload_slots);
+        scalar!(
+            "RUSTYSOUL_DOWNLOAD_BYTES_PER_SECOND",
+            self.limits.download_bytes_per_second
+        );
+        scalar!("RUSTYSOUL_MAX_SEARCH_RESULTS", self.limits.search_results);
+        scalar!("RUSTYSOUL_MAX_BROWSE_FILES", self.limits.browse_files);
+        scalar!("RUSTYSOUL_MAX_SEARCHES", self.limits.searches);
+        scalar!("RUSTYSOUL_MAX_TRANSFERS", self.limits.transfers);
+        if let Some(value) = get("RUSTYSOUL_SOULSEEK_SERVER") {
+            self.soulseek.server = value;
+        }
+        if let Some(value) = get("RUSTYSOUL_DATA_DIR") {
+            ensure!(
+                Path::new(&value).is_absolute(),
+                "RUSTYSOUL_DATA_DIR must be an absolute path"
+            );
+            self.data_dir = value.into();
+        }
+        if let Some(value) = get("RUSTYSOUL_DOWNLOAD_DIR") {
+            self.download_dir = Some(value.into());
+        }
+        if let Some(value) = get("RUSTYSOUL_LIBRARY_DIRS") {
+            self.soulseek.shares = environment_paths("RUSTYSOUL_LIBRARY_DIRS", &value)?;
+        }
+        if let Some(value) = get("RUSTYSOUL_LOCATION_ROOTS") {
+            self.location_roots = environment_paths("RUSTYSOUL_LOCATION_ROOTS", &value)?;
+        }
+        Ok(())
     }
     fn apply_deployment_env(
         &mut self,
@@ -202,6 +259,19 @@ impl Config {
     }
 }
 
+fn environment_paths(name: &str, value: &str) -> Result<Vec<PathBuf>> {
+    if value.trim_start().starts_with('[') {
+        serde_json::from_str(value)
+            .with_context(|| format!("{name} must be a path or a JSON array of paths"))
+    } else {
+        ensure!(
+            !value.is_empty(),
+            "{name} must be a path or a JSON array of paths"
+        );
+        Ok(vec![value.into()])
+    }
+}
+
 // Deliberately no Debug implementation: these values must never enter logs or API responses.
 pub struct Secrets {
     pub api_token: String,
@@ -242,6 +312,83 @@ impl Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn environment_only_configuration_covers_paths_network_limits_and_validates_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = std::collections::HashMap::from([
+            ("RUSTYSOUL_BIND", "all:8585".to_string()),
+            ("RUSTYSOUL_ALLOW_REMOTE", "true".into()),
+            (
+                "RUSTYSOUL_DATA_DIR",
+                dir.path().join("state").to_string_lossy().into_owned(),
+            ),
+            (
+                "RUSTYSOUL_DOWNLOAD_DIR",
+                dir.path().join("downloads").to_string_lossy().into_owned(),
+            ),
+            (
+                "RUSTYSOUL_LIBRARY_DIRS",
+                serde_json::to_string(&vec![dir.path()]).unwrap(),
+            ),
+            (
+                "RUSTYSOUL_LOCATION_ROOTS",
+                serde_json::to_string(&vec![dir.path()]).unwrap(),
+            ),
+            ("RUSTYSOUL_SOULSEEK_SERVER", "127.0.0.1".into()),
+            ("RUSTYSOUL_SOULSEEK_PORT", "12345".into()),
+            ("RUSTYSOUL_AUTO_CONNECT", "false".into()),
+            ("RUSTYSOUL_UPLOAD_SLOTS", "3".into()),
+            ("RUSTYSOUL_MAX_PEERS", "12".into()),
+            ("RUSTYSOUL_MAX_SEARCH_RESULTS", "1234".into()),
+            ("RUSTYSOUL_MAX_BROWSE_FILES", "2345".into()),
+            ("RUSTYSOUL_MAX_TRANSFERS", "77".into()),
+            ("RUSTYSOUL_MAX_SEARCHES", "4".into()),
+            ("RUSTYSOUL_DOWNLOAD_BYTES_PER_SECOND", "999".into()),
+        ]);
+        let mut c = Config::default();
+        c.apply_environment(|k| env.get(k).cloned()).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.bind, "0.0.0.0:8585".parse().unwrap());
+        assert_eq!(c.data_dir, dir.path().join("state"));
+        assert_eq!(c.download_dir, Some(dir.path().join("downloads")));
+        assert_eq!(c.soulseek.shares, vec![dir.path()]);
+        assert_eq!(c.location_roots, vec![dir.path()]);
+        assert!(!c.soulseek.auto_connect);
+        assert_eq!(
+            (c.soulseek.server.as_str(), c.soulseek.port),
+            ("127.0.0.1", 12345)
+        );
+        assert_eq!(
+            (
+                c.limits.peers,
+                c.limits.upload_slots,
+                c.limits.transfers,
+                c.limits.searches
+            ),
+            (12, 3, 77, 4)
+        );
+        assert_eq!(
+            (
+                c.limits.search_results,
+                c.limits.browse_files,
+                c.limits.download_bytes_per_second
+            ),
+            (1234, 2345, 999)
+        );
+        for (key, value) in [
+            ("RUSTYSOUL_ALLOW_REMOTE", "yes"),
+            ("RUSTYSOUL_LIBRARY_DIRS", "[broken"),
+            ("RUSTYSOUL_DATA_DIR", "relative"),
+            ("RUSTYSOUL_MAX_PEERS", "unlimited"),
+        ] {
+            assert!(
+                Config::default()
+                    .apply_environment(|k| if k == key { Some(value.into()) } else { None })
+                    .is_err()
+            );
+        }
+        assert!(Config::load_optional(Some(&dir.path().join("missing.toml"))).is_err());
+    }
     #[test]
     fn supports_specific_adapter_all_aliases_and_install_time_ports() {
         for value in ["all", "all:8484", "0.0.0.0:8484", "192.168.1.1:8484"] {

@@ -144,6 +144,18 @@ pub struct SearchQuery {
     pub file_sort: String,
     pub offset: usize,
     pub username: Option<String>,
+    pub min_bitrate: Option<u32>,
+    pub max_bitrate: Option<u32>,
+    pub min_duration: Option<u32>,
+    pub max_duration: Option<u32>,
+    pub min_sample_rate: Option<u32>,
+    pub max_sample_rate: Option<u32>,
+    pub min_bit_depth: Option<u32>,
+    pub max_bit_depth: Option<u32>,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    pub vbr: Option<bool>,
+    pub free_slots: bool,
 }
 impl Default for SearchQuery {
     fn default() -> Self {
@@ -155,6 +167,18 @@ impl Default for SearchQuery {
             file_sort: "name".into(),
             offset: 0,
             username: None,
+            min_bitrate: None,
+            max_bitrate: None,
+            min_duration: None,
+            max_duration: None,
+            min_sample_rate: None,
+            max_sample_rate: None,
+            min_bit_depth: None,
+            max_bit_depth: None,
+            min_size: None,
+            max_size: None,
+            vbr: None,
+            free_slots: false,
         }
     }
 }
@@ -197,6 +221,8 @@ pub fn page(db: &Connection, id: &str, q: &SearchQuery) -> Result<Page> {
         "largest" => "f.size DESC,f.path",
         "bitrate" => "COALESCE(json_extract(f.attributes,'$.0'),0) DESC,f.path",
         "duration" => "COALESCE(json_extract(f.attributes,'$.1'),9223372036854),f.path",
+        "sample_rate" => "COALESCE(json_extract(f.attributes,'$.4'),0) DESC,f.path",
+        "bit_depth" => "COALESCE(json_extract(f.attributes,'$.5'),0) DESC,f.path",
         _ => anyhow::bail!("Invalid file order"),
     };
     let mut values = vec![
@@ -206,6 +232,53 @@ pub fn page(db: &Connection, id: &str, q: &SearchQuery) -> Result<Page> {
     ];
     let mut where_clause =
         "search_id=?1 AND instr(search_key,?2)>0 AND (?3='all' OR format=?3)".to_string();
+    let mut criteria = false;
+    for (code, min, max) in [
+        ("0", q.min_bitrate, q.max_bitrate),
+        ("1", q.min_duration, q.max_duration),
+        ("4", q.min_sample_rate, q.max_sample_rate),
+        ("5", q.min_bit_depth, q.max_bit_depth),
+    ] {
+        ensure!(
+            min.zip(max).is_none_or(|(a, b)| a <= b),
+            "Minimum attribute value must not exceed maximum"
+        );
+        for (operator, value) in [(">=", min), ("<=", max)] {
+            if let Some(value) = value {
+                criteria = true;
+                values.push(Value::Integer(i64::from(value)));
+                where_clause.push_str(&format!(
+                    " AND json_extract(attributes,'$.{code}'){operator}?{}",
+                    values.len()
+                ));
+            }
+        }
+    }
+    ensure!(
+        q.min_size.zip(q.max_size).is_none_or(|(a, b)| a <= b),
+        "Minimum file size must not exceed maximum"
+    );
+    for (operator, value) in [(">=", q.min_size), ("<=", q.max_size)] {
+        if let Some(value) = value {
+            criteria = true;
+            values.push(Value::Integer(
+                i64::try_from(value).map_err(|_| anyhow::anyhow!("Invalid file size"))?,
+            ));
+            where_clause.push_str(&format!(" AND size{operator}?{}", values.len()));
+        }
+    }
+    if let Some(value) = q.vbr {
+        criteria = true;
+        values.push(Value::Integer(i64::from(value)));
+        where_clause.push_str(&format!(
+            " AND json_extract(attributes,'$.2')=?{}",
+            values.len()
+        ));
+    }
+    if q.free_slots {
+        criteria = true;
+        where_clause.push_str(" AND free_slots>0");
+    }
     for term in q.exclude.split_whitespace().take(32) {
         values.push(Value::Text(term.to_lowercase()));
         where_clause.push_str(&format!(" AND instr(search_key,?{})=0", values.len()));
@@ -215,7 +288,8 @@ pub fn page(db: &Connection, id: &str, q: &SearchQuery) -> Result<Page> {
         where_clause.push_str(&format!(" AND username=?{}", values.len()));
     }
     let tx = crate::store::write_transaction(db)?;
-    let cached = q.filter.is_empty() && q.exclude.trim().is_empty() && q.format == "all";
+    let cached =
+        !criteria && q.filter.is_empty() && q.exclude.trim().is_empty() && q.format == "all";
     let (stats_sql, stats_values) = if cached {
         let mut params = vec![Value::Text(id.into())];
         let condition = if let Some(u) = &q.username {
@@ -332,6 +406,87 @@ pub fn wishlist_id(db: &Connection, id: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attribute_filters_apply_before_counting_grouping_and_pagination_with_unknowns_excluded() {
+        let store = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let db = &store.connection;
+        create(
+            db,
+            &SearchView {
+                id: "quality".into(),
+                query: "music".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        for i in 0..330 {
+            files.push(FileView {
+                username: if i < 160 { "alice" } else { "bob" }.into(),
+                path: format!("Music/{i:04}.flac"),
+                size: 1024,
+                free_slots: 1,
+                speed: 500,
+                attributes: if i == 0 {
+                    BTreeMap::new()
+                } else {
+                    [(1, 120), (4, 96000), (5, 24)].into()
+                },
+            });
+        }
+        files.push(FileView {
+            username: "alice".into(),
+            path: "lossy.mp3".into(),
+            size: 10,
+            free_slots: 0,
+            speed: 20,
+            attributes: [(0, 320), (1, 30), (2, 0)].into(),
+        });
+        append(db, "quality", files, 1000).unwrap();
+        let mut q = SearchQuery {
+            min_sample_rate: Some(48000),
+            min_bit_depth: Some(24),
+            min_duration: Some(100),
+            max_duration: Some(200),
+            min_size: Some(100),
+            max_size: Some(2000),
+            free_slots: true,
+            ..Default::default()
+        };
+        let p = page(db, "quality", &q).unwrap();
+        assert_eq!(p.total, 329);
+        assert_eq!(p.files.len(), 100);
+        assert_eq!(p.users["bob"].count, 170);
+        q.offset = 300;
+        assert_eq!(page(db, "quality", &q).unwrap().files.len(), 29);
+        q = SearchQuery {
+            min_bitrate: Some(320),
+            max_bitrate: Some(320),
+            vbr: Some(false),
+            ..Default::default()
+        };
+        let p = page(db, "quality", &q).unwrap();
+        assert_eq!(p.total, 1);
+        assert_eq!(p.files[0].path, "lossy.mp3");
+        q.free_slots = true;
+        assert_eq!(page(db, "quality", &q).unwrap().total, 0);
+        q.min_bitrate = Some(500);
+        assert!(page(db, "quality", &q).is_err());
+        q = SearchQuery {
+            max_bit_depth: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            page(db, "quality", &q).unwrap().total,
+            0,
+            "Unknown is not zero bit depth"
+        );
+        q = SearchQuery {
+            max_size: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(page(db, "quality", &q).is_err());
+    }
     #[test]
     fn empty_files_remain_searchable_browseable_and_downloadable() {
         let store = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();

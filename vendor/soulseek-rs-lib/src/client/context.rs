@@ -15,6 +15,9 @@ use super::{
 };
 
 impl ClientContext {
+    pub(super) fn advertised_upload_speed(&self)->u32 {
+        self.reported_upload_speed.or(self.measured_upload_speed).unwrap_or(self.last_upload_speed)
+    }
     /// A context for the client that logs in as `username`.
     #[must_use]
     pub fn for_user(username: &str) -> Self {
@@ -88,6 +91,8 @@ impl ClientContext {
             upload_slots: DEFAULT_UPLOAD_SLOTS,
             upload_slots_per_user: usize::MAX,
             last_upload_speed: 0,
+            reported_upload_speed: None,
+            measured_upload_speed: None,
             upload_events: Vec::new(),
             downloads: DownloadStore::new(),
             actor_system,

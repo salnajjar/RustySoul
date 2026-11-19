@@ -2,7 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { Message } from "./types";
 type Page = { messages: Message[]; has_more: boolean };
-export type Conversation = { target: string; private: boolean };
+export type Conversation = {
+  target: string;
+  private: boolean;
+  latest_id?: number;
+};
 
 export function useConversations(
   token: string,
@@ -62,9 +66,10 @@ export function useMessageHistory(
   revision: number | undefined,
   reset: number,
   live: Message[],
+  visibilityKey = "",
 ) {
   const enabled = revision !== undefined;
-  const key = JSON.stringify([target, privateChat, reset]);
+  const key = JSON.stringify([target, privateChat, reset, visibilityKey]);
   const latest = useRef(revision);
   latest.current = revision;
   const [state, setState] = useState<{

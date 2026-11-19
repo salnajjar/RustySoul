@@ -607,6 +607,8 @@ pub struct ClientContext {
     /// Bytes per second of the last completed upload, advertised in search
     /// replies; zero until one has finished.
     last_upload_speed: u32,
+    reported_upload_speed: Option<u32>,
+    measured_upload_speed: Option<u32>,
     /// Queued-upload states that came and went between two polls of
     /// [`Client::uploads`]. A caller sampling that snapshot would otherwise
     /// never see a peer that queued and was served inside one poll interval,

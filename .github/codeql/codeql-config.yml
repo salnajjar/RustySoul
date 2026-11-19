@@ -1,0 +1,10 @@
+name: RustySoul security analysis
+# Generated files and private workspace inputs are not application source.
+# Tests and the vendored protocol implementation remain fully scanned.
+paths-ignore:
+  - ReferenceCode
+  - artifacts
+  - '**/target'
+  - '**/node_modules'
+  - web/dist
+  - docs/GITHUB_TOKEN.md

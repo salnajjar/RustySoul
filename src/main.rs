@@ -10,8 +10,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = "RustySoul — Linux Soulseek daemon")]
 struct Args {
-    #[arg(short, long, default_value = "rustysoul.toml")]
-    config: PathBuf,
+    /// Optional TOML configuration. Environment variables override file values.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
     /// Validate configuration and environment without opening sockets.
     #[arg(long)]
     check: bool,
@@ -49,7 +50,7 @@ async fn main() -> Result<std::process::ExitCode> {
         .with(rustysoul::activity::TraceLayer)
         .init();
     let args = Args::parse();
-    let config = Config::load(&args.config)?;
+    let config = Config::load_optional(args.config.as_deref())?;
     if args.create_backup.is_some()
         || args.inspect_backup.is_some()
         || args.restore_backup.is_some()

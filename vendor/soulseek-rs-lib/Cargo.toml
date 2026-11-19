@@ -53,6 +53,7 @@ name = "resume_e2e"
 path = "tests/resume_e2e.rs"
 
 [dependencies]
+lofty = "=0.25.5"
 
 [target."cfg(unix)".dependencies.libc]
 version = "0.2.189"

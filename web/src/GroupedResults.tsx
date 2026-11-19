@@ -3,6 +3,7 @@ import { Download, FolderOpen, Users } from "lucide-react";
 import type { FileResult } from "./types";
 import { basename, bytes } from "./api";
 import User from "./User";
+import FileAttributes from "./FileAttributes";
 import LoadMore from "./LoadMore";
 import VirtualTable from "./VirtualTable";
 import {
@@ -254,6 +255,8 @@ export default function GroupedResults({
             <option value="largest">Largest first</option>
             <option value="bitrate">Highest bitrate</option>
             <option value="duration">Shortest duration</option>
+            <option value="sample_rate">Highest sample rate</option>
+            <option value="bit_depth">Highest bit depth</option>
           </select>
         </label>
       </div>
@@ -411,9 +414,7 @@ export default function GroupedResults({
                                 ?.toUpperCase()
                                 .slice(0, 6)}
                             </span>
-                            {f.attributes["0"] ? (
-                              <small>{f.attributes["0"]} kbps</small>
-                            ) : null}
+                            <FileAttributes attributes={f.attributes} />
                           </td>
                           <td className="mono">{bytes(f.size)}</td>
                           <td>

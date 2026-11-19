@@ -83,7 +83,7 @@ fn verify(password: &str, encoded: &str) -> bool {
             .is_ok()
     })
 }
-pub fn validate(username: &str, password: &str) -> Result<()> {
+pub fn validate_username(username: &str) -> Result<()> {
     ensure!(
         (3..=64).contains(&username.len())
             && username
@@ -91,6 +91,10 @@ pub fn validate(username: &str, password: &str) -> Result<()> {
                 .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
         "Username must be 3..64 ASCII letters, numbers, dots, underscores or hyphens"
     );
+    Ok(())
+}
+pub fn validate(username: &str, password: &str) -> Result<()> {
+    validate_username(username)?;
     ensure!(
         password.chars().count() >= 8
             && password.len() <= 1024
@@ -122,6 +126,8 @@ impl Auth {
                 let username =
                     std::env::var("RUSTYSOUL_DEFAULT_USERNAME").unwrap_or_else(|_| "admin".into());
                 let password = std::env::var("RUSTYSOUL_DEFAULT_PASSWORD")
+                    // Deployment bootstrap only: must_change gates every
+                    // operational API until BOTH account fields are replaced.
                     .unwrap_or_else(|_| "change-me-now".into());
                 validate(&username, &password)?;
                 let a = Account {

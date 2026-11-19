@@ -37,6 +37,7 @@ struct Engine {
     work_dirs: BTreeMap<(String, String), cap_std::fs::Dir>,
     message_ids: (u64, u64),
     profile: crate::profile::Profile,
+    upload_speed: crate::upload_speed::Estimate,
     away_replied: BTreeMap<String, Instant>,
     traffic_pending: std::collections::HashMap<String, (u64, u64)>,
     traffic_sample_at: Instant,
@@ -68,6 +69,7 @@ struct Engine {
     queue: Vec<SavedDownload>,
     store: Store,
     last_save: Instant,
+    unread_through: u64,
     _instance_lock: std::fs::File,
     retry: Option<Instant>,
     retry_seconds: u64,
@@ -177,6 +179,7 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
         .map_err(anyhow::Error::msg)?;
     }
     let profile = crate::profile::load(&store.connection)?;
+    let upload_speed = crate::upload_speed::Estimate::load(&store.connection)?;
     let mut view = Snapshot {
         room_management: crate::rooms::load(&store.connection, &secrets.username)?,
         discovery: crate::discovery::load(&store.connection, &secrets.username, None)?,
@@ -225,11 +228,12 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
         )?);
     view.subscribed_rooms.sort();
     view.subscribed_rooms.dedup();
-    view.room_read = store
-        .connection
-        .prepare("SELECT room,last_id FROM room_reads")?
-        .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?
-        .collect::<rusqlite::Result<_>>()?;
+    view.room_read = crate::messages::read_cursors(&store.connection, false)?;
+    view.private_read = crate::messages::read_cursors(&store.connection, true)?;
+    view.room_unread = crate::messages::unread(&store.connection, &secrets.username, false, None)?;
+    view.private_unread =
+        crate::messages::unread(&store.connection, &secrets.username, true, None)?;
+    let unread_through = view.messages.last().map_or(0, |m| m.id);
 
     crate::transfers::recover_uploads(&store.connection)?;
     view.uploads = crate::transfers::preview(&store.connection, "uploads")?;
@@ -279,6 +283,7 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
                 work_dirs: BTreeMap::new(),
                 message_ids,
                 profile,
+                upload_speed,
                 away_replied: BTreeMap::new(),
                 traffic_pending: std::collections::HashMap::new(),
                 traffic_sample_at: Instant::now(),
@@ -302,6 +307,7 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
                 queue,
                 store,
                 last_save: Instant::now(),
+                unread_through,
                 _instance_lock: lock,
                 searches: BTreeMap::new(),
                 browsing: BTreeMap::new(),
@@ -450,6 +456,9 @@ impl Engine {
         }
         self.view.profile = profile.view(self.view.profile.revision + 1);
         self.profile = profile;
+        if let Some(c) = &self.client {
+            self.configure_speed_reporting(c);
+        }
         self.view.notice = Some("Profile saved. It is available to peers while connected.".into());
         Ok(())
     }
@@ -467,6 +476,7 @@ impl Engine {
         }
         let downloaded = self.traffic_pending.values().map(|p| p.0).sum();
         let uploaded = self.traffic_pending.values().map(|p| p.1).sum();
+        let elapsed = self.traffic_sample_at.elapsed().as_secs_f64();
         match crate::traffic::record_users(
             &self.store.connection,
             now(),
@@ -475,6 +485,15 @@ impl Engine {
             &self.traffic_pending,
         ) {
             Ok(()) => {
+                if let Err(e) = self
+                    .upload_speed
+                    .observe(&self.store.connection, uploaded, elapsed)
+                {
+                    self.view.error = Some(e.to_string());
+                }
+                if let Some(c) = &self.client {
+                    self.configure_speed_reporting(c);
+                }
                 if downloaded > 0 || uploaded > 0 {
                     self.view.transfer_revision += 1;
                 }
@@ -497,22 +516,17 @@ impl Engine {
         crate::activity::transition("info", "system", self.view.notice.as_deref());
         let mut snapshot = self.view.clone();
         snapshot.privileges = self.privileges.view.clone();
+        snapshot.profile.measured_upload_speed = self.upload_speed.measured();
+        snapshot.profile.upload_speed_measured = self.upload_speed.has_measurement();
         snapshot.away_automatic = self.idle.automatic;
         snapshot.system = self.system.latest();
         snapshot.effective_peer_limit = self.client.as_ref().map_or(0, |c| c.peer_capacity());
-        snapshot.room_unread.clear();
-        for m in &snapshot.messages {
-            if !m.private
-                && m.username != snapshot.username
-                && m.id > *snapshot.room_read.get(&m.target).unwrap_or(&0)
-                && !snapshot
-                    .user_rules
-                    .iter()
-                    .any(|r| r.ignored && r.username.eq_ignore_ascii_case(&m.username))
-            {
-                *snapshot.room_unread.entry(m.target.clone()).or_default() += 1;
-            }
-        }
+        snapshot.messages.retain(|m| {
+            !snapshot
+                .user_rules
+                .iter()
+                .any(|r| r.ignored && r.username.eq_ignore_ascii_case(&m.username))
+        });
         snapshot.download_capacity_used = self
             .queue
             .iter()
@@ -569,13 +583,15 @@ impl Engine {
             Command::SetRoomInvitations { .. } => "Update room invitation preference",
             Command::SendMessage { .. } => "Send message",
             Command::ClearMessageHistory { .. } => "Delete message history",
-            Command::WatchUsers { .. } | Command::ReadRoom { .. } => "",
+            Command::WatchUsers { .. } | Command::ReadRoom { .. } | Command::ReadPrivate { .. } => {
+                ""
+            }
             _ => "Update settings or user controls",
         };
         crate::activity::record("info", "activity", operation);
         if matches!(
             command,
-            Command::WatchUsers { .. } | Command::ReadRoom { .. }
+            Command::WatchUsers { .. } | Command::ReadRoom { .. } | Command::ReadPrivate { .. }
         ) {
             if let Err(e) = self.apply(command) {
                 self.view.error = Some(format!("{e:#}"));
@@ -703,6 +719,7 @@ impl Engine {
             let _ = client.add_dislike(item);
         }
         client.set_away(self.view.away)?;
+        self.configure_speed_reporting(&client);
         client.replace_share_index(self.locations.shares.clone(), self.index.clone())?;
         let _ = client.request_room_list();
         client.set_room_invitations_enabled(crate::rooms::invitations(
@@ -727,11 +744,21 @@ impl Engine {
             .map(|((_, u, p), r)| (u.clone(), p.clone(), r.priority, r.position))
             .collect()
     }
+    fn configure_speed_reporting(&self, client: &Client) {
+        client.configure_upload_speed_reporting(
+            crate::upload_speed::Estimate::override_speed(
+                &self.profile,
+                self.network.upload_limit_kib,
+            ),
+            self.upload_speed.measured(),
+        );
+    }
     fn configure_transfers(&self, client: &Client) {
+        self.configure_speed_reporting(client);
         client.set_download_write_guard(Some(self.storage.clone()));
         client.set_download_slots(
             self.network.download_slots,
-            self.network.download_slots_per_user,
+            self.network.effective_download_slots_per_user(),
         );
         client.set_upload_policy(self.view.sharing_policy.protocol(&self.view.buddies));
         client.set_max_peers(self.network.max_peers);
@@ -768,9 +795,78 @@ impl Engine {
                 .collect(),
         );
     }
+    fn refresh_unread(&mut self, target: &str, private: bool) -> Result<()> {
+        let counts = crate::messages::unread(
+            &self.store.connection,
+            &self.secrets.username,
+            private,
+            Some(target),
+        )?;
+        let map = if private {
+            &mut self.view.private_unread
+        } else {
+            &mut self.view.room_unread
+        };
+        let key = if private {
+            target.to_ascii_lowercase()
+        } else {
+            target.into()
+        };
+        map.remove(&key);
+        map.extend(counts);
+        Ok(())
+    }
+    fn mark_read(&mut self, target: &str, through_id: u64, private: bool) -> Result<()> {
+        let collation = if private { "COLLATE NOCASE" } else { "" };
+        let latest = self.store.connection.query_row(&format!("SELECT COALESCE(MAX(id),0) FROM messages WHERE private=?1 AND target=?2 {collation}"),rusqlite::params![private,target],|r|r.get::<_,i64>(0))? as u64;
+        if latest == 0 {
+            return Ok(());
+        }
+        ensure!(
+            through_id <= latest,
+            "Cannot acknowledge messages that have not arrived"
+        );
+        let (table, column) = if private {
+            ("private_reads", "username")
+        } else {
+            ("room_reads", "room")
+        };
+        self.store.connection.execute(&format!("INSERT INTO {table} VALUES(?1,?2) ON CONFLICT({column}) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)"),rusqlite::params![target,through_id as i64])?;
+        let map = if private {
+            &mut self.view.private_read
+        } else {
+            &mut self.view.room_read
+        };
+        let key = if private {
+            target.to_ascii_lowercase()
+        } else {
+            target.into()
+        };
+        map.entry(key)
+            .and_modify(|id| *id = (*id).max(through_id))
+            .or_insert(through_id);
+        self.refresh_unread(target, private)
+    }
     fn flush_messages(&mut self) -> Result<()> {
         if self.store.save_messages(&self.view.messages)? {
             self.view.message_revision += 1;
+            let targets: std::collections::BTreeSet<_> = self
+                .view
+                .messages
+                .iter()
+                .filter(|m| m.id > self.unread_through)
+                .map(|m| (m.private, m.target.clone()))
+                .collect();
+            for (private, target) in targets {
+                self.refresh_unread(&target, private)?;
+            }
+            self.unread_through = self
+                .view
+                .messages
+                .iter()
+                .map(|m| m.id)
+                .max()
+                .unwrap_or(self.unread_through);
         }
         let overflow = self.view.messages.len().saturating_sub(500);
         self.view.messages.drain(..overflow);
@@ -1080,25 +1176,12 @@ impl Engine {
                 return Ok(());
             }
             Command::ReadRoom { room, through_id } => {
-                let latest = self.store.connection.query_row(
-                    "SELECT COALESCE(MAX(id),0) FROM messages WHERE private=0 AND target=?1",
-                    [&room],
-                    |r| r.get::<_, i64>(0),
-                )? as u64;
-                if latest == 0 {
-                    return Ok(());
-                }
-                ensure!(
-                    through_id <= latest,
-                    "Cannot acknowledge room messages that have not arrived"
-                );
-                let previous = *self.view.room_read.get(&room).unwrap_or(&0);
-                if through_id > previous {
-                    self.store.connection.execute("INSERT INTO room_reads VALUES(?1,?2) ON CONFLICT(room) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)",rusqlite::params![room,through_id as i64])?;
-                    self.view.room_read.insert(room, through_id);
-                }
-                return Ok(());
+                return self.mark_read(&room, through_id, false);
             }
+            Command::ReadPrivate {
+                username,
+                through_id,
+            } => return self.mark_read(&username, through_id, true),
             Command::SetRoomInvitations { enabled } => {
                 self.room_controller.set_invitations(
                     &self.store.connection,
@@ -1270,7 +1353,7 @@ impl Engine {
                 banned,
             } => {
                 ensure!(
-                    username != self.secrets.username,
+                    !username.eq_ignore_ascii_case(&self.secrets.username),
                     "You cannot ignore or ban your own account"
                 );
                 ensure!(
@@ -1282,6 +1365,7 @@ impl Engine {
                             .any(|r| r.username.eq_ignore_ascii_case(&username)),
                     "User control limit reached (512)"
                 );
+                self.flush_messages()?;
                 if !ignored && !banned {
                     self.store
                         .connection
@@ -1294,6 +1378,19 @@ impl Engine {
                     self.view.transfer_revision += 1;
                 }
                 self.view.user_rules = users::rules(&self.store.connection)?;
+                self.view.message_revision += 1;
+                self.view.room_unread = crate::messages::unread(
+                    &self.store.connection,
+                    &self.secrets.username,
+                    false,
+                    None,
+                )?;
+                self.view.private_unread = crate::messages::unread(
+                    &self.store.connection,
+                    &self.secrets.username,
+                    true,
+                    None,
+                )?;
                 if let Some(c) = &self.client {
                     c.set_banned_users(
                         self.view
@@ -1627,13 +1724,27 @@ impl Engine {
                 }
                 return Ok(());
             }
-            Command::ClearMessageHistory { target, private } => {
+            Command::ClearMessageHistory {
+                target,
+                private,
+                range,
+            } => {
                 self.flush_messages()?;
-                let (count, ids) = self.store.clear_message_history(&target, private)?;
+                let at = now();
+                let (count, ids) = self
+                    .store
+                    .clear_message_history_filtered(&target, private, &range, at)?;
                 self.message_ids = ids;
-                self.view
-                    .messages
-                    .retain(|m| m.private != private || m.target != target);
+                self.view.messages.retain(|m| {
+                    !(m.private == private
+                        && (if private {
+                            m.target.eq_ignore_ascii_case(&target)
+                        } else {
+                            m.target == target
+                        })
+                        && range.matches(m.timestamp, at))
+                });
+                self.refresh_unread(&target, private)?;
                 self.view.message_reset = ids.0;
                 self.view.message_revision += 1;
                 self.view.notice = Some(format!("Deleted {count} saved messages from {target}"));
@@ -1655,7 +1766,7 @@ impl Engine {
                     self.config
                         .published_transfer_port
                         .is_none_or(|port| port == settings.port),
-                    "This container uses a fixed published port. Change RUSTYSOUL_TRANSFER_PORT in its deployment and recreate it to change the port"
+                    "This container uses a fixed published port. Change RUSTYSOUL_PUBLISHED_TRANSFER_PORT and its matching TCP port mapping in the deployment and recreate it to change the port"
                 );
                 ensure!(
                     self.config.published_transfer_port.is_none() || !settings.upnp,
@@ -1811,6 +1922,18 @@ impl Engine {
                 self.view.connection = "connected".into();
                 self.secrets.username = username.clone();
                 self.secrets.password = password;
+                self.view.room_unread = crate::messages::unread(
+                    &self.store.connection,
+                    &self.secrets.username,
+                    false,
+                    None,
+                )?;
+                self.view.private_unread = crate::messages::unread(
+                    &self.store.connection,
+                    &self.secrets.username,
+                    true,
+                    None,
+                )?;
                 self.view.username = username;
                 self.view.discovery =
                     crate::discovery::load(&self.store.connection, &self.secrets.username, None)?;
@@ -2229,7 +2352,7 @@ impl Engine {
                     .get(&row.username.to_lowercase())
                     .copied()
                     .unwrap_or(0)
-                    >= self.network.download_slots_per_user
+                    >= self.network.effective_download_slots_per_user()
                 || pending.contains(&row.username.to_lowercase())
             {
                 continue;
@@ -3035,6 +3158,7 @@ mod tests {
         let previous_reset = h.snapshot.borrow().message_reset;
         h.commands
             .send(Command::ClearMessageHistory {
+                range: Default::default(),
                 target: "archived-peer".into(),
                 private: true,
             })
@@ -3070,6 +3194,118 @@ mod tests {
             .unwrap()
             .messages
             .is_empty()
+        );
+    }
+    #[test]
+    fn private_alerts_and_ignore_controls_are_durable_and_independent_of_room_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.path().join("rustysoul.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        store
+            .save_messages(&[
+                MessageView {
+                    id: 1,
+                    target: "room".into(),
+                    username: "PEER".into(),
+                    text: "room message".into(),
+                    private: false,
+                    timestamp: 1,
+                },
+                MessageView {
+                    id: 2,
+                    target: "Peer".into(),
+                    username: "peer".into(),
+                    text: "direct message".into(),
+                    private: true,
+                    timestamp: 2,
+                },
+                MessageView {
+                    id: 3,
+                    target: "other".into(),
+                    username: "other".into(),
+                    text: "another direct".into(),
+                    private: true,
+                    timestamp: 3,
+                },
+            ])
+            .unwrap();
+        drop(store);
+        let mut config = Config {
+            data_dir: dir.path().into(),
+            ..Default::default()
+        };
+        config.soulseek.auto_connect = false;
+        let secret = || Secrets::new("s".repeat(32), "self".into(), "password".into()).unwrap();
+        let h = start(config.clone(), secret()).unwrap();
+        let wait = |h: &EngineHandle, predicate: fn(&Snapshot) -> bool| {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !predicate(&h.snapshot.borrow()) {
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait(&h, |v| {
+            v.private_unread.get("peer") == Some(&1)
+                && v.private_unread.get("other") == Some(&1)
+                && v.room_unread.get("room") == Some(&1)
+        });
+        h.commands
+            .send(Command::SetUserRule {
+                username: "Peer".into(),
+                ignored: true,
+                banned: true,
+            })
+            .unwrap();
+        wait(&h, |v| {
+            !v.private_unread.contains_key("peer")
+                && !v.room_unread.contains_key("room")
+                && v.messages
+                    .iter()
+                    .all(|m| !m.username.eq_ignore_ascii_case("peer"))
+        });
+        h.commands
+            .send(Command::SetUserRule {
+                username: "PEER".into(),
+                ignored: false,
+                banned: false,
+            })
+            .unwrap();
+        wait(&h, |v| {
+            v.private_unread.get("peer") == Some(&1) && v.room_unread.get("room") == Some(&1)
+        });
+        h.commands
+            .send(Command::ReadPrivate {
+                username: "PEER".into(),
+                through_id: 2,
+            })
+            .unwrap();
+        wait(&h, |v| {
+            !v.private_unread.contains_key("peer")
+                && v.private_unread.get("other") == Some(&1)
+                && v.room_unread.get("room") == Some(&1)
+        });
+        h.stop.send(()).unwrap();
+        h.thread.join().unwrap();
+        let h = start(config, secret()).unwrap();
+        wait(&h, |v| {
+            v.private_read.get("peer") == Some(&2)
+                && !v.private_unread.contains_key("peer")
+                && v.private_unread.get("other") == Some(&1)
+        });
+        h.stop.send(()).unwrap();
+        h.thread.join().unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
         );
     }
     #[test]

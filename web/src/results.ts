@@ -2,7 +2,14 @@ import type { FileResult } from "./types";
 export type AudioFormat = "all" | "lossless" | "lossy";
 export type UserSort = "matches" | "speed" | "name" | "available";
 export type FileSort =
-  "name" | "name_desc" | "smallest" | "largest" | "bitrate" | "duration";
+  | "name"
+  | "name_desc"
+  | "smallest"
+  | "largest"
+  | "bitrate"
+  | "duration"
+  | "sample_rate"
+  | "bit_depth";
 export function compareFiles(a: FileResult, b: FileResult, sort: FileSort) {
   let result = 0;
   switch (sort) {
@@ -20,6 +27,12 @@ export function compareFiles(a: FileResult, b: FileResult, sort: FileSort) {
     case "duration":
       result =
         (a.attributes["1"] ?? Infinity) - (b.attributes["1"] ?? Infinity);
+      break;
+    case "sample_rate":
+      result = (b.attributes["4"] || 0) - (a.attributes["4"] || 0);
+      break;
+    case "bit_depth":
+      result = (b.attributes["5"] || 0) - (a.attributes["5"] || 0);
       break;
   }
   return result || a.path.localeCompare(b.path);

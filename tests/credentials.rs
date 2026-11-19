@@ -341,6 +341,7 @@ fn download_scheduler_enforces_total_and_per_user_slots_and_zero_pauses_new_work
         port: server.peer_port,
         download_slots: 2,
         download_slots_per_user: 1,
+        automatic_download_parallelism: false,
         ..Default::default()
     };
     h.commands

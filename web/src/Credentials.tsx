@@ -12,6 +12,8 @@ export default function Credentials({
 }) {
   const [username, setUsername] = useState(state.username);
   const [password, setPassword] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [confirmation, setConfirmation] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
@@ -24,6 +26,7 @@ export default function Credentials({
   useEffect(() => {
     setUsername(state.username);
     setPassword("");
+    setConfirmation("");
     setPending(false);
     setSaved(state.credentials_revision > 0);
   }, [state.username, state.credentials_revision]);
@@ -41,6 +44,12 @@ export default function Credentials({
   async function save(e: FormEvent) {
     e.preventDefault();
     setError("");
+    if (creating && (password.length < 8 || password !== confirmation)) {
+      setError(
+        "Choose a password of at least 8 characters and enter the same password twice.",
+      );
+      return;
+    }
     setSaved(false);
     setPending(true);
     try {
@@ -68,6 +77,50 @@ export default function Credentials({
   return (
     <section className="panel wide" id="soulseek-account">
       <h2>Soulseek account</h2>
+      <div
+        className="button-row"
+        role="group"
+        aria-label="Soulseek account setup"
+      >
+        <button
+          type="button"
+          className="button small secondary"
+          aria-pressed={!creating}
+          disabled={!disconnected || pending}
+          onClick={() => {
+            setCreating(false);
+            setConfirmation("");
+            setError("");
+          }}
+        >
+          Use an existing account
+        </button>
+        <button
+          type="button"
+          className="button small secondary"
+          aria-pressed={creating}
+          disabled={!disconnected || pending}
+          onClick={() => {
+            setCreating(true);
+            setPassword("");
+            setConfirmation("");
+            setError("");
+            setSaved(false);
+          }}
+        >
+          Create a Soulseek account
+        </button>
+      </div>
+      {creating && (
+        <p className="hint">
+          Choose your own username and password. Soulseek creates an unused
+          username when you first connect. If a name is already registered with
+          another password, choose a different name. No email or website
+          registration is required. Keep your password safe; the network has no
+          automatic password reset. This is separate from your RustySoul
+          administrator account.
+        </p>
+      )}
       <form className="credentials-form" onSubmit={save}>
         <label>
           Soulseek username
@@ -93,6 +146,7 @@ export default function Credentials({
             type="password"
             autoComplete="new-password"
             maxLength={1024}
+            minLength={creating ? 8 : undefined}
             value={password}
             disabled={
               (!disconnected && state.connection !== "verifying") || pending
@@ -103,7 +157,9 @@ export default function Credentials({
                 : "Enter your password"
             }
             required={
-              !state.credentials_configured || username !== state.username
+              creating ||
+              !state.credentials_configured ||
+              username !== state.username
             }
             onChange={(e) => {
               setPassword(e.target.value);
@@ -111,6 +167,22 @@ export default function Credentials({
             }}
           />
         </label>
+        {creating && (
+          <label>
+            Confirm Soulseek password
+            <input
+              aria-label="Confirm Soulseek password"
+              type="password"
+              autoComplete="new-password"
+              required
+              minLength={8}
+              maxLength={1024}
+              value={confirmation}
+              disabled={!disconnected || pending}
+              onChange={(e) => setConfirmation(e.target.value)}
+            />
+          </label>
+        )}
         <div className="button-row">
           <button
             className="button"
@@ -120,7 +192,11 @@ export default function Credentials({
               !username
             }
           >
-            {pending ? "Verifying login…" : "Save account"}
+            {pending
+              ? "Verifying login…"
+              : creating
+                ? "Create account and connect"
+                : "Save account"}
           </button>
           <button
             className="button secondary"

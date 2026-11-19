@@ -27,6 +27,7 @@ pub mod system;
 pub mod traffic;
 mod transfer_timing;
 pub mod transfers;
+pub mod upload_speed;
 pub mod validation;
 pub mod vault;
 

@@ -16,6 +16,29 @@ const message = (id: number): Message => ({
 const flush = async () => {
   await act(async () => {});
 };
+
+it("reloads saved pages when ignore visibility changes, including older messages on unignore", async () => {
+  let ignored = false;
+  request.mockImplementation(async () => ({
+    messages: ignored ? [message(2)] : [message(1), message(2)],
+    has_more: false,
+  }));
+  const { result, rerender } = renderHook(
+    ({ visibility }) =>
+      useMessageHistory("", "peer", true, 1, 0, [], visibility),
+    { initialProps: { visibility: "" } },
+  );
+  await flush();
+  expect(result.current.messages.map((m) => m.id)).toEqual([1, 2]);
+  ignored = true;
+  rerender({ visibility: "peer" });
+  await flush();
+  expect(result.current.messages.map((m) => m.id)).toEqual([2]);
+  ignored = false;
+  rerender({ visibility: "" });
+  await flush();
+  expect(result.current.messages.map((m) => m.id)).toEqual([1, 2]);
+});
 beforeEach(() => {
   vi.useFakeTimers();
   request.mockReset();

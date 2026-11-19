@@ -18,6 +18,7 @@
 //!   STRESS_TIMEOUT    seconds before the run is called off
 //!   STRESS_SAVE=1     store this run as the new baseline
 //!   STRESS_REQUIRE_FUNCTIONAL=1  exit 1 if any transfer, search or browse was lost
+//!   STRESS_PASSWORD  optional password for mock accounts (otherwise random)
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -30,8 +31,7 @@ use std::time::{Duration, Instant};
 
 use soulseek_rs::message::Message;
 use soulseek_rs::message::peer::{
-    FileEntry, SharedDirectory, SharedFileEntry, build_file_search_response,
-    build_shared_file_list,
+    FileEntry, SharedDirectory, SharedFileEntry, build_file_search_response, build_shared_file_list,
 };
 use soulseek_rs::message::server::MessageFactory;
 use soulseek_rs::{Client, ClientSettings, ClientVersion, PeerAddress};
@@ -172,8 +172,7 @@ impl TestServer {
 
         let bin = PathBuf::from(std::env::var("SOULFIND_BIN").ok()?);
         let port = free_port()?;
-        let db =
-            std::env::temp_dir().join(format!("soulfind-stress-{port}.db"));
+        let db = std::env::temp_dir().join(format!("soulfind-stress-{port}.db"));
         let _ = std::fs::remove_file(&db);
 
         let mut child = Command::new(&bin)
@@ -186,9 +185,7 @@ impl TestServer {
             .spawn()
             .ok()?;
 
-        if wait_until_listening("127.0.0.1", port, Duration::from_secs(5))
-            .is_none()
-        {
+        if wait_until_listening("127.0.0.1", port, Duration::from_secs(5)).is_none() {
             let _ = child.kill();
             let _ = child.wait();
             return None;
@@ -227,11 +224,7 @@ fn free_port() -> Option<u16> {
         .map(|a| a.port())
 }
 
-fn wait_until_listening(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Option<()> {
+fn wait_until_listening(host: &str, port: u16, timeout: Duration) -> Option<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if TcpStream::connect((host, port)).is_ok() {
@@ -279,16 +272,32 @@ fn connect_retry(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
 
 /// Log in to the server and drain up to the login response, leaving the user
 /// online for as long as the returned stream lives.
+fn stress_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| {
+        if let Ok(value) = std::env::var("STRESS_PASSWORD") {
+            assert!(
+                value.len() >= 8,
+                "STRESS_PASSWORD must have at least 8 bytes"
+            );
+            return value;
+        }
+        // This benchmark starts a local Linux Soulfind server. Use a single
+        // fresh OS-random password for all mock accounts in this run.
+        let mut random = [0_u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut random))
+            .expect("OS randomness for stress-test accounts");
+        random.iter().map(|byte| format!("{byte:02x}")).collect()
+    })
+}
+
 fn login_raw(server_addr: &str, username: &str) -> std::io::Result<TcpStream> {
     let mut srv = connect_retry(server_addr, Duration::from_secs(10))?;
     srv.set_read_timeout(Some(Duration::from_secs(20)))?;
     srv.write_all(
-        &MessageFactory::build_login_message(
-            username,
-            "pw",
-            ClientVersion::default(),
-        )
-        .get_buffer(),
+        &MessageFactory::build_login_message(username, stress_password(), ClientVersion::default())
+            .get_buffer(),
     )?;
     srv.flush()?;
     loop {
@@ -336,9 +345,7 @@ impl Seeder {
             return;
         };
         if srv
-            .write_all(
-                &MessageFactory::build_set_wait_port_message(port).get_buffer(),
-            )
+            .write_all(&MessageFactory::build_set_wait_port_message(port).get_buffer())
             .is_err()
         {
             return;
@@ -429,16 +436,13 @@ impl SeederState {
                 attribs: &[],
             })
             .collect();
-        let response =
-            build_file_search_response(&self.name, token, &entries, 1, 0, 0);
+        let response = build_file_search_response(&self.name, token, &entries, 1, 0, 0);
 
         let Ok(mut guard) = self.conn.lock() else {
             return;
         };
         if guard.is_none() {
-            let Ok(mut p) =
-                connect_retry(&self.client_addr, Duration::from_secs(10))
-            else {
+            let Ok(mut p) = connect_retry(&self.client_addr, Duration::from_secs(10)) else {
                 Metrics::bump(&self.metrics.peer_connect_failures);
                 return;
             };
@@ -513,8 +517,7 @@ impl SeederState {
                 43 => {
                     msg.set_pointer(8);
                     let requested = msg.read_string();
-                    let Some((name, size)) =
-                        self.files.iter().find(|(n, _)| *n == requested)
+                    let Some((name, size)) = self.files.iter().find(|(n, _)| *n == requested)
                     else {
                         continue;
                     };
@@ -535,8 +538,7 @@ impl SeederState {
                     let addr = self.client_addr.clone();
                     let name = self.name.clone();
                     std::thread::spawn(move || {
-                        let _ =
-                            serve_file_over_f(&addr, &name, token, &content);
+                        let _ = serve_file_over_f(&addr, &name, token, &content);
                     });
                 }
                 _ => {}
@@ -546,7 +548,10 @@ impl SeederState {
 
     /// Everything we hold, the answer to a GetShareFileList.
     fn send_listing(&self, p: &mut TcpStream, shared: bool) -> bool {
-        let dir = SharedDirectory {name:format!("stress\\{}",self.name),files:entries(&self.files)};
+        let dir = SharedDirectory {
+            name: format!("stress\\{}", self.name),
+            files: entries(&self.files),
+        };
         let list = build_shared_file_list(std::slice::from_ref(&dir));
         self.reply(p, shared, &list.get_buffer())
     }
@@ -554,12 +559,7 @@ impl SeederState {
     /// Wait for the client's `TransferResponse` allowing `token`. A browse
     /// that arrives meanwhile is answered: a busy client accepts an offer
     /// late, and a browse it sent in between is not lost work on its side.
-    fn wait_for_allow(
-        &self,
-        p: &mut TcpStream,
-        shared: bool,
-        token: u32,
-    ) -> bool {
+    fn wait_for_allow(&self, p: &mut TcpStream, shared: bool, token: u32) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline && !self.stop.load(Ordering::Relaxed) {
             match read_framed(p) {
@@ -569,10 +569,7 @@ impl SeederState {
                         return true;
                     }
                 }
-                Ok(msg)
-                    if msg.get_message_code() == 4
-                        && !self.send_listing(p, shared) =>
-                {
+                Ok(msg) if msg.get_message_code() == 4 && !self.send_listing(p, shared) => {
                     return false;
                 }
                 Ok(_) => {}
@@ -662,9 +659,7 @@ impl Leecher {
         };
         // The client dials this port for the F leg, so the server must know it.
         if srv
-            .write_all(
-                &MessageFactory::build_set_wait_port_message(port).get_buffer(),
-            )
+            .write_all(&MessageFactory::build_set_wait_port_message(port).get_buffer())
             .is_err()
         {
             return;
@@ -687,10 +682,7 @@ impl Leecher {
         let mut p = connect_retry(&self.client_addr, Duration::from_secs(10))?;
         p.set_read_timeout(Some(Duration::from_secs(30)))?;
         p.write_all(&peer_init_bytes(&self.name, "P", 0))?;
-        p.write_all(
-            &MessageFactory::build_queue_upload_message(&self.filename)
-                .get_buffer(),
-        )?;
+        p.write_all(&MessageFactory::build_queue_upload_message(&self.filename).get_buffer())?;
         p.flush()?;
 
         // The client offers the transfer; accept it so it starts streaming.
@@ -739,10 +731,7 @@ impl Leecher {
 
 /// Accept connections until one announces itself as an F (file) connection,
 /// and return it positioned just past its PeerInit and transfer token.
-fn accept_file_connection(
-    listener: &TcpListener,
-    deadline: Instant,
-) -> std::io::Result<TcpStream> {
+fn accept_file_connection(listener: &TcpListener, deadline: Instant) -> std::io::Result<TcpStream> {
     listener.set_nonblocking(true)?;
     let mut held = Vec::new();
     loop {
@@ -801,8 +790,7 @@ fn gate_failures(score: &Score) -> Vec<String> {
 }
 
 fn compute_score(m: &Metrics, elapsed: Duration) -> Score {
-    let bytes =
-        Metrics::get(&m.bytes_downloaded) + Metrics::get(&m.bytes_uploaded);
+    let bytes = Metrics::get(&m.bytes_downloaded) + Metrics::get(&m.bytes_uploaded);
     let mbps = (bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(0.001);
 
     let parts = vec![
@@ -917,9 +905,7 @@ fn thread_count() -> usize {
 fn main() {
     let cfg = Config::from_env();
     let Some(server) = TestServer::spawn() else {
-        eprintln!(
-            "stress: no soulfind server. Set SOULFIND_BIN (or SOULSEEK_TEST_SERVER)."
-        );
+        eprintln!("stress: no soulfind server. Set SOULFIND_BIN (or SOULSEEK_TEST_SERVER).");
         std::process::exit(2);
     };
     let server_addr = server.addr();
@@ -928,17 +914,14 @@ fn main() {
 
     // Shares the client under test offers to mock leechers.
     let run_id = std::process::id();
-    let share_dir =
-        std::env::temp_dir().join(format!("soulseek-stress-share-{run_id}"));
-    let download_dir =
-        std::env::temp_dir().join(format!("soulseek-stress-dl-{run_id}"));
+    let share_dir = std::env::temp_dir().join(format!("soulseek-stress-share-{run_id}"));
+    let download_dir = std::env::temp_dir().join(format!("soulseek-stress-dl-{run_id}"));
     let _ = std::fs::remove_dir_all(&share_dir);
     let _ = std::fs::remove_dir_all(&download_dir);
     std::fs::create_dir_all(&share_dir).expect("share dir");
     std::fs::create_dir_all(&download_dir).expect("download dir");
 
-    let payload: Vec<u8> =
-        (0..cfg.file_bytes).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0..cfg.file_bytes).map(|i| (i % 251) as u8).collect();
     // Peers ask for the backslash-separated virtual path (root dir name first),
     // not the basename — anything else is silently unknown to the share index.
     let share_root = share_dir
@@ -951,8 +934,7 @@ fn main() {
         .collect();
     for name in &shared_names {
         let basename = name.rsplit('\\').next().expect("basename");
-        std::fs::write(share_dir.join(basename), &payload)
-            .expect("write share");
+        std::fs::write(share_dir.join(basename), &payload).expect("write share");
     }
 
     let client_port = free_port().expect("client port");
@@ -976,8 +958,7 @@ fn main() {
     for i in 0..cfg.peers {
         let name = format!("stress_seed_{run_id}_{i}");
         seeder_names.push(name.clone());
-        let files =
-            vec![(format!("share\\{TAG}_{i}.bin"), cfg.file_bytes as u64)];
+        let files = vec![(format!("share\\{TAG}_{i}.bin"), cfg.file_bytes as u64)];
         let seeder = Seeder {
             name,
             server_addr: server_addr.clone(),
@@ -995,8 +976,7 @@ fn main() {
     // They wait on `start` before queueing anything, so the server has really
     // registered their listening port by the time we ask it for their address.
     let start = Arc::new(AtomicBool::new(false));
-    let run_deadline_hint =
-        Instant::now() + cfg.timeout + Duration::from_secs(40);
+    let run_deadline_hint = Instant::now() + cfg.timeout + Duration::from_secs(40);
     let mut leechers = Vec::new();
     for i in 0..cfg.leechers {
         let leecher = Leecher {
@@ -1014,9 +994,7 @@ fn main() {
 
     // Let the swarm register its wait ports before the client starts.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Metrics::get(&metrics.peers_online) < cfg.peers as u64
-        && Instant::now() < deadline
-    {
+    while Metrics::get(&metrics.peers_online) < cfg.peers as u64 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
     println!(
@@ -1028,7 +1006,7 @@ fn main() {
     // --- client under test ------------------------------------------------
     let mut client = Client::with_settings(ClientSettings {
         username: client_name,
-        password: "pw".to_string(),
+        password: stress_password().to_string(),
         server_address: PeerAddress::new(server.host.clone(), server.port),
         enable_listen: true,
         listen_port: client_port,
@@ -1062,8 +1040,7 @@ fn main() {
     let mut workers = Vec::new();
 
     // --- concurrent searches ---------------------------------------------
-    let queries: Vec<String> =
-        (0..cfg.searches).map(|k| format!("{TAG}_q{k}")).collect();
+    let queries: Vec<String> = (0..cfg.searches).map(|k| format!("{TAG}_q{k}")).collect();
     for query in queries.clone() {
         let client = client.clone();
         let metrics = metrics.clone();
@@ -1107,8 +1084,7 @@ fn main() {
     let mut results_seen = 0u64;
     // Keep collecting until there is enough to download *and* every search has
     // been answered, so search recall is measured even on download-free runs.
-    while Instant::now() < hit_deadline
-        && (hits.len() < cfg.downloads || answered < queries.len())
+    while Instant::now() < hit_deadline && (hits.len() < cfg.downloads || answered < queries.len())
     {
         answered = 0;
         results_seen = 0;
@@ -1155,9 +1131,7 @@ fn main() {
                 match status_rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(soulseek_rs::DownloadStatus::Completed) => {
                         Metrics::bump(&metrics.downloads_completed);
-                        metrics
-                            .bytes_downloaded
-                            .fetch_add(size, Ordering::Relaxed);
+                        metrics.bytes_downloaded.fetch_add(size, Ordering::Relaxed);
                         if let Ok(mut c) = completed.lock() {
                             c.push(peer);
                         }
@@ -1186,8 +1160,7 @@ fn main() {
 
     // --- report -----------------------------------------------------------
     let score = compute_score(&metrics, elapsed);
-    let bytes = Metrics::get(&metrics.bytes_downloaded)
-        + Metrics::get(&metrics.bytes_uploaded);
+    let bytes = Metrics::get(&metrics.bytes_downloaded) + Metrics::get(&metrics.bytes_uploaded);
 
     println!("\n--- results ({:.1}s) ---", elapsed.as_secs_f64());
     println!(
@@ -1255,8 +1228,7 @@ fn main() {
         *by_status.entry(label).or_default() += 1;
     }
     if !by_status.is_empty() {
-        let mut parts: Vec<String> =
-            by_status.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut parts: Vec<String> = by_status.iter().map(|(k, v)| format!("{k}={v}")).collect();
         parts.sort();
         println!("  download states      {}", parts.join(" "));
     }
@@ -1296,9 +1268,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&download_dir);
 
     let failures = gate_failures(&score);
-    if std::env::var("STRESS_REQUIRE_FUNCTIONAL").is_ok_and(|v| v == "1")
-        && !failures.is_empty()
-    {
+    if std::env::var("STRESS_REQUIRE_FUNCTIONAL").is_ok_and(|v| v == "1") && !failures.is_empty() {
         eprintln!("stress: work was lost: {}", failures.join(", "));
         std::process::exit(1);
     }
@@ -1317,15 +1287,10 @@ mod tests {
 
     #[test]
     fn lost_work_fails_the_gate_but_slow_transfers_do_not() {
-        let clean =
-            score(&[("downloads", 1.0), ("uploads", 1.0), ("throughput", 0.1)]);
+        let clean = score(&[("downloads", 1.0), ("uploads", 1.0), ("throughput", 0.1)]);
         assert!(gate_failures(&clean).is_empty());
 
-        let lossy = score(&[
-            ("downloads", 0.98),
-            ("uploads", 1.0),
-            ("throughput", 1.0),
-        ]);
+        let lossy = score(&[("downloads", 0.98), ("uploads", 1.0), ("throughput", 1.0)]);
         assert_eq!(gate_failures(&lossy), ["downloads 98.0%"]);
     }
 }

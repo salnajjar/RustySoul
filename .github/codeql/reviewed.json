@@ -1,0 +1,60 @@
+{
+  "expressions": [
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "src/engine.rs",
+      "anchor": "self.vault.encrypt(\"\", \"\")",
+      "guards": [
+        {"path": "src/engine.rs", "contains": "self.secrets.username.clear()"},
+        {"path": "src/engine.rs", "contains": "self.secrets.password.clear()"},
+        {"path": "src/engine.rs", "contains": "Disconnect before removing credentials"}
+      ],
+      "reason": "Encrypted empty-record tombstone when removing credentials, not an authentication password. Both in-memory credential fields are cleared, the client must be disconnected and no account can log in using this empty sentinel. Preserves the explicit removal across restarts instead of restoring environment bootstrap credentials."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "src/auth.rs",
+      "anchor": ".unwrap_or_else(|_| \"change-me-now\".into())",
+      "guards": [
+        {"path": "src/auth.rs", "contains": "must_change: true"},
+        {"path": "src/auth.rs", "contains": "username != previous.username && !verify(password, &previous.hash)"},
+        {"path": "src/api.rs", "contains": "if account.must_change"},
+        {"path": "src/api.rs", "contains": "Change both the deployment username and password before using RustySoul"}
+      ],
+      "reason": "Intentional deployment bootstrap required by the product: environment-overridable initial password, Argon2id storage, mandatory replacement of BOTH username/password before operational API access. Existing account passwords never fall back to it. Covered by first-login gate and account-rotation tests."
+    },
+    {
+      "rule": "rust/weak-sensitive-data-hashing",
+      "path": "src/api_access.rs",
+      "anchor": "Sha256::digest(token.as_bytes()).into()",
+      "guards": [
+        {"path": "src/api_access.rs", "contains": "let mut bytes = [0; 32];"},
+        {"path": "src/api_access.rs", "contains": "getrandom::fill(&mut bytes)"},
+        {"path": "src/api_access.rs", "contains": "token.len() != 70"},
+        {"path": "src/api_access.rs", "contains": "state.keys.get_mut(&digest(token))?"}
+      ],
+      "reason": "SHA-256 indexes OS-random 256-bit API keys, not human passwords. Generation is internal, token format is checked, and only hashes are persisted. Argon2id remains mandatory for administrator passwords. A password KDF per API request would add avoidable denial-of-service cost and invalidate existing keys without improving their entropy."
+    },
+    {
+      "rule": "rust/weak-sensitive-data-hashing",
+      "path": "src/api.rs",
+      "anchor": "token_hash: Sha256::digest(token).into()",
+      "guards": [
+        {"path": "src/config.rs", "contains": "uuid::Uuid::new_v4(), uuid::Uuid::new_v4()"},
+        {"path": "src/api.rs", "contains": "with_auth"},
+        {"path": "src/main.rs", "contains": ".with_auth("}
+      ],
+      "reason": "Fast hash of a startup-generated compatibility bearer secret. Production uses Auth sessions/API keys; this constructor also supports isolated test daemons. It never hashes a human login password."
+    }
+  ],
+  "backup_state": {
+    "functions": ["regular", "regular_reader", "workspace", "space", "last_result"],
+    "guards": [
+      {"path": "src/api.rs", "contains": "data_dir: config.data_dir.clone()"},
+      {"path": "src/api.rs", "contains": "data_dir: std::path::PathBuf"},
+      {"path": "src/backup.rs", "contains": ".tempdir_in(data)?"},
+      {"path": "src/backup.rs", "contains": "data.join(\"restore-last-result.json\")"}
+    ],
+    "reason": "Rust CodeQL treats Axum State as request input. These specific status/inspect flows use the immutable private ApiState.data_dir, copied from startup Config, never an HTTP body/query/path. Space checks open that configured directory, workspace children are created by tempfile, and status uses a fixed filename and a bounded no-follow regular-file reader. Any additional request-derived flow, different endpoint, missing guard or new sink remains a finding."
+  }
+}

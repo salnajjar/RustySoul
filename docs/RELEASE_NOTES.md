@@ -1,32 +1,39 @@
-# RustySoul v0.1.0-beta.3
+# RustySoul v0.1.0-beta.4
 
-RustySoul is a Linux Soulseek daemon with a responsive browser interface, authenticated API and SQLite persistence. This beta includes streaming search, share trees/profiles, persistent transfers, priorities/retries, per-user limits, multi-room chat, incremental library indexing, traffic graphs, scoped API keys, maintenance and encrypted backup/restore.
+RustySoul is a Linux Soulseek daemon with a responsive browser interface, authenticated API and SQLite persistence. This beta adds easier installation, richer discovery and search, clearer conversations, and stronger filesystem handling.
 
-## Changes since beta.1
+## Changes since beta.3
 
-- Private chats and room history are now retained in SQLite until explicitly deleted. Closing conversations, leaving rooms and restarting the daemon preserve history. Saved conversations are discoverable independently of the live preview, with older-message loading and confirmed per-conversation deletion.
-- The share browser loads complete folder metadata without folder pagination. Expand and filter locally, resize the folder pane, and retain its width across peers and browser refreshes.
-- Upload and download rows show their recorded start date/time and a live elapsed counter that freezes when the transfer finishes. Transfer timing is included in backups and survives restarts.
-- Transfer-page speed cards show a five-second rolling average for a steadier indication of sustained bandwidth.
-- A self-contained garden SVG supplies interface branding, favicons and installed-app icons. A web-app manifest and installation controls support installing RustySoul from the daemon's interface.
-- Browser tests work with both local development and GitHub Actions, including concurrent fixture timing and isolated transfer destinations. Backup/restore and database maintenance support the updated history schema.
-
-- Registry images preserve the built-in health check in both Docker and Podman. The release workflow verifies the published digest with Podman before creating the GitHub release.
+- Deploy Docker, Podman or the native daemon using environment variables. Compose, Quadlet and TOML configurations remain supported. Configure shared libraries and downloads through mounted folders and the documented environment settings.
+- Ignore users in both rooms and private chats, manage share bans from user options, and receive persistent private-message unread notifications. Delete history selectively by age or date range.
+- Click an entire private-conversation row to open it. Closing a conversation removes its sidebar row, selects the next unread conversation or the adjacent chat, and preserves its history. New messages or explicit reopening restore the conversation.
+- Search all saved room/private history by message text, sender or both, with older-match paging and ignored-user filtering.
+- Browse an interest in Discover and use its thumbs-up/down controls to add, switch or remove your own preference, including in shared-dislike views.
+- Advertise supported file attributes for more common audio formats. Advanced search filters cover bitrate, duration, sample rate, bit depth, file size, CBR/VBR and available upload slots. Metadata appears in search and share views; sample-rate and bit-depth sorting are available. User/room searches correctly retain their selected scope.
+- Expand audio metadata probing with bounded property-only reads and real synthetic format fixtures. Existing library metadata refreshes once per extractor version; later scans skip unchanged files. MP3 CBR reporting retains nominal bitrate for precise quality filters.
+- Create a Soulseek account in Settings with password confirmation and verified login before saving credentials.
+- Report your measured upload speed, choose a custom value or withhold it; own-profile queue statistics use the complete queue. Automatically use simultaneous downloads offered by a peer while respecting global slots.
+- Harden credential-key and backup/status reads against symlinks and non-regular files, bound status-file reads, and retain the existing encrypted backup format. The stress tool generates its fixture-account password. Administrator passwords continue to use Argon2id; generated API keys retain their compatible fast digests.
+- Add audited CodeQL review and a mandatory Critical gate to verification and publication. All security queries remain enabled, raw findings are retained, and intentional fixture/configuration flows have scoped, tested reasons. Public-username logging and the isolated mock-listener advisory remain visible. See [security analysis](https://github.com/salnajjar/RustySoul/blob/main/docs/SECURITY_ANALYSIS.md).
 
 ## Upgrade
 
-Back up application state before upgrading. This release uses SQLite schema 14 and preserves existing accounts, sessions, credentials, settings and history. To roll back, restore the matching earlier database and image together. Previous releases retained only a 500-message live window; messages already purged by them are available only if present in an existing backup. Older transfer records have no invented start/end times.
+Back up application state before upgrading. This release uses SQLite schema 16 and preserves existing accounts, sessions, encrypted credentials, settings, transfers, library data and history. Supported schema-11 through schema-15 backups are validated and migrated to schema 16 on restore. To roll back, restore the matching earlier database and image together. Messages purged by old releases are recoverable only from an existing backup.
 
-Pull `ghcr.io/salnajjar/rustysoul:0.1.0-beta.3` for a pinned version, or `:beta` for the current beta. Recreate the container with its existing persistent volumes and configuration. Container updates do not automatically migrate existing native installations; use the native bundle's installer for those.
+Library metadata is refreshed automatically during the next scan. This reads file properties without changing media; large libraries may take longer on the first upgraded scan. Startup-index and scheduled-banner preferences are preserved. Subsequent unchanged scans retain the incremental cache.
+
+Pull `ghcr.io/salnajjar/rustysoul:0.1.0-beta.4` for a pinned image, or `:beta` for the current beta. Recreate the container with its existing data, library and download volumes and its existing environment/configuration. Do not delete the persistent data volume when upgrading.
 
 ## Installation
 
-Use the Compose files in the source archive or repository. Copy `.env.example` to `.env`, set your library/download mount paths, then run `docker compose pull` and `docker compose up -d --no-build`. See the [README](https://github.com/salnajjar/RustySoul#readme) for Podman, remote access and first sign-in.
+Pull the image, mount persistent data plus your library/download folders, and set the deployment environment variables. No Compose or TOML file is required. The [README](https://github.com/salnajjar/RustySoul#readme) includes Docker and Podman run commands; the [environment reference](https://github.com/salnajjar/RustySoul/blob/main/docs/ENVIRONMENT.md) lists overrides and native examples.
 
-Default administrator login: **admin / change-me-now**. Both must be replaced on first sign-in; Soulseek credentials are entered separately in Settings. HTTP defaults to loopback port **8484**; incoming transfers default to TCP **2234**.
+Default administrator login: **admin / change-me-now**, overridable at deployment. Both fields must be replaced on first sign-in. Enter or create the separate Soulseek network account in Settings. Container HTTP listens on port **8484**; the documented host publication is loopback by default. Incoming file transfers default to TCP **2234**.
 
-The native Linux x86-64 bundle includes the executable, installer, systemd service and licence notices. It requires glibc 2.36 or newer; follow its README. The SHA-256 sidecar verifies the downloaded archive.
+The native Linux x86-64 bundle includes the executable, installer, systemd service and documentation/licence notices. It requires glibc 2.36 or newer. Follow its README and verify the archive using its SHA-256 sidecar.
 
-## Beta limits
+## Verification and beta scope
 
-Published images and native assets currently target **Linux amd64/x86-64**. Back up persistent state and media before upgrades. Broader real-world network/client testing and an independent security review remain useful; this release makes no production-readiness guarantee. Tested external-client quirks and test-harness accommodations are documented in the interoperability guides. Reference clients, personal installation files, credentials and generated test artifacts are excluded from the source distribution.
+This release is gated by Rust application/integration tests, SDK tests, UI tests, desktop/mobile browser tests, CodeQL review, native smoke checks and Docker/Podman installation checks. Synthetic network fixtures are distinguished from external-client interoperability evidence in the testing guides. Published images and native assets target **Linux amd64/x86-64**.
+
+Reference clients, credentials, installation-specific documents and generated test/build artifacts are excluded from the repository and release source. Independent review and broader real-world feedback remain useful for beta software.

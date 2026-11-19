@@ -5,6 +5,7 @@ import GroupedResults from "./GroupedResults";
 import LoadMore from "./LoadMore";
 import { useChoice, fileIdentity } from "./WorkspaceState";
 import type { AudioFormat, FileSort, UserSort } from "./results";
+import { matchesCriteria, type FileCriteria } from "./AdvancedSearch";
 type Page = {
   files: FileResult[];
   total: number;
@@ -19,6 +20,7 @@ export default function SearchResults({
   token,
   filter,
   format,
+  criteria,
   send,
   online,
   capacity,
@@ -27,6 +29,7 @@ export default function SearchResults({
   token: string;
   filter: string;
   format: AudioFormat;
+  criteria: FileCriteria;
   send: (command: object) => void;
   online: boolean;
   capacity: number;
@@ -39,7 +42,16 @@ export default function SearchResults({
   const [fileSort, setFileSort] = useChoice<FileSort>(
     "search.fileOrder",
     "name",
-    ["name", "name_desc", "smallest", "largest", "bitrate", "duration"],
+    [
+      "name",
+      "name_desc",
+      "smallest",
+      "largest",
+      "bitrate",
+      "duration",
+      "sample_rate",
+      "bit_depth",
+    ],
   );
   const [exclude, setExclude] = useState("");
   const key = JSON.stringify([
@@ -50,6 +62,7 @@ export default function SearchResults({
     exclude,
     userSort,
     fileSort,
+    criteria,
   ]);
   const [window, setWindow] = useState({ key, count: 100 });
   const [data, setData] = useState<Page>({
@@ -101,6 +114,8 @@ export default function SearchResults({
             user_sort: userSort,
             file_sort: fileSort,
           });
+          for (const [name, value] of Object.entries(criteria))
+            if (value !== undefined) q.set(name, String(value));
           latest = await api<Page>(
             token,
             `searches/${encodeURIComponent(search.id)}/results?${q}`,
@@ -142,6 +157,7 @@ export default function SearchResults({
   ]);
   const preview = search.results.filter(
     (f) =>
+      matchesCriteria(f, criteria) &&
       !exclude
         .toLowerCase()
         .split(/\s+/)

@@ -70,7 +70,7 @@ pub fn normalize_picture(bytes: &[u8], optimize: bool) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
     pub description: String,
@@ -80,6 +80,23 @@ pub struct Profile {
     pub away_on_startup: bool,
     pub auto_away_minutes: u32,
     pub away_message: String,
+    pub report_upload_speed: bool,
+    pub reported_upload_speed_kib: Option<u32>,
+}
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            description: String::new(),
+            picture: None,
+            likes: vec![],
+            dislikes: vec![],
+            away_on_startup: false,
+            auto_away_minutes: 0,
+            away_message: String::new(),
+            report_upload_speed: true,
+            reported_upload_speed_kib: None,
+        }
+    }
 }
 #[derive(Clone, Default, Serialize)]
 pub struct View {
@@ -91,6 +108,10 @@ pub struct View {
     pub away_message: String,
     pub has_picture: bool,
     pub revision: u64,
+    pub report_upload_speed: bool,
+    pub reported_upload_speed_kib: Option<u32>,
+    pub measured_upload_speed: u32,
+    pub upload_speed_measured: bool,
 }
 impl Profile {
     pub fn view(&self, revision: u64) -> View {
@@ -103,9 +124,18 @@ impl Profile {
             away_message: self.away_message.clone(),
             has_picture: self.picture.is_some(),
             revision,
+            report_upload_speed: self.report_upload_speed,
+            reported_upload_speed_kib: self.reported_upload_speed_kib,
+            measured_upload_speed: 0,
+            upload_speed_measured: false,
         }
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.reported_upload_speed_kib
+                .is_none_or(|v| (1..=1_000_000).contains(&v)),
+            "Choose a reported speed from 1 to 1000000 KiB/s, or leave it blank for automatic"
+        );
         ensure!(
             self.auto_away_minutes <= 1440,
             "Choose an idle timeout from 1 to 1440 minutes, or 0 to disable"

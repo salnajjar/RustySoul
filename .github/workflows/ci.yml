@@ -20,6 +20,12 @@ concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  security:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
   tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -53,7 +59,7 @@ jobs:
         working-directory: web
       - run: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked --all-targets
       - run: cargo test --locked --all-targets --manifest-path vendor/soulseek-rs-lib/Cargo.toml
-      - run: cargo build --release --locked && python3 scripts/smoke.py target/release/rustysoul
+      - run: cargo build --release --locked && python3 scripts/smoke.py target/release/rustysoul && python3 scripts/env-smoke.py target/release/rustysoul
       - run: npm audit --omit=dev --audit-level=moderate
         working-directory: web
       - uses: actions/upload-artifact@v4
@@ -81,3 +87,5 @@ jobs:
           python3 scripts/container-matrix.py --engine docker --image rustysoul:ci --network host --storage bind --bind-data
           python3 scripts/container-matrix.py --engine docker --image rustysoul:ci --network bridge --storage named
           python3 scripts/container-matrix.py --engine docker --image rustysoul:ci --network bridge --storage bind --bind-data
+          python3 scripts/container-matrix.py --engine docker --image rustysoul:ci --network host --env-only
+          python3 scripts/container-matrix.py --engine docker --image rustysoul:ci --network bridge --env-only

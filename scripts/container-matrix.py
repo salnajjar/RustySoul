@@ -25,11 +25,13 @@ def main():
     parser.add_argument('--quadlet', type=Path)
     parser.add_argument('--bind-data',action='store_true',help='Also bind the private database directory (POSIX filesystems only)')
     parser.add_argument('--daemon-bind',action='store_true',help='Create isolated Linux bind sources in a daemon-owned fixture volume')
+    parser.add_argument('--env-only',action='store_true',help='Configure with environment variables only; mount no TOML files')
     args = parser.parse_args()
     if args.bind_data:
         assert args.storage=='bind'
     if args.quadlet:
         assert args.engine == 'podman' and args.network == 'host' and args.storage == 'named'
+        assert not args.env_only
     label = 'io.rustysoul.verification=container-matrix'
     name = 'rustysoul-matrix-' + uuid.uuid4().hex[:12]
     volumes = []
@@ -163,7 +165,7 @@ def main():
                 engine('run','--rm','--label',label,'--user','0:0','--entrypoint','sh','-v',bind_parent+':/fixture',args.image,'-c','mkdir /fixture/data /fixture/downloads /fixture/library; chown 10001:10001 /fixture/data /fixture/downloads /fixture/library; chmod 700 /fixture/data /fixture/downloads /fixture/library')
                 bind_point=json.loads(engine('volume','inspect',bind_parent))[0]['Mountpoint']
                 assert Path(bind_point).is_absolute() and '..' not in Path(bind_point).parts
-            for purpose in ['data', 'downloads', 'library', 'config']:
+            for purpose in ['data', 'downloads', 'library'] + ([] if args.env_only else ['config']):
                 if args.storage == 'bind' and (purpose in ['downloads','library'] or (args.bind_data and purpose=='data')):
                     if bind_parent:
                         sources[purpose]=str(Path(bind_point)/purpose)
@@ -182,10 +184,15 @@ def main():
                     volumes.append(volume)
                     sources[purpose] = volume
             # Install-time config contains only the loopback fixture address.
-            engine('run', '--rm', '-i', '--label', label, '--user', '0:0', '--entrypoint', 'sh', '-v', sources['config'] + ':/config', args.image, '-c', 'cat > /config/rustysoul.toml; chmod 644 /config/rustysoul.toml', input=config.read_text())
+            if not args.env_only:
+                engine('run', '--rm', '-i', '--label', label, '--user', '0:0', '--entrypoint', 'sh', '-v', sources['config'] + ':/config', args.image, '-c', 'cat > /config/rustysoul.toml; chmod 644 /config/rustysoul.toml', input=config.read_text())
             engine('run', '--rm', '--label', label, '--entrypoint', 'sh', '-v', sources['library'] + ':/library', args.image, '-c', 'printf fLaC > /library/matrix.flac; : > /library/empty.txt')
-            mounts = [sources['data'] + ':/var/lib/rustysoul', sources['downloads'] + ':/downloads', sources['library'] + ':/library:ro', sources['config'] + ':/etc/rustysoul:ro']
+            mounts = [sources['data'] + ':/var/lib/rustysoul', sources['downloads'] + ':/downloads', sources['library'] + ':/library:ro']
+            if not args.env_only:
+                mounts.append(sources['config'] + ':/etc/rustysoul:ro')
             extra_env = ['RUSTYSOUL_DEFAULT_USERNAME=matrix-bootstrap', 'RUSTYSOUL_DEFAULT_PASSWORD=eightpwd']
+            if args.env_only:
+                extra_env += [f'RUSTYSOUL_BIND={"127.0.0.1" if args.network=="host" else "0.0.0.0"}:{internal_http}', 'RUSTYSOUL_ALLOW_REMOTE=true', 'RUSTYSOUL_DATA_DIR=/var/lib/rustysoul', 'RUSTYSOUL_DOWNLOAD_DIR=/downloads', 'RUSTYSOUL_LIBRARY_DIRS=[]', 'RUSTYSOUL_LOCATION_ROOTS=["/downloads","/library"]', f'RUSTYSOUL_SOULSEEK_SERVER={server}',f'RUSTYSOUL_SOULSEEK_PORT={listener.getsockname()[1]}',f'RUSTYSOUL_TRANSFER_PORT={peer_port}','RUSTYSOUL_AUTO_CONNECT=false']
             if args.network == 'bridge':
                 extra_env.append(f'RUSTYSOUL_PUBLISHED_TRANSFER_PORT={peer_port}')
             if args.quadlet:
@@ -265,6 +272,8 @@ def main():
             inspection = json.loads(engine('inspect', name))[0]
             assert inspection['HostConfig']['ReadonlyRootfs']
             assert inspection['Config'].get('Healthcheck'), 'Runtime image lost its health check'
+            if args.env_only:
+                assert all(not mount['Destination'].startswith('/etc/rustysoul') for mount in inspection['Mounts'])
             if args.quadlet:
                 run('systemctl', '--user', 'restart', name + '.service')
             else:
@@ -291,14 +300,14 @@ def main():
                 engine('cp', name + ':/var/lib/rustysoul/rustysoul.sqlite3', str(root / 'state.sqlite3'))
             from contextlib import closing
             with closing(sqlite3.connect(root / 'state.sqlite3')) as db:
-                assert db.execute('PRAGMA user_version').fetchone()[0] == 14
+                assert db.execute('PRAGMA user_version').fetchone()[0] == 16
                 assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
                 assert not db.execute('PRAGMA foreign_key_check').fetchall()
                 for table in ['downloads', 'uploads']:
                     assert {'started_at', 'finished_at'} <= {row[1] for row in db.execute('PRAGMA table_info('+table+')')}
                 started, finished = db.execute('SELECT started_at,finished_at FROM downloads WHERE username=? AND path=?', ('fixture-peer', remote)).fetchone()
                 assert started is not None and finished is not None and finished >= started
-            print(f'{args.engine} rootless={rootless} {args.network}/{args.storage} bind_data={args.bind_data} quadlet={bool(args.quadlet)}: initial account gate, UID/mount permissions, indexing, incoming peer/file connection, empty download, health and restart/session/credentials/settings/media/database persistence passed.', flush=True)
+            print(f'{args.engine} rootless={rootless} {args.network}/{args.storage} bind_data={args.bind_data} env_only={args.env_only} quadlet={bool(args.quadlet)}: initial account gate, UID/mount permissions, indexing, incoming peer/file connection, empty download, health and restart/session/credentials/settings/media/database persistence passed.', flush=True)
         except Exception:
             import sys
             log=subprocess.run([args.engine,'logs','--tail','20',name],capture_output=True,text=True);print(log.stdout+log.stderr,file=sys.stderr)

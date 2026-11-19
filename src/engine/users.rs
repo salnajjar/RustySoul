@@ -47,6 +47,14 @@ impl Engine {
                     exists: Some(true),
                     shared_files: Some(self.index.file_count()),
                     shared_folders: Some(self.index.folder_count()),
+                    average_speed: self
+                        .upload_speed
+                        .reported(&self.profile, self.network.upload_limit_kib),
+                    queue_size: Some(
+                        self.client
+                            .as_ref()
+                            .map_or(0, |c| c.own_upload_availability().0),
+                    ),
                     description: Some(self.profile.description.clone()),
                     interests: crate::discovery::Interests {
                         likes: self.profile.likes.clone(),
@@ -57,12 +65,9 @@ impl Engine {
                     picture_revision: self.view.profile.revision.to_string(),
                     upload_slots: Some(self.network.upload_slots as u32),
                     slots_free: Some(
-                        self.view
-                            .uploads
-                            .iter()
-                            .filter(|u| u.status == "uploading")
-                            .count()
-                            < self.network.upload_slots,
+                        self.client
+                            .as_ref()
+                            .is_some_and(|c| c.own_upload_availability().1),
                     ),
                     ..Default::default()
                 },

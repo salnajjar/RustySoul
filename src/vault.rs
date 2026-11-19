@@ -46,11 +46,17 @@ impl Vault {
             );
         }
         ensure!(metadata.len() == 32, "Invalid credential key length");
-        let mut key = [0_u8; 32];
-        std::fs::File::open(path)?.read_exact(&mut key)?;
-        Ok(Self {
-            cipher: ChaCha20Poly1305::new((&key).into()),
-        })
+        // Read the persisted key rather than a zero-initialized key buffer.
+        // The bounded, no-follow reader also rejects replacement symlinks/FIFOs.
+        let mut key = Vec::with_capacity(33);
+        crate::backup::regular_reader(path)?
+            .take(33)
+            .read_to_end(&mut key)?;
+        ensure!(key.len() == 32, "Invalid credential key length");
+        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| anyhow::anyhow!("Invalid credential key length"))?;
+        key.fill(0);
+        Ok(Self { cipher })
     }
     pub fn encrypt(&self, username: &str, password: &str) -> Result<Vec<u8>> {
         let mut nonce = [0_u8; 12];

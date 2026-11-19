@@ -9,6 +9,7 @@ export function useRoomRead({
   readTo,
   token,
   acknowledge = true,
+  privateChat = false,
 }: {
   enabled: boolean;
   room: string;
@@ -16,6 +17,7 @@ export function useRoomRead({
   readTo: number;
   token: string;
   acknowledge?: boolean;
+  privateChat?: boolean;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLDivElement>(null);
@@ -118,19 +120,20 @@ export function useRoomRead({
         !atBottom()
       )
         return;
-      const key = c.room + ":" + c.latest;
+      const key =
+        (privateChat ? "private:" : "room:") + c.room + ":" + c.latest;
       if (pending.current.key === key && Date.now() - pending.current.at < 3000)
         return;
       pending.current = { key, at: Date.now() };
-      void api(token, "rooms/read", {
-        room: c.room,
+      void api(token, privateChat ? "messages/read" : "rooms/read", {
+        [privateChat ? "username" : "room"]: c.room,
         through_id: c.latest,
       }).catch(() => {
         pending.current = { key: "", at: 0 };
       });
     }, 750);
     return () => clearInterval(timer);
-  }, [enabled, token, acknowledge]);
+  }, [enabled, token, acknowledge, privateChat]);
   const jump = () => {
     if (viewport.current) {
       viewport.current.scrollTop = viewport.current.scrollHeight;

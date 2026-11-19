@@ -753,6 +753,39 @@ fn login_search_messages_and_room_list_use_reference_wire_format() {
     )
     .unwrap();
     assert!(
+        !private_history
+            .messages
+            .iter()
+            .any(|m| m.username == "fixture-peer"),
+        "Ignored users must be hidden from saved history as well as live snapshots"
+    );
+    assert!(
+        history_db
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE username='fixture-peer'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+            > 0,
+        "Ignoring must not delete saved history"
+    );
+    history_db
+        .execute(
+            "UPDATE user_rules SET ignored=0 WHERE username='fixture-peer'",
+            [],
+        )
+        .unwrap();
+    let private_history = rustysoul::messages::page(
+        &history_db,
+        &rustysoul::messages::Query {
+            target: "fixture-peer".into(),
+            private: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
         private_history
             .messages
             .iter()

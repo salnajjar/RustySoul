@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api } from "./api";
+import { api, bytes } from "./api";
 import type { ProfileSettings, Snapshot } from "./types";
 const empty: ProfileSettings = {
   description: "",
@@ -177,6 +177,58 @@ export default function Profile({
           <p className="hint">
             Up to 100 entries in each list, 80 bytes each. Duplicates are
             removed.
+          </p>
+          <h3>Upload speed reporting</h3>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={profile.report_upload_speed ?? true}
+              onChange={(e) =>
+                setProfile({
+                  ...profile,
+                  report_upload_speed: e.target.checked,
+                })
+              }
+            />
+            Report my upload speed to other users
+          </label>
+          <label>
+            Custom reported upload speed (KiB/s)
+            <input
+              aria-label="Custom reported upload speed (KiB/s)"
+              type="number"
+              min="1"
+              max="1000000"
+              step="1"
+              placeholder="Automatic"
+              disabled={profile.report_upload_speed === false}
+              value={profile.reported_upload_speed_kib ?? ""}
+              onChange={(e) =>
+                setProfile({
+                  ...profile,
+                  reported_upload_speed_kib:
+                    e.target.value === "" ? null : Number(e.target.value),
+                })
+              }
+            />
+          </label>
+          <p className="hint">
+            Leave custom speed blank to use your total upload limit when
+            configured, or the measured upload rate otherwise. Measurements
+            exclude idle periods and survive restarts. A new installation starts
+            at 1 MiB/s until a measurement is available. Hiding speed also hides
+            it in search replies; other clients may retain older server
+            statistics.
+          </p>
+          <p>
+            Local{" "}
+            {state.profile?.upload_speed_measured
+              ? "measured rate"
+              : "starting estimate"}
+            :{" "}
+            <strong>
+              {bytes(state.profile?.measured_upload_speed || 1048576)}/s
+            </strong>
           </p>
           <label className="checkbox-label">
             <input

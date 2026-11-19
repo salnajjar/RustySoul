@@ -6,62 +6,57 @@ It has a modern React browser interface, an authenticated API and SQLite persist
 
 **[Explore the project website →](https://salnajjar.github.io/RustySoul/)** — screenshots, features and installation options.
 
-**Current beta: v0.1.0-beta.3.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
+**Current beta: v0.1.0-beta.4.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
 
 ## Quick start with Docker
 
-Published images currently support **Linux amd64**. Download this repository (or a release source archive), then:
+Published images currently support **Linux amd64**. Pull the image and run it with environment variables and persistent volumes; no repository checkout, Compose file or user-supplied TOML file is needed.
 
 ```sh
-cp .env.example .env
-chmod 600 .env
-docker compose pull
-docker compose up -d --no-build
+docker pull ghcr.io/salnajjar/rustysoul:beta
+docker run -d --name rustysoul --restart unless-stopped \
+  --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  -p 127.0.0.1:8484:8484 -p 2234:2234 \
+  -e RUSTYSOUL_BIND=all -e RUSTYSOUL_ALLOW_REMOTE=true \
+  -e RUSTYSOUL_PUBLISHED_TRANSFER_PORT=2234 \
+  -e RUSTYSOUL_DEFAULT_USERNAME=admin \
+  -e RUSTYSOUL_DEFAULT_PASSWORD=change-me-now \
+  -v rustysoul-data:/var/lib/rustysoul \
+  -v rustysoul-downloads:/downloads \
+  -v rustysoul-library:/library:ro \
+  ghcr.io/salnajjar/rustysoul:beta
 ```
 
-The public image is `ghcr.io/salnajjar/rustysoul:beta`. For a pinned version, set `RUSTYSOUL_IMAGE=ghcr.io/salnajjar/rustysoul:0.1.0-beta.3` in `.env`. No registry login is required for public pulls:
+Open **http://127.0.0.1:8484**. For a server elsewhere, use `ssh -L 8484:127.0.0.1:8484 your-server` or an HTTPS reverse proxy. To publish HTTP on another host adapter, change the host address in `-p`. For a pinned image use `ghcr.io/salnajjar/rustysoul:0.1.0-beta.4`. Public pulls need no registry login.
 
-```sh
-docker pull ghcr.io/salnajjar/rustysoul:0.1.0-beta.3
-```
+Initial administrator credentials are **admin / change-me-now**, unless changed with the two deployment variables above. First sign-in requires replacing **both** the username and password (minimum eight characters). Existing accounts survive restarts and are never reset by these bootstrap variables. Soulseek credentials are entered and verified separately under **Settings → Accounts**.
 
-Open **http://127.0.0.1:8484**. Initial administrator credentials are **admin / change-me-now**, unless changed in `.env` before installation. On first sign-in you must replace **both** the username and password (minimum eight characters). Soulseek account credentials are separate: enter and verify them under **Settings -> Accounts**. Verified credentials can connect automatically on startup.
+### Storage and networking
 
-For another computer, use `ssh -L 8484:127.0.0.1:8484 your-server`, then open the local address. For remote browser access, configure an HTTPS reverse proxy. Preserve Host/Origin, disable buffering for `/api/v1/events` and allow idle connections longer than 15 seconds. [HTTP binding and connection settings](docs/CONNECTIONS.md) explain adapter binding and remote access.
+Replace the named download/library volumes with `-v /your/downloads:/downloads` and `-v /your/music:/library:ro` to use existing host folders. The daemon runs as UID/GID **10001**; see [storage mapping](docs/STORAGE_MOUNTS.md) for permissions and rootless Podman. Keep the private state volume: it contains accounts, credentials, settings and history. Add more mounted libraries through Settings.
 
-### Storage and ports
+The bridge example publishes TCP **2234** and fixes the UI port to that publication. To change it, update the published port and `RUSTYSOUL_PUBLISHED_TRANSFER_PORT`, then recreate the container with the same volumes. Linux host networking supports UI port changes and UPnP without container port recreation; see the [environment deployment guide](docs/ENVIRONMENT.md) for a host-network example, all variables, GUI container managers and native operation. Slots, bandwidth limits, library locations and other preferences are editable in the UI.
 
-Compose uses three named volumes by default: private application state at `/var/lib/rustysoul`, downloads at `/downloads`, and an initially empty shared library at `/library`. To use existing host folders, set `RUSTYSOUL_LIBRARY_SOURCE=/path/to/music` and `RUSTYSOUL_DOWNLOADS_SOURCE=/path/to/downloads` in `.env` before starting. Libraries are mounted read-only; downloads must be writable by UID/GID **10001**. Multiple libraries and subfolders can be configured in the UI once mounted. See [storage mapping](docs/STORAGE_MOUNTS.md).
-
-The default Compose deployment uses Linux host networking for incoming transfers and UPnP discovery. HTTP binds to loopback and the transfer listener defaults to TCP **2234**. Change transfer ports, slots, per-user/total speed limits and UPnP under **Settings -> Network**. [Bridge networking](docs/CONTAINERS.md) is also available; its published transfer port must match the UI setting and requires container recreation to change. Back up application state and downloads before upgrades; `docker compose down -v` deletes named volumes.
+Compose and Quadlet remain optional alternatives in [container deployment](docs/CONTAINERS.md). Existing configurations continue to work; environment variables override file values, and saved UI preferences retain precedence for their startup defaults.
 
 ## Podman and native installation
 
-For rootless Podman:
+Use the same command with `podman` in place of `docker`. Named volumes also work with rootless Podman. For automatic startup through systemd, the optional `deploy/rustysoul.container` Quadlet example is available.
 
-```sh
-podman pull ghcr.io/salnajjar/rustysoul:beta
-mkdir -p ~/.config/containers/systemd ~/.config/rustysoul
-install -m 600 .env ~/.config/rustysoul/daemon.env
-install -m 644 deploy/container.toml ~/.config/rustysoul/rustysoul.toml
-install -m 644 deploy/rustysoul.container ~/.config/containers/systemd/
-systemctl --user daemon-reload
-systemctl --user start rustysoul.service
-```
-
-The [container guide](docs/CONTAINERS.md) covers storage and networking. Native Linux release bundles include the executable, installer, systemd service and notices; see [native installation](docs/NATIVE.md). Node is only needed to build the frontend, not at runtime.
+Native Linux bundles include the executable, installer, systemd service and notices; see [native installation](docs/NATIVE.md). Native startup can also use environment variables without a TOML file. Node is needed only to build the frontend.
 
 ## Features
 
-- Streaming search, format filters, wishlist, user/folder grouping, sorting and batch downloads.
-- User profiles, pictures, presence, buddies, share trees and interest discovery.
+- Streaming search, [file attributes and advanced quality filters](docs/SEARCH_AND_ATTRIBUTES.md), wishlist, user/folder grouping, sorting and batch downloads.
+- [User profiles and presence](docs/PROFILE.md), pictures, measured/custom upload-speed reporting, buddies, share trees and interest discovery.
 - Persistent transfer queues, retries, priorities, manual ordering, bulk cancellation and audio playback.
 - Multiple shared libraries, filesystem monitoring and incremental indexing with live progress.
-- Multi-room chat, unread indicators, private messaging, room boards and access controls. [Saved chat and room history](docs/CHAT_HISTORY.md) survives closing conversations and daemon restarts, with explicit per-conversation deletion.
+- Multi-room chat, unread indicators, private messaging, room boards and access controls. [Saved chat and room history](docs/CHAT_HISTORY.md) survives closing conversations and daemon restarts, with full-history text/sender search and all-history, age and date-range deletion.
 - Per-user/all-time traffic, compact long-term graphs, sharing protections and privileges status.
 - Themes, API integration keys, operational logs, database maintenance and encrypted backup/restore.
 
-See [feature details](docs/FEATURES.md) and the [API reference](docs/API.md). Credentials are encrypted at rest using a private local key; authentication uses hashed passwords and protected persistent sessions. See [security](docs/SECURITY.md) for boundaries and reporting.
+See [feature details](docs/FEATURES.md) and the [API reference](docs/API.md). Credentials are encrypted at rest using a private local key; authentication uses hashed passwords and protected persistent sessions. See [security](docs/SECURITY.md) for boundaries and reporting, and [security analysis](docs/SECURITY_ANALYSIS.md) for CI scanning, audited false-positive handling and release gates.
 
 ## Build and test
 

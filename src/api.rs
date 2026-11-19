@@ -69,6 +69,8 @@ impl ApiState {
             auth: None,
             commands,
             snapshot,
+            // Compatibility bearer token, generated at startup. User passwords
+            // are verified by Auth with Argon2id, never by this token digest.
             token_hash: Sha256::digest(token).into(),
             allow_remote: config.allow_remote,
             streams: Arc::new(Semaphore::new(16)),
@@ -133,6 +135,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/messages", get(message_history))
         .route("/messages/conversations", get(message_conversations))
         .route("/rooms/read", post(read_room))
+        .route("/messages/read", post(read_private))
         .route("/rooms/entries", get(room_entries))
         .route("/downloads/file", get(download_file))
         .route("/users/picture", get(user_picture))
@@ -227,6 +230,24 @@ async fn read_room(State(state): State<ApiState>, Json(q): Json<ReadRoom>) -> Re
         room: q.room,
         through_id: q.through_id,
     };
+    queue_read(state, command)
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadPrivate {
+    username: String,
+    through_id: u64,
+}
+async fn read_private(State(state): State<ApiState>, Json(q): Json<ReadPrivate>) -> Response {
+    queue_read(
+        state,
+        Command::ReadPrivate {
+            username: q.username,
+            through_id: q.through_id,
+        },
+    )
+}
+fn queue_read(state: ApiState, command: Command) -> Response {
     if let Err(e) = command.validate() {
         return error(StatusCode::BAD_REQUEST, &e);
     }
@@ -237,7 +258,7 @@ async fn read_room(State(state): State<ApiState>, Json(q): Json<ReadRoom>) -> Re
         if rate.0 < 1. {
             return error(
                 StatusCode::TOO_MANY_REQUESTS,
-                "Room read markers are updating too quickly",
+                "Read markers are updating too quickly",
             );
         }
         rate.0 -= 1.;
@@ -1221,6 +1242,128 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
     #[tokio::test]
+    async fn attribute_and_message_search_queries_work_through_authenticated_readonly_http_routes()
+    {
+        use http_body_util::BodyExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::store::Store::open(&dir.path().join("rustysoul.sqlite3")).unwrap();
+        let search = crate::model::SearchView {
+            id: "quality-http".into(),
+            query: "music".into(),
+            ..Default::default()
+        };
+        crate::search::create(&store.connection, &search).unwrap();
+        crate::search::append(
+            &store.connection,
+            &search.id,
+            [
+                crate::model::FileView {
+                    username: "alice".into(),
+                    path: "Music/good.flac".into(),
+                    size: 1024,
+                    free_slots: 1,
+                    speed: 2048,
+                    attributes: [(1, 120), (4, 96000), (5, 24)].into(),
+                },
+                crate::model::FileView {
+                    username: "bob".into(),
+                    path: "Music/low.mp3".into(),
+                    size: 1024,
+                    free_slots: 0,
+                    speed: 1024,
+                    attributes: [(0, 192), (1, 120), (2, 0), (4, 44100)].into(),
+                },
+            ],
+            100,
+        )
+        .unwrap();
+        store
+            .save_messages(&[
+                crate::model::MessageView {
+                    id: 1,
+                    target: "club".into(),
+                    username: "Alice".into(),
+                    text: "Jazz recommendation".into(),
+                    private: false,
+                    timestamp: 1,
+                },
+                crate::model::MessageView {
+                    id: 2,
+                    target: "club".into(),
+                    username: "bob".into(),
+                    text: "Jazz from someone else".into(),
+                    private: false,
+                    timestamp: 2,
+                },
+            ])
+            .unwrap();
+        let (_, snapshot) = watch::channel(Snapshot {
+            searches: vec![search],
+            ..Default::default()
+        });
+        let (commands, _) = mpsc::sync_channel(32);
+        let app = router(ApiState::new(
+            &Config {
+                data_dir: dir.path().into(),
+                ..Default::default()
+            },
+            &"s".repeat(32),
+            commands,
+            snapshot,
+        ));
+        // Library/history writers must coexist with the API's read-only snapshot.
+        let _writer = crate::store::write_transaction(&store.connection).unwrap();
+        for (uri, property, expected) in [
+            (
+                "/api/v1/searches/quality-http/results?min_sample_rate=48000&min_bit_depth=24&min_size=100&free_slots=true",
+                "files",
+                "Music/good.flac",
+            ),
+            (
+                "/api/v1/messages?target=club&private=false&filter=jazz&username=ALICE",
+                "messages",
+                "Jazz recommendation",
+            ),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req("GET", uri, None, ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let response = app
+                .clone()
+                .oneshot(req("GET", uri, Some(&"s".repeat(32)), ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body[property].as_array().unwrap().len(), 1);
+            assert_eq!(
+                body[property][0][if property == "files" { "path" } else { "text" }],
+                expected
+            );
+        }
+        for uri in [
+            "/api/v1/searches/quality-http/results?min_bitrate=320&max_bitrate=128",
+            "/api/v1/searches/quality-http/results?min_bit_depth=-1",
+            "/api/v1/messages?target=club&username=bad%0Aname",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req("GET", uri, Some(&"s".repeat(32)), ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+    #[tokio::test]
     async fn backup_work_can_outlast_the_ordinary_request_deadline() {
         let (commands, _receiver) = mpsc::sync_channel(32);
         let (_, snapshot) = watch::channel(Snapshot::default());
@@ -2056,11 +2199,13 @@ mod tests {
             "/api/v1/events",
             "/api/v1/commands",
             "/api/v1/maintenance",
+            "/api/v1/messages/read",
+            "/api/v1/rooms/read",
         ] {
             let (app, _) = app();
             let response = app
                 .oneshot(req(
-                    if route.ends_with("commands") {
+                    if route.ends_with("commands") || route.ends_with("/read") {
                         "POST"
                     } else {
                         "GET"
@@ -2073,6 +2218,69 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
         }
+    }
+    #[tokio::test]
+    async fn private_read_markers_validate_before_queuing_and_share_the_read_rate_limit() {
+        let (app, received) = app();
+        let token = "s".repeat(32);
+        for body in [
+            r#"{"username":"","through_id":1}"#,
+            r#"{"username":"peer","through_id":18446744073709551615}"#,
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req("POST", "/api/v1/messages/read", Some(&token), body))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert!(received.try_recv().is_err());
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(req(
+                    "POST",
+                    "/api/v1/messages/read",
+                    Some(&token),
+                    r#"{"username":"Peer","through_id":7}"#
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), Command::ReadPrivate { username, through_id: 7 } if username=="Peer")
+        );
+        for _ in 0..15 {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req(
+                        "POST",
+                        "/api/v1/rooms/read",
+                        Some(&token),
+                        r#"{"room":"room","through_id":1}"#
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            received.try_recv().unwrap();
+        }
+        assert_eq!(
+            app.oneshot(req(
+                "POST",
+                "/api/v1/messages/read",
+                Some(&token),
+                r#"{"username":"Peer","through_id":7}"#
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
     #[tokio::test]
     async fn metrics_are_authenticated_readonly_text_without_private_snapshot_fields() {

@@ -72,11 +72,16 @@ import Backups from "./Backups";
 import Discover from "./Discover";
 import RoomTools, { RoomJoin } from "./RoomTools";
 import ChatComposer from "./ChatComposer";
+import HistoryDelete from "./HistoryDelete";
+import MessageSearch from "./MessageSearch";
+import AdvancedSearch, { type FileCriteria } from "./AdvancedSearch";
 import SystemStatus from "./SystemStatus";
 import ConversationMessages from "./ConversationMessages";
 import { useConversations, useMessageHistory } from "./useMessageHistory";
+import { usePrivateConversations } from "./usePrivateConversations";
 import { SelectionProvider, useChoice, accepted } from "./WorkspaceState";
 import { useRoomRead } from "./RoomRead";
+import { userKey, isIgnored, unreadTotal } from "./chatState";
 import {
   sortTransfers,
   progress,
@@ -341,7 +346,9 @@ export default function App() {
                   key={id}
                   aria-label={label}
                   aria-describedby={
-                    id === "rooms" ? "room-unread-total" : undefined
+                    id === "rooms" || id === "messages"
+                      ? `${id}-unread-total`
+                      : undefined
                   }
                   className={`nav-item ${page === id ? "selected" : ""}`}
                   onClick={() => setPage(id)}
@@ -349,19 +356,19 @@ export default function App() {
                 >
                   <Icon size={18} />
                   {label}
-                  {id === "rooms" &&
-                    Object.values(state.room_unread || {}).reduce(
-                      (a, b) => a + b,
-                      0,
+                  {(id === "rooms" || id === "messages") &&
+                    unreadTotal(
+                      id === "rooms" ? state.room_unread : state.private_unread,
                     ) > 0 && (
                       <span
                         className="count unread-count"
-                        id="room-unread-total"
-                        aria-label={`${Object.values(state.room_unread || {}).reduce((a, b) => a + b, 0)} unread room messages`}
+                        id={`${id}-unread-total`}
+                        aria-label={`${unreadTotal(id === "rooms" ? state.room_unread : state.private_unread)} unread ${id === "rooms" ? "room" : "private"} messages`}
                       >
-                        {Object.values(state.room_unread || {}).reduce(
-                          (a, b) => a + b,
-                          0,
+                        {unreadTotal(
+                          id === "rooms"
+                            ? state.room_unread
+                            : state.private_unread,
                         )}
                       </span>
                     )}
@@ -766,10 +773,15 @@ export default function App() {
                             Soulseek account above.
                           </p>
                           <p className="hint">
+                            Soulseek supports Online and Away while connected.
+                            Away keeps searches and transfers working; the
+                            protocol has no supported invisible mode. Set Away
+                            from the account menu or configure automatic Away in
+                            Profile.
+                          </p>
+                          <p className="hint">
                             Soulseek traffic is not end-to-end encrypted. Use
-                            HTTPS for remote browser access. This alpha has not
-                            completed a security audit or live interoperability
-                            testing.
+                            HTTPS for remote browser access.
                           </p>
                         </section>
                       </>
@@ -896,6 +908,7 @@ function SearchPage({
   const [selected, setSelected] = useState("");
   const [filter, setFilter] = useState("");
   const [format, setFormat] = useState<AudioFormat>("all");
+  const [criteria, setCriteria] = useState<FileCriteria>({});
   const [repeatQuery, setRepeatQuery] = useState("");
   useEffect(() => {
     if (scopePreset) {
@@ -948,7 +961,18 @@ function SearchPage({
         onSubmit={(e) => {
           e.preventDefault();
           if (!online) return;
-          send({ type: "search", query: query.trim() });
+          send(
+            scope === "global"
+              ? { type: "search", query: query.trim() }
+              : {
+                  type: "search_scoped",
+                  query: query.trim(),
+                  scope: {
+                    type: scope,
+                    [scope === "user" ? "username" : "room"]: target.trim(),
+                  },
+                },
+          );
           setSelected("");
         }}
       >
@@ -1002,6 +1026,7 @@ function SearchPage({
         </small>
       </div>
       <Wishlist state={state} send={send} open={setSelected} />
+      <AdvancedSearch value={criteria} change={setCriteria} />
       <div className="search-hints">
         <span>
           <ShieldCheck size={13} />
@@ -1105,6 +1130,7 @@ function SearchPage({
               token={token}
               filter={filter}
               format={format}
+              criteria={criteria}
               send={send}
               online={online}
               capacity={Math.max(
@@ -2130,14 +2156,19 @@ function ChatPage({
     state.message_reset || 0,
     state.message_revision,
   );
-  const conversations = [
-    ...new Set([
-      ...state.messages.filter((m) => m.private).map((m) => m.target),
-      ...savedConversations.data.filter((c) => c.private).map((c) => c.target),
-    ]),
-  ];
+  const privateConversations = usePrivateConversations(
+    state,
+    savedConversations.data,
+    privateChat ? target : "",
+    setTarget,
+  );
+  const conversations = privateConversations.names;
   const liveMessages = state.messages.filter(
-    (m) => m.private === privateChat && m.target === target,
+    (m) =>
+      m.private === privateChat &&
+      (privateChat
+        ? userKey(m.target) === userKey(target)
+        : m.target === target),
   );
   const history = useMessageHistory(
     token,
@@ -2146,21 +2177,28 @@ function ChatPage({
     state.message_revision,
     state.message_reset || 0,
     liveMessages,
+    JSON.stringify(
+      state.user_rules
+        .filter((r) => r.ignored)
+        .map((r) => userKey(r.username))
+        .sort(),
+    ),
   );
   const messages = history.messages.filter(
-    (m) =>
-      !state.user_rules.some((r) => r.ignored && r.username === m.username),
+    (m) => !isIgnored(state, m.username),
   );
   const [deleteHistory, setDeleteHistory] = useState(false);
-  const [deletingHistory, setDeletingHistory] = useState(false);
+  const [searchMessages, setSearchMessages] = useState(false);
+  useEffect(() => setSearchMessages(false), [target, privateChat]);
   useEffect(() => setDeleteHistory(false), [target, privateChat]);
   const read = useRoomRead({
-    enabled: readingEnabled && (privateChat || roomPane === "chat"),
-    acknowledge: !privateChat,
+    enabled:
+      readingEnabled && !searchMessages && (privateChat || roomPane === "chat"),
+    privateChat,
     room: target,
     messages,
     readTo: privateChat
-      ? Number.MAX_SAFE_INTEGER
+      ? state.private_read?.[userKey(target)] || 0
       : state.room_read?.[target] || 0,
     token,
   });
@@ -2301,17 +2339,33 @@ function ChatPage({
             {privateChat
               ? conversations.map((u) => (
                   <div
-                    className={`room-item ${target === u ? "chosen" : ""}`}
+                    className={`room-item ${userKey(target) === userKey(u) ? "chosen" : ""}`}
                     key={u}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Open conversation with ${u}`}
+                    aria-pressed={userKey(target) === userKey(u)}
+                    onClick={() => setTarget(u)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setTarget(u);
+                      }
+                    }}
                   >
-                    <User username={u} />
-                    <button
-                      className="button small secondary"
-                      aria-label={`Open conversation with ${u}`}
-                      onClick={() => setTarget(u)}
-                    >
-                      Chat
-                    </button>
+                    <span className="user-identity">
+                      <strong>{u}</strong>
+                      <UserStatus username={u} />
+                    </span>
+                    {(state.private_unread?.[userKey(u)] || 0) > 0 && (
+                      <span
+                        className="unread-count"
+                        aria-label={`${state.private_unread?.[userKey(u)]} unread messages`}
+                      >
+                        {state.private_unread?.[userKey(u)]}
+                      </span>
+                    )}
+                    <ChevronRight size={16} aria-hidden="true" />
                   </div>
                 ))
               : sortRooms(allRooms, roomSort)
@@ -2405,6 +2459,18 @@ function ChatPage({
             {target && (
               <button
                 className="button small secondary"
+                aria-pressed={searchMessages}
+                onClick={() => {
+                  setSearchMessages(!searchMessages);
+                  setRoomPane("chat");
+                }}
+              >
+                Search messages
+              </button>
+            )}
+            {target && (
+              <button
+                className="button small secondary"
                 onClick={() => setDeleteHistory(true)}
               >
                 Delete history
@@ -2413,7 +2479,7 @@ function ChatPage({
             {privateChat && target && (
               <button
                 className="button small secondary"
-                onClick={() => setTarget("")}
+                onClick={privateConversations.close}
               >
                 Close chat
               </button>
@@ -2447,48 +2513,12 @@ function ChatPage({
             )}
           </div>
           {deleteHistory && target && (
-            <div
-              className="chat-history-confirmation"
-              role="alertdialog"
-              aria-label="Delete conversation history"
-            >
-              <p>
-                Permanently delete all saved{" "}
-                {privateChat ? "private chat" : "room"} messages{" "}
-                {privateChat ? "with" : "in"} {target}, including older history?
-                New messages will still be saved.
-              </p>
-              <div className="button-row">
-                <button
-                  className="button small"
-                  disabled={deletingHistory}
-                  onClick={async () => {
-                    setDeletingHistory(true);
-                    try {
-                      if (
-                        (await send({
-                          type: "clear_message_history",
-                          target,
-                          private: privateChat,
-                        })) !== false
-                      )
-                        setDeleteHistory(false);
-                    } finally {
-                      setDeletingHistory(false);
-                    }
-                  }}
-                >
-                  Delete history permanently
-                </button>
-                <button
-                  className="button small secondary"
-                  disabled={deletingHistory}
-                  onClick={() => setDeleteHistory(false)}
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
+            <HistoryDelete
+              target={target}
+              privateChat={privateChat}
+              send={send}
+              close={() => setDeleteHistory(false)}
+            />
           )}
           {!privateChat && target && (
             <div
@@ -2606,8 +2636,25 @@ function ChatPage({
             id="room-chat-content"
             hidden={!privateChat && roomPane !== "chat"}
           >
+            {searchMessages && (
+              <MessageSearch
+                key={`${privateChat}:${target}`}
+                token={token}
+                target={target}
+                privateChat={privateChat}
+                visibility={JSON.stringify([
+                  state.message_reset,
+                  state.user_rules
+                    .filter((r) => r.ignored)
+                    .map((r) => userKey(r.username))
+                    .sort(),
+                ])}
+                close={() => setSearchMessages(false)}
+              />
+            )}
             <div
               className="message-list"
+              hidden={searchMessages}
               role="log"
               aria-label="Conversation"
               ref={read.viewport}
@@ -2653,9 +2700,10 @@ function ChatPage({
                 aria-hidden="true"
               />
             </div>
-            {!privateChat &&
-              !read.bottom &&
-              (state.room_unread?.[target] || 0) > 0 && (
+            {!read.bottom &&
+              (privateChat
+                ? state.private_unread?.[userKey(target)] || 0
+                : state.room_unread?.[target] || 0) > 0 && (
                 <button className="button small secondary" onClick={read.jump}>
                   New messages · Jump to latest
                 </button>

@@ -255,6 +255,17 @@ fn scan(
                     .unwrap_or_default()
                     .as_nanos()
                     .to_string();
+                // Reprobe an older metadata extractor once, then retain the fast
+                // unchanged-file path on all subsequent incremental scans.
+                let extractor = if path
+                    .extension()
+                    .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("mp3"))
+                {
+                    "audio-mp3-v3"
+                } else {
+                    "audio-v2"
+                };
+                let changed = format!("{extractor}:{changed}");
                 let attrs = if let Some(c) = old.get(&real).filter(|c| {
                     c.size == meta.len()
                         && c.modified == modified
@@ -600,6 +611,51 @@ mod tests {
         assert!(check_location_roots(&locations, &roots).is_err());
     }
     #[test]
+    fn old_cached_properties_are_refreshed_once_without_reopening_unchanged_media_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("music");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("vendor/soulseek-rs-lib/tests/fixtures/audio/tone.wav"),
+            root.join("tone.wav"),
+        )
+        .unwrap();
+        let mut store = crate::store::Store::open(&dir.path().join("db")).unwrap();
+        let stop = AtomicBool::new(false);
+        scan(
+            &mut store.connection,
+            std::slice::from_ref(&root),
+            &stop,
+            |_| {},
+        )
+        .unwrap();
+        store.connection.execute_batch("UPDATE library_cache SET changed=substr(changed,10),attributes='[]'; UPDATE local_files SET attributes='[]';").unwrap();
+        let (_, refreshed) = scan(
+            &mut store.connection,
+            std::slice::from_ref(&root),
+            &stop,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((refreshed.changed, refreshed.skipped), (1, 0));
+        let attrs: String = store
+            .connection
+            .query_row("SELECT attributes FROM local_files", [], |r| r.get(0))
+            .unwrap();
+        let attrs: Vec<(u32, u32)> = serde_json::from_str(&attrs).unwrap();
+        assert!(attrs.contains(&(4, 48000)));
+        assert!(attrs.contains(&(5, 24)));
+        let (_, unchanged) = scan(
+            &mut store.connection,
+            std::slice::from_ref(&root),
+            &stop,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((unchanged.changed, unchanged.skipped), (0, 1));
+    }
+    #[test]
     fn incremental_scan_skips_unchanged_and_tracks_add_modify_remove() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("music");
@@ -636,6 +692,63 @@ mod tests {
         std::fs::remove_file(root.join("a.flac")).unwrap();
         let (index, last) = scan(&mut store.connection, &[root], &stop, |_| {}).unwrap();
         assert_eq!((last.skipped, last.removed, index.file_count()), (1, 1, 1));
+    }
+
+    #[test]
+    fn mp3_metadata_upgrade_corrects_cbr_and_keeps_other_formats_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("music");
+        std::fs::create_dir(&root).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/soulseek-rs-lib/tests/fixtures/audio");
+        for name in ["tone.flac", "tone.mp3"] {
+            std::fs::copy(fixtures.join(name), root.join(name)).unwrap();
+        }
+        let mut store = crate::store::Store::open(&dir.path().join("db")).unwrap();
+        let stop = AtomicBool::new(false);
+        scan(
+            &mut store.connection,
+            std::slice::from_ref(&root),
+            &stop,
+            |_| {},
+        )
+        .unwrap();
+        store.connection.execute_batch("UPDATE library_cache SET changed=replace(changed,'audio-mp3-v3:','audio-v2:'),attributes='[[0,195],[1,1],[2,0],[4,48000]]' WHERE real_path LIKE '%.mp3'; UPDATE local_files SET attributes='[[0,195],[1,1],[2,0],[4,48000]]' WHERE path LIKE '%.mp3';").unwrap();
+        let (index, status) = scan(
+            &mut store.connection,
+            std::slice::from_ref(&root),
+            &stop,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((status.changed, status.skipped), (1, 1));
+        let mp3 = index
+            .files()
+            .iter()
+            .find(|f| f.virtual_path.ends_with("tone.mp3"))
+            .unwrap();
+        assert!(mp3.attributes.contains(&(0, 192)));
+        let attrs: String = store
+            .connection
+            .query_row(
+                "SELECT attributes FROM local_files WHERE path LIKE '%.mp3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Vec<(u32, u32)>>(&attrs)
+                .unwrap()
+                .contains(&(0, 192))
+        );
+        let (_, unchanged) = scan(
+            &mut store.connection,
+            std::slice::from_ref(&root),
+            &stop,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((unchanged.changed, unchanged.skipped), (0, 2));
     }
     #[test]
     fn filesystem_hooks_automatically_detect_new_files() {
