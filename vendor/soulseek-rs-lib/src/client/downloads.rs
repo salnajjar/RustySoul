@@ -6,6 +6,9 @@ use super::{
 use crate::peer::discard_idle_partial;
 
 impl Client {
+    pub fn take_upload_rate_samples(&self) -> Vec<crate::types::UploadRateSample> {
+        self.context.read_safe().map(|c| c.upload_speed_limit.take_upload_rate_samples()).unwrap_or_default()
+    }
     pub fn set_download_write_guard(&self, guard: Option<Arc<dyn crate::types::DownloadWriteGuard>>) {
         if let Ok(mut context)=self.context.write_safe(){context.download_write_guard=guard;}
     }

@@ -2,6 +2,8 @@ use std::{collections::HashMap, sync::mpsc::Sender};
 
 use crate::{error::Result, message::Message, utils::zlib::inflate};
 
+pub use crate::utils::bandwidth::UploadRateSample;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct File {

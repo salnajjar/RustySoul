@@ -32,7 +32,8 @@ fn room_list(stream: &mut TcpStream, created: bool, owned: bool, operator: bool)
 }
 fn join(stream: &mut TcpStream, room: &str, owner: &str, operators: &[&str], private: bool) {
     let mut b = string(room);
-    for _ in 0..5 {
+    b.extend(strings(if private { &["fixture-self"] } else { &[] }));
+    for _ in 0..4 {
         b.extend(0u32.to_le_bytes());
     }
     if private {
@@ -42,7 +43,7 @@ fn join(stream: &mut TcpStream, room: &str, owner: &str, operators: &[&str], pri
     send(stream, 14, &b);
     if private {
         let mut members = string(room);
-        members.extend(strings(&["fixture-self", "alice", "bob"]));
+        members.extend(strings(&["alice", "bob"]));
         send(stream, 133, &members);
     }
     let mut board = string(room);
@@ -100,9 +101,12 @@ fn private_room_controls_board_public_fallback_and_membership_gated_restart_use_
                             if !created {
                                 assert_eq!(flag, 1);
                                 created = true;
-                            } else {
-                                assert_eq!(flag, 0);
+                                // Ownership can be announced before a chat is joined.
+                                // The client must follow through with a private join.
+                                room_list(&mut stream, created, owned, operator);
+                                continue;
                             }
+                            assert_eq!(flag, 1);
                             join(
                                 &mut stream,
                                 room,
@@ -112,7 +116,7 @@ fn private_room_controls_board_public_fallback_and_membership_gated_restart_use_
                             );
                         } else {
                             assert_eq!(room, "Other");
-                            assert_eq!(flag, 0);
+                            assert_eq!(flag, 1);
                             join(
                                 &mut stream,
                                 room,
@@ -353,7 +357,7 @@ fn private_room_controls_board_public_fallback_and_membership_gated_restart_use_
     });
     assert_eq!(expect(141), vec![1]);
     let mut requested = string("Other");
-    requested.extend(0u32.to_le_bytes());
+    requested.extend(1u32.to_le_bytes());
     assert_eq!(expect(14), requested);
     let mut published = string("Other");
     published.extend(string("Persistent board"));

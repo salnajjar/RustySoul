@@ -16,6 +16,53 @@ export function RoomJoin({
   const [name, setName] = useState("");
   const [kind, setKind] = useState("public");
   const [busy, setBusy] = useState(false);
+  const [requested, setRequested] = useState<{
+    room: string;
+    errorBefore: string | null;
+    revisionBefore: number;
+  } | null>(null);
+  const [joinError, setJoinError] = useState("");
+  useEffect(() => {
+    if (!requested) return;
+    if (state.joined_rooms.includes(requested.room)) {
+      choose(requested.room);
+      setRequested(null);
+      return;
+    }
+    const info = state.room_management?.rooms[requested.room];
+    const failure =
+      ((info?.revision ?? 0) > requested.revisionBefore && !info?.pending
+        ? info?.error
+        : "") ||
+      (state.error !== requested.errorBefore &&
+      /^(Create private room|Join room) failed:/.test(state.error || "")
+        ? state.error
+        : "");
+    if (failure || state.connection !== "connected") {
+      setJoinError(
+        failure ||
+          "Disconnected before the server confirmed the room. Reconnect and try again.",
+      );
+      setRequested(null);
+    }
+  }, [
+    requested,
+    state.joined_rooms,
+    state.room_management,
+    state.error,
+    state.connection,
+    choose,
+  ]);
+  useEffect(() => {
+    if (!requested) return;
+    const timer = setTimeout(() => {
+      setJoinError(
+        "The server has not confirmed the room. Check the room name and your access, then try again.",
+      );
+      setRequested(null);
+    }, 25000);
+    return () => clearTimeout(timer);
+  }, [requested]);
   const [dismissed, setDismissed] = useState<string | null>(null);
   useEffect(
     () => setDismissed(null),
@@ -46,6 +93,7 @@ export function RoomJoin({
             e.preventDefault();
             const room = name.trim();
             if (!room) return;
+            setJoinError("");
             setBusy(true);
             try {
               if (
@@ -55,7 +103,12 @@ export function RoomJoin({
                   room,
                 })) !== false
               )
-                choose(room);
+                setRequested({
+                  room,
+                  errorBefore: state.error,
+                  revisionBefore:
+                    state.room_management?.rooms[room]?.revision ?? 0,
+                });
             } finally {
               setBusy(false);
             }
@@ -81,16 +134,34 @@ export function RoomJoin({
               <option value="private">Private</option>
             </select>
           </label>
-          <button className="button" disabled={!online || busy || !name.trim()}>
-            {kind === "private"
-              ? "Create or join private room"
-              : "Join room by name"}
+          <button
+            className="button"
+            disabled={!online || busy || !!requested || !name.trim()}
+          >
+            {requested
+              ? "Waiting for room confirmation…"
+              : kind === "private"
+                ? "Create or join private room"
+                : "Join room by name"}
           </button>
         </form>
+        {requested && (
+          <p role="status">
+            {state.room_management?.rooms[requested.room]?.pending ||
+              `Waiting for the server to join ${requested.room}…`}
+          </p>
+        )}
+        {joinError && (
+          <SystemMessage error onDismiss={() => setJoinError("")}>
+            {joinError}
+          </SystemMessage>
+        )}
         <p className="hint">
           Private rooms are visible to their members. A new private name makes
           you the owner. Leaving the chat keeps membership; cancelling
-          membership is a separate action.
+          membership is a separate action. Creation joins you automatically once
+          the server confirms it. Public rooms have no owner or administrator
+          role.
         </p>
         <label className="checkbox-label">
           <input

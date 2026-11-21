@@ -5,18 +5,62 @@
 //! of them having to be widened for the move.
 
 use super::{
-    ActorSystem, Arc, AtomicBool, AtomicUsize, BROKER_CONNECT_TIMEOUT,
-    BROWSE_PROTECT_WINDOW, ClientContext, DEFAULT_MAX_PEERS,
-    DEFAULT_UPLOAD_SLOTS, DownloadStatus, DownloadStore, HashMap, HashSet,
-    DiscoveryEvent, Instant, PENDING_PEER_TTL, Recommendation, RoomEvent, RoomInfo, RoomTicker,
-    RoomUserStats, SharedDirectory, Shares, SimilarUser, UserInfo,
-    UserInterests, UserMessage, UserPresence, UserStats, UserStatus, children,
-    distributed, sorted_unique,
+    ActorSystem, Arc, AtomicBool, AtomicUsize, BROKER_CONNECT_TIMEOUT, BROWSE_PROTECT_WINDOW,
+    ClientContext, DEFAULT_MAX_PEERS, DEFAULT_UPLOAD_SLOTS, DiscoveryEvent, DownloadStatus,
+    DownloadStore, HashMap, HashSet, Instant, PENDING_PEER_TTL, Recommendation, RoomEvent,
+    RoomInfo, RoomTicker, RoomUserStats, SharedDirectory, Shares, SimilarUser, UserInfo,
+    UserInterests, UserMessage, UserPresence, UserStats, UserStatus, children, distributed,
+    sorted_unique,
 };
 
 impl ClientContext {
-    pub(super) fn advertised_upload_speed(&self)->u32 {
-        self.reported_upload_speed.or(self.measured_upload_speed).unwrap_or(self.last_upload_speed)
+    pub(crate) fn accept_search_result(&mut self, result: crate::types::SearchResult) {
+        if let Some(search) = self.searches.values_mut().find(|s| s.token == result.token) {
+            search.accept(result);
+        }
+    }
+    fn fail_offline_uploads(&mut self, username: &str) {
+        use crate::types::{UploadInfo, UploadStatus};
+        let reason = "The receiving user went offline before the upload finished.";
+        let mut ended: Vec<_> = self
+            .queued_uploads()
+            .into_iter()
+            .filter(|u| u.username.eq_ignore_ascii_case(username))
+            .collect();
+        ended.extend(
+            self.uploads
+                .values()
+                .filter(|u| u.downloader.eq_ignore_ascii_case(username))
+                .map(|u| UploadInfo {
+                    username: u.downloader.clone(),
+                    filename: u.virtual_path.clone(),
+                    size: u.size,
+                    bytes_sent: 0,
+                    speed_bytes_per_sec: 0.,
+                    status: UploadStatus::Failed(reason.into()),
+                }),
+        );
+        self.release_upload_slots(username);
+        for mut info in ended {
+            info.status = UploadStatus::Failed(reason.into());
+            self.upload_events.push(Arc::new(info));
+        }
+        let overflow = self.upload_events.len().saturating_sub(256);
+        self.upload_events.drain(..overflow);
+        for upload in self.active_uploads.values_mut().filter(|u| {
+            u.username.eq_ignore_ascii_case(username)
+                && matches!(u.status, UploadStatus::InProgress)
+        }) {
+            upload.status = UploadStatus::Failed(reason.into());
+            upload
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    pub(super) fn advertised_upload_speed(&self) -> u32 {
+        self.reported_upload_speed
+            .or(self.measured_upload_speed)
+            .unwrap_or(self.last_upload_speed)
     }
     /// A context for the client that logs in as `username`.
     #[must_use]
@@ -59,7 +103,8 @@ impl ClientContext {
             browse_results: HashMap::new(),
             folder_contents: HashMap::new(),
             peer_infos: HashMap::new(),
-            public_description:String::new(),public_picture:Vec::new(),
+            public_description: String::new(),
+            public_picture: Vec::new(),
             pending_browses: HashMap::new(),
             room_list: Vec::new(),
             room_events: Vec::new(),
@@ -80,12 +125,16 @@ impl ClientContext {
             watched_users: HashSet::new(),
             wishlist_interval: None,
             privileged_users: HashSet::new(),
-            banned_users:HashSet::new(),
-            upload_policy:Default::default(),sharing_checks:HashMap::new(),sharing_stats_at:HashMap::new(),sharing_denials:Vec::new(),
+            banned_users: HashSet::new(),
+            upload_policy: Default::default(),
+            sharing_checks: HashMap::new(),
+            sharing_stats_at: HashMap::new(),
+            sharing_denials: Vec::new(),
             own_privileges: None,
             own_privileges_revision: 0,
             excluded_search_phrases: Vec::new(),
             upload_queue: Vec::new(),
+            upload_reconnects: HashMap::new(),
             upload_seq: 0,
             upload_order: HashMap::new(),
             upload_slots: DEFAULT_UPLOAD_SLOTS,
@@ -110,9 +159,15 @@ impl ClientContext {
                 members.dedup();
                 self.room_members.insert(room.clone(), members);
             }
-            RoomEvent::PrivateJoined { room, users, operators, .. } => {
+            RoomEvent::PrivateJoined {
+                room,
+                users,
+                operators,
+                ..
+            } => {
                 self.room_members.insert(room.clone(), sorted_unique(users));
-                self.private_room_operators.insert(room.clone(), sorted_unique(operators));
+                self.private_room_operators
+                    .insert(room.clone(), sorted_unique(operators));
             }
             RoomEvent::PrivateList { .. } | RoomEvent::InvitationsEnabled(_) => {}
             RoomEvent::Left { room } => {
@@ -213,11 +268,7 @@ impl ClientContext {
     /// interest cannot both be held.
     /// Returns the stored spelling, or `None` for an empty item — which is
     /// no interest, and must not be sent to the server either.
-    pub fn add_own_interest(
-        &mut self,
-        item: &str,
-        liked: bool,
-    ) -> Option<String> {
+    pub fn add_own_interest(&mut self, item: &str, liked: bool) -> Option<String> {
         let item = item.trim().to_lowercase();
         if item.is_empty() {
             return None;
@@ -234,11 +285,7 @@ impl ClientContext {
     }
 
     /// Forget one of our own interests. `None` for an empty item, as above.
-    pub fn remove_own_interest(
-        &mut self,
-        item: &str,
-        liked: bool,
-    ) -> Option<String> {
+    pub fn remove_own_interest(&mut self, item: &str, liked: bool) -> Option<String> {
         let item = item.trim().to_lowercase();
         if item.is_empty() {
             return None;
@@ -311,16 +358,22 @@ impl ClientContext {
     }
 
     /// Record what `username` says about itself.
-    pub fn store_peer_info(
-        &mut self,
-        username: String,
-        info: crate::message::peer::PeerInfo,
-    ) {
+    pub fn store_peer_info(&mut self, username: String, info: crate::message::peer::PeerInfo) {
         self.peer_infos.remove(&username);
         let incoming = info.picture.as_ref().map_or(0, |p| p.len());
         // Bound both entry count and aggregate picture memory.
-        while self.peer_infos.len() >= 128 || self.peer_infos.values().map(|p| p.picture.as_ref().map_or(0, |b| b.len())).sum::<usize>() + incoming > 16 * 1024 * 1024 {
-            let Some(old) = self.peer_infos.keys().next().cloned() else { break; };
+        while self.peer_infos.len() >= 128
+            || self
+                .peer_infos
+                .values()
+                .map(|p| p.picture.as_ref().map_or(0, |b| b.len()))
+                .sum::<usize>()
+                + incoming
+                > 16 * 1024 * 1024
+        {
+            let Some(old) = self.peer_infos.keys().next().cloned() else {
+                break;
+            };
             self.peer_infos.remove(&old);
         }
         self.peer_infos.insert(username, info);
@@ -328,10 +381,7 @@ impl ClientContext {
 
     /// What `username` last said about itself, if anything.
     #[must_use]
-    pub fn peer_info(
-        &self,
-        username: &str,
-    ) -> Option<crate::message::peer::PeerInfo> {
+    pub fn peer_info(&self, username: &str) -> Option<crate::message::peer::PeerInfo> {
         self.peer_infos.get(username).cloned()
     }
 
@@ -383,8 +433,7 @@ impl ClientContext {
     /// The private rooms we belong to, in a stable order.
     #[must_use]
     pub fn private_rooms(&self) -> Vec<String> {
-        let mut rooms: Vec<String> =
-            self.private_room_members.keys().cloned().collect();
+        let mut rooms: Vec<String> = self.private_room_members.keys().cloned().collect();
         rooms.sort();
         rooms
     }
@@ -404,7 +453,11 @@ impl ClientContext {
     ) {
         let recommended: Vec<_> = recommended.into_iter().take(500).collect();
         let unrecommended: Vec<_> = unrecommended.into_iter().take(500).collect();
-        self.push_discovery(DiscoveryEvent::Recommendations { global, recommended: recommended.clone(), unrecommended: unrecommended.clone() });
+        self.push_discovery(DiscoveryEvent::Recommendations {
+            global,
+            recommended: recommended.clone(),
+            unrecommended: unrecommended.clone(),
+        });
         let slot = if global {
             &mut self.global_recommendations
         } else {
@@ -432,8 +485,13 @@ impl ClientContext {
         recommendations: Vec<Recommendation>,
     ) {
         let recommendations: Vec<_> = recommendations.into_iter().take(1000).collect();
-        self.push_discovery(DiscoveryEvent::ItemRecommendations { item: item.clone(), recommendations: recommendations.clone() });
-        if self.item_recommendations.len() >= 64 { self.item_recommendations.clear(); }
+        self.push_discovery(DiscoveryEvent::ItemRecommendations {
+            item: item.clone(),
+            recommendations: recommendations.clone(),
+        });
+        if self.item_recommendations.len() >= 64 {
+            self.item_recommendations.clear();
+        }
         self.item_recommendations.insert(item, recommendations);
     }
 
@@ -456,14 +514,15 @@ impl ClientContext {
         self.similar_users.clone()
     }
 
-    pub fn apply_item_similar_users(
-        &mut self,
-        item: String,
-        usernames: Vec<String>,
-    ) {
+    pub fn apply_item_similar_users(&mut self, item: String, usernames: Vec<String>) {
         let usernames: Vec<_> = usernames.into_iter().take(500).collect();
-        self.push_discovery(DiscoveryEvent::ItemUsers { item: item.clone(), usernames: usernames.clone() });
-        if self.item_similar_users.len() >= 64 { self.item_similar_users.clear(); }
+        self.push_discovery(DiscoveryEvent::ItemUsers {
+            item: item.clone(),
+            usernames: usernames.clone(),
+        });
+        if self.item_similar_users.len() >= 64 {
+            self.item_similar_users.clear();
+        }
         self.item_similar_users.insert(item, usernames);
     }
 
@@ -478,13 +537,17 @@ impl ClientContext {
     pub fn apply_user_interests(&mut self, mut interests: UserInterests) {
         interests.likes.truncate(500);
         interests.hates.truncate(500);
-        if self.user_interests.len() >= 512 { self.user_interests.clear(); }
+        if self.user_interests.len() >= 512 {
+            self.user_interests.clear();
+        }
         self.user_interests
             .insert(interests.username.clone(), interests);
     }
 
     fn push_discovery(&mut self, event: DiscoveryEvent) {
-        if self.discovery_events.len() >= 16 { self.discovery_events.remove(0); }
+        if self.discovery_events.len() >= 16 {
+            self.discovery_events.remove(0);
+        }
         self.discovery_events.push(event);
     }
 
@@ -500,8 +563,7 @@ impl ClientContext {
     /// Record the phrases the server excludes (code 160), lowercased here so
     /// the per-file check is a plain `contains` on a lowercased path.
     pub fn set_excluded_search_phrases(&mut self, phrases: Vec<String>) {
-        self.excluded_search_phrases =
-            phrases.iter().map(|p| p.to_lowercase()).collect();
+        self.excluded_search_phrases = phrases.iter().map(|p| p.to_lowercase()).collect();
     }
 
     /// The phrases the server refuses to search for.
@@ -518,12 +580,10 @@ impl ClientContext {
 
     /// Record a `GetUserStatus` reply, merging it with any statistics already
     /// received for that user.
-    pub fn apply_user_status(
-        &mut self,
-        username: String,
-        status: u32,
-        privileged: bool,
-    ) {
+    pub fn apply_user_status(&mut self, username: String, status: u32, privileged: bool) {
+        if status == 0 {
+            self.fail_offline_uploads(&username);
+        }
         self.user_info
             .entry(username.clone())
             .or_insert_with(|| UserInfo::pending(username))
@@ -548,7 +608,8 @@ impl ClientContext {
         shared_files: u32,
         shared_folders: u32,
     ) {
-        self.sharing_stats_at.insert(username.clone(),Instant::now());
+        self.sharing_stats_at
+            .insert(username.clone(), Instant::now());
         self.user_info
             .entry(username.clone())
             .or_insert_with(|| UserInfo::pending(username))
@@ -574,8 +635,7 @@ impl ClientContext {
     /// Everyone we are currently watching, sorted by name.
     #[must_use]
     pub fn watched_users(&self) -> Vec<String> {
-        let mut users: Vec<String> =
-            self.watched_users.iter().cloned().collect();
+        let mut users: Vec<String> = self.watched_users.iter().cloned().collect();
         users.sort();
         users
     }
@@ -592,6 +652,9 @@ impl ClientContext {
         shared_files: Option<u32>,
         shared_folders: Option<u32>,
     ) {
+        if !exists || status == Some(0) {
+            self.fail_offline_uploads(&username);
+        }
         if !exists {
             self.watched_users.remove(&username);
             let mut info = UserInfo::pending(username.clone());
@@ -599,7 +662,10 @@ impl ClientContext {
             self.user_info.insert(username, info);
             return;
         }
-        self.user_info.entry(username.clone()).or_insert_with(|| UserInfo::pending(username.clone())).exists = Some(true);
+        self.user_info
+            .entry(username.clone())
+            .or_insert_with(|| UserInfo::pending(username.clone()))
+            .exists = Some(true);
         if let Some(status) = status {
             let entry = self
                 .user_info
@@ -607,8 +673,7 @@ impl ClientContext {
                 .or_insert_with(|| UserInfo::pending(username.clone()));
             // The watch reply carries no privileged flag, so keep whatever a
             // previous GetUserStatus told us rather than asserting `false`.
-            let privileged =
-                entry.presence.as_ref().is_some_and(|p| p.privileged);
+            let privileged = entry.presence.as_ref().is_some_and(|p| p.privileged);
             entry.presence = Some(UserPresence {
                 status: UserStatus::from_code(status),
                 privileged,
@@ -617,12 +682,7 @@ impl ClientContext {
         if let (Some(average_speed), Some(shared_files), Some(shared_folders)) =
             (average_speed, shared_files, shared_folders)
         {
-            self.apply_user_stats(
-                username,
-                average_speed,
-                shared_files,
-                shared_folders,
-            );
+            self.apply_user_stats(username, average_speed, shared_files, shared_folders);
         }
     }
 
@@ -640,11 +700,7 @@ impl ClientContext {
 
     /// Record the per-member statistics of a room we just joined, replacing
     /// any previous snapshot for it.
-    pub fn apply_room_member_stats(
-        &mut self,
-        room: String,
-        stats: Vec<RoomUserStats>,
-    ) {
+    pub fn apply_room_member_stats(&mut self, room: String, stats: Vec<RoomUserStats>) {
         self.room_member_stats.insert(room, stats);
     }
 
@@ -674,12 +730,7 @@ impl ClientContext {
     }
 
     /// Cache a peer's listen address learned from a GetPeerAddress response.
-    pub fn cache_peer_address(
-        &mut self,
-        username: &str,
-        host: String,
-        port: u32,
-    ) {
+    pub fn cache_peer_address(&mut self, username: &str, host: String, port: u32) {
         self.peer_addresses
             .insert(username.to_string(), (host, port));
     }
@@ -691,11 +742,7 @@ impl ClientContext {
     }
 
     /// Queue a peer message to send once a control connection to `username` is up.
-    pub fn queue_peer_message(
-        &mut self,
-        username: &str,
-        message: crate::message::Message,
-    ) {
+    pub fn queue_peer_message(&mut self, username: &str, message: crate::message::Message) {
         let entry = self
             .pending_peer_messages
             .entry(username.to_string())
@@ -705,10 +752,7 @@ impl ClientContext {
     }
 
     /// Remove and return the messages queued for `username`.
-    pub fn take_peer_messages(
-        &mut self,
-        username: &str,
-    ) -> Vec<crate::message::Message> {
+    pub fn take_peer_messages(&mut self, username: &str) -> Vec<crate::message::Message> {
         self.pending_peer_messages
             .remove(username)
             .map(|(_, messages)| messages)
@@ -718,17 +762,12 @@ impl ClientContext {
     /// Drop peer messages nobody could deliver within
     /// [`PENDING_PEER_TTL`]: the searcher went offline, or never existed.
     pub(crate) fn expire_pending_peer_messages(&mut self, now: Instant) {
-        self.pending_peer_messages.retain(|_, (since, _)| {
-            now.duration_since(*since) < PENDING_PEER_TTL
-        });
+        self.pending_peer_messages
+            .retain(|_, (since, _)| now.duration_since(*since) < PENDING_PEER_TTL);
     }
 
     /// Store a shared-file listing received from browsing `username`.
-    pub fn store_browse_result(
-        &mut self,
-        username: String,
-        directories: Vec<SharedDirectory>,
-    ) {
+    pub fn store_browse_result(&mut self, username: String, directories: Vec<SharedDirectory>) {
         self.pending_browses.remove(&username);
         self.browse_results.insert(username, directories);
     }
@@ -742,10 +781,7 @@ impl ClientContext {
     }
 
     /// Remove and return the shared-file listing browsed from `username`.
-    pub fn take_browse_result(
-        &mut self,
-        username: &str,
-    ) -> Option<Vec<SharedDirectory>> {
+    pub fn take_browse_result(&mut self, username: &str) -> Option<Vec<SharedDirectory>> {
         self.browse_results.remove(username)
     }
 
@@ -776,7 +812,7 @@ impl ClientContext {
             super::BrokeredUpload {
                 token,
                 real_path,
-                deadline: Instant::now() + BROKER_CONNECT_TIMEOUT,
+                deadline: Instant::now() + super::UPLOAD_CONNECT_TIMEOUT,
                 claimed: claimed.clone(),
             },
         );
@@ -830,11 +866,9 @@ impl ClientContext {
             })
             .map(|d| d.username.clone())
             .collect();
-        protected
-            .extend(self.active_uploads.values().map(|u| u.username.clone()));
+        protected.extend(self.active_uploads.values().map(|u| u.username.clone()));
         protected.extend(self.uploads.values().map(|j| j.downloader.clone()));
-        protected
-            .extend(self.upload_queue.iter().map(|q| q.downloader.clone()));
+        protected.extend(self.upload_queue.iter().map(|q| q.downloader.clone()));
         protected.extend(self.pending_serves.keys().cloned());
         protected.extend(self.pending_peer_messages.keys().cloned());
         let now = Instant::now();
@@ -863,16 +897,29 @@ mod picture_budget_tests {
     use super::*;
     #[test]
     fn profile_cache_bounds_count_and_aggregate_picture_memory() {
-        let mut context=ClientContext::new();
+        let mut context = ClientContext::new();
         for n in 0..150 {
-            context.store_peer_info(format!("peer-{n}"),crate::message::peer::PeerInfo {
-                picture:Some(Arc::new(vec![1;3*1024*1024])), ..Default::default()
-            });
-            assert!(context.peer_infos.len()<=128);
-            assert!(context.peer_infos.values().map(|p|p.picture.as_ref().map_or(0,|v|v.len())).sum::<usize>()<=16*1024*1024);
+            context.store_peer_info(
+                format!("peer-{n}"),
+                crate::message::peer::PeerInfo {
+                    picture: Some(Arc::new(vec![1; 3 * 1024 * 1024])),
+                    ..Default::default()
+                },
+            );
+            assert!(context.peer_infos.len() <= 128);
+            assert!(
+                context
+                    .peer_infos
+                    .values()
+                    .map(|p| p.picture.as_ref().map_or(0, |v| v.len()))
+                    .sum::<usize>()
+                    <= 16 * 1024 * 1024
+            );
             assert!(context.peer_info(&format!("peer-{n}")).is_some());
         }
-        for n in 0..150 { context.store_peer_info(format!("empty-{n}"),Default::default()); }
-        assert_eq!(context.peer_infos.len(),128);
+        for n in 0..150 {
+            context.store_peer_info(format!("empty-{n}"), Default::default());
+        }
+        assert_eq!(context.peer_infos.len(), 128);
     }
 }

@@ -22,23 +22,21 @@ pub mod utils;
 pub mod prelude {
     pub use crate::actor::server_actor::PeerAddress;
     pub use crate::types::{
-        ClientVersion, DiscoveryEvent, DownloadStatus, File, Recommendation, RoomEvent,
-        RoomInfo, RoomTicker, Search, SearchResult, SimilarUser, Transfer,
-        UploadInfo, UploadStatus, UserInfo, UserInterests, UserPresence,
-        UserStats, UserStatus,
+        ClientVersion, DiscoveryEvent, DownloadStatus, File, Recommendation, RoomEvent, RoomInfo,
+        RoomTicker, Search, SearchResult, SimilarUser, Transfer, UploadInfo, UploadStatus,
+        UserInfo, UserInterests, UserPresence, UserStats, UserStatus,
     };
     pub use crate::{debug, error, info, trace, warn};
 }
 
 // Re-export commonly used types
 pub use actor::server_actor::{PeerAddress, UserMessage};
-pub use client::{CancelHandle, Client, ClientSettings,UploadPolicy};
+pub use client::{CancelHandle, Client, ClientSettings, UploadPolicy, UploadSnapshot};
 pub use error::{Result, SoulseekRs};
 pub use message::peer::{SharedDirectory, SharedFileEntry};
 pub use peer::{ConnectionType, ParseConnectionTypeError};
 pub use types::{
     ClientVersion, DiscoveryEvent, DownloadStatus, File, Recommendation, RoomEvent, RoomInfo,
-    RoomTicker, Search, SearchResult, SessionLoss, SimilarUser, Transfer,
-    UploadInfo, UploadStatus, UserInfo, UserInterests, UserPresence, UserStats,
-    UserStatus,
+    RoomTicker, Search, SearchResult, SessionLoss, SimilarUser, Transfer, UploadInfo, UploadRateSample, UploadStatus,
+    UserInfo, UserInterests, UserPresence, UserStats, UserStatus,
 };

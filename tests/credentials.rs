@@ -333,7 +333,17 @@ fn download_scheduler_enforces_total_and_per_user_slots_and_zero_pauses_new_work
     fn until(h: &engine::EngineHandle, p: impl Fn(&rustysoul::model::Snapshot) -> bool) {
         let end = Instant::now() + Duration::from_secs(5);
         while !p(&h.snapshot.borrow()) {
-            assert!(Instant::now() < end, "{:?}", h.snapshot.borrow().error);
+            assert!(
+                Instant::now() < end,
+                "error={:?}; downloads={:?}",
+                h.snapshot.borrow().error,
+                h.snapshot
+                    .borrow()
+                    .downloads
+                    .iter()
+                    .map(|d| (&d.username, &d.path, &d.status))
+                    .collect::<Vec<_>>()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }

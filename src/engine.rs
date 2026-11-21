@@ -35,6 +35,8 @@ struct Engine {
     discovery: crate::discovery::Controller,
     queue_rules: crate::queue_order::Rules,
     work_dirs: BTreeMap<(String, String), cap_std::fs::Dir>,
+    #[cfg(target_os = "linux")]
+    staging_cleanup: crate::downloads::StagingCleanup,
     message_ids: (u64, u64),
     profile: crate::profile::Profile,
     upload_speed: crate::upload_speed::Estimate,
@@ -215,7 +217,13 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
         },
         ..Default::default()
     };
-    store.restore(&mut view, config.limits.searches)?;
+    store.restore(&mut view)?;
+    // The initial watch snapshot is available before the engine's first poll.
+    // Publish durable measurements immediately, including after a restart.
+    view.profile.measured_upload_speed = upload_speed.measured();
+    view.profile.upload_speed_measured = upload_speed.has_measurement();
+    view.profile.upload_speed_recipients = upload_speed.recipients();
+    view.profile.upload_speed_selected_recipients = upload_speed.selected();
     view.subscribed_rooms = store
         .connection
         .prepare("SELECT room FROM room_subscriptions ORDER BY rowid")?
@@ -281,6 +289,8 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
                 discovery: Default::default(),
                 queue_rules,
                 work_dirs: BTreeMap::new(),
+                #[cfg(target_os = "linux")]
+                staging_cleanup: Default::default(),
                 message_ids,
                 profile,
                 upload_speed,
@@ -338,6 +348,24 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
                 }
                 engine.poll_library();
                 engine.poll_network();
+                #[cfg(target_os = "linux")]
+                match engine.staging_cleanup.poll(
+                    Path::new(&engine.locations.downloads),
+                    &engine.queue,
+                    engine.work_dirs.values(),
+                ) {
+                    Ok(Some(removed)) if removed > 0 => crate::activity::record(
+                        "info",
+                        "maintenance",
+                        &format!("Removed {removed} empty download staging folders"),
+                    ),
+                    Err(error) => crate::activity::record(
+                        "warn",
+                        "maintenance",
+                        &format!("Could not finish download staging cleanup: {error:#}"),
+                    ),
+                    _ => (),
+                }
                 if engine
                     .notice_deadline
                     .is_some_and(|at| Instant::now() >= at)
@@ -476,7 +504,6 @@ impl Engine {
         }
         let downloaded = self.traffic_pending.values().map(|p| p.0).sum();
         let uploaded = self.traffic_pending.values().map(|p| p.1).sum();
-        let elapsed = self.traffic_sample_at.elapsed().as_secs_f64();
         match crate::traffic::record_users(
             &self.store.connection,
             now(),
@@ -485,10 +512,12 @@ impl Engine {
             &self.traffic_pending,
         ) {
             Ok(()) => {
-                if let Err(e) = self
-                    .upload_speed
-                    .observe(&self.store.connection, uploaded, elapsed)
-                {
+                let samples = self
+                    .client
+                    .as_ref()
+                    .map(Client::take_upload_rate_samples)
+                    .unwrap_or_default();
+                if let Err(e) = self.upload_speed.observe(&self.store.connection, samples) {
                     self.view.error = Some(e.to_string());
                 }
                 if let Some(c) = &self.client {
@@ -518,6 +547,8 @@ impl Engine {
         snapshot.privileges = self.privileges.view.clone();
         snapshot.profile.measured_upload_speed = self.upload_speed.measured();
         snapshot.profile.upload_speed_measured = self.upload_speed.has_measurement();
+        snapshot.profile.upload_speed_recipients = self.upload_speed.recipients();
+        snapshot.profile.upload_speed_selected_recipients = self.upload_speed.selected();
         snapshot.away_automatic = self.idle.automatic;
         snapshot.system = self.system.latest();
         snapshot.effective_peer_limit = self.client.as_ref().map_or(0, |c| c.peer_capacity());
@@ -607,6 +638,10 @@ impl Engine {
         self.library_notice = false;
         self.view.error = None;
         self.view.notice = None;
+        let joining_room = match &command {
+            Command::JoinRoom { room } | Command::CreatePrivateRoom { room } => Some(room.clone()),
+            _ => None,
+        };
         if let Err(error) = self.apply(command) {
             self.view.notice = None;
             // Protocol errors may contain peer text; passwords/tokens are never interpolated here.
@@ -616,6 +651,15 @@ impl Engine {
                     .take(2048)
                     .collect(),
             );
+            if let Some(room) = joining_room
+                && !self.room_controller.pending(&room)
+                && (self.view.room_management.rooms.contains_key(&room)
+                    || self.view.room_management.rooms.len() < 256)
+            {
+                let summary = self.view.room_management.rooms.entry(room).or_default();
+                summary.revision = summary.revision.wrapping_add(1);
+                summary.error.clone_from(&self.view.error);
+            }
             if self.view.connection == "verifying" || self.view.connection == "connecting" {
                 self.view.connection = "disconnected".into();
             }
@@ -1231,6 +1275,17 @@ impl Engine {
                 return Ok(());
             }
             Command::CreatePrivateRoom { room } => {
+                if self.view.joined_rooms.contains(&room) {
+                    ensure!(
+                        self.view
+                            .room_management
+                            .rooms
+                            .get(&room)
+                            .is_some_and(|s| s.private),
+                        "This is an existing public room. Choose another private-room name"
+                    );
+                    return Ok(());
+                }
                 ensure!(
                     self.view.subscribed_rooms.len() < 32
                         || self.view.subscribed_rooms.contains(&room),
@@ -1281,10 +1336,15 @@ impl Engine {
                         "Wait for the server to confirm membership before joining this private room"
                     );
                 }
-                self.client
-                    .as_ref()
-                    .context("Connect to Soulseek first")?
-                    .join_room(&room)?;
+                if self.view.joined_rooms.contains(&room) {
+                    return Ok(());
+                }
+                let client = self.client.as_ref().context("Connect to Soulseek first")?;
+                if private {
+                    client.join_private_room(&room)?;
+                } else {
+                    client.join_room(&room)?;
+                }
                 if private {
                     self.room_controller
                         .joining_private(&mut self.view.room_management, &room);
@@ -2254,15 +2314,6 @@ impl Engine {
         Ok(())
     }
     fn begin_search(&mut self, query: String, scope: SearchScope) -> Result<()> {
-        ensure!(
-            self.view
-                .searches
-                .iter()
-                .filter(|s| s.wishlist_id.is_none() || s.pinned)
-                .count()
-                < self.config.limits.searches,
-            "Search limit reached; close an existing search"
-        );
         let c = self.client.as_ref().context("Connect to Soulseek first")?;
         let id = uuid::Uuid::new_v4().to_string();
         let view = SearchView {
@@ -2288,6 +2339,7 @@ impl Engine {
         }
         self.searches.insert(id, (query, Instant::now()));
         self.view.searches.push(view);
+        crate::search::trim_previews(&mut self.view.searches);
         Ok(())
     }
     fn pump_downloads(&mut self) -> Result<()> {
@@ -2568,7 +2620,12 @@ impl Engine {
         }
         let (folders, files) = c.shared_counts();
         self.view.shares = ShareCounts { folders, files };
-        for search in &mut self.view.searches {
+        let recent = self
+            .view
+            .searches
+            .len()
+            .saturating_sub(crate::search::SNAPSHOT_PREVIEWS);
+        for (index, search) in self.view.searches.iter_mut().enumerate() {
             if let Some((_, started)) = self.searches.get(&search.id) {
                 if !search.collecting {
                     continue;
@@ -2595,9 +2652,12 @@ impl Engine {
                             search.total = total;
                             search.truncated |= limited || truncated;
                             search.revision += 1;
-                            search.results =
+                            search.results = if index >= recent {
                                 crate::search::preview(&self.store.connection, &search.id)
-                                    .unwrap_or_default();
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
                         }
                         Err(e) => self.view.error = Some(e.to_string()),
                     }
@@ -2613,9 +2673,10 @@ impl Engine {
                     );
                 }
                 search.collecting =
-                    started.elapsed() < Duration::from_secs(30) && !search.truncated;
+                    started.elapsed() < Duration::from_secs(120) && !search.truncated;
                 if !search.collecting {
                     let _ = c.forget_search(&search.id);
+                    self.searches.remove(&search.id);
                 }
             }
         }
@@ -2726,63 +2787,80 @@ impl Engine {
                 Err(e) => self.view.error = Some(e.to_string()),
             }
         }
-        let uploads: Vec<_> = c
-            .take_upload_events()
-            .into_iter()
-            .chain(c.uploads())
-            .map(|u| TransferView {
-                username: u.username,
-                path: u.filename,
-                size: u.size,
-                transferred: u.bytes_sent,
-                speed: u.speed_bytes_per_sec,
-                detail: match &u.status {
-                    soulseek_rs::UploadStatus::Failed(e)
-                    | soulseek_rs::UploadStatus::TimedOut(e) => e.clone(),
-                    _ => String::new(),
-                },
-                status: match u.status {
-                    soulseek_rs::UploadStatus::Queued(_) => "queued",
-                    soulseek_rs::UploadStatus::CheckingShares(_) => "checking_shares",
-                    soulseek_rs::UploadStatus::Failed(ref e)
-                        if e.starts_with("Sharing protection:") =>
-                    {
-                        "blocked"
+        if let Ok(batch) = c.upload_snapshot() {
+            let uploads: Vec<_> = batch
+                .uploads()
+                .iter()
+                .cloned()
+                .map(|u| TransferView {
+                    username: u.username,
+                    path: u.filename,
+                    size: u.size,
+                    transferred: u.bytes_sent,
+                    speed: u.speed_bytes_per_sec,
+                    detail: match &u.status {
+                        soulseek_rs::UploadStatus::Queued(0) =>
+                            "Upload slot reserved; waiting for the receiving peer to answer the transfer offer.".into(),
+                        soulseek_rs::UploadStatus::Failed(e)
+                        | soulseek_rs::UploadStatus::TimedOut(e) => e.clone(),
+                        _ => String::new(),
+                    },
+                    status: match u.status {
+                        soulseek_rs::UploadStatus::Queued(_) => "queued",
+                        soulseek_rs::UploadStatus::CheckingShares(_) => "checking_shares",
+                        soulseek_rs::UploadStatus::Failed(ref e)
+                            if e.starts_with("Sharing protection:") =>
+                        {
+                            "blocked"
+                        }
+                        soulseek_rs::UploadStatus::InProgress => "uploading",
+                        soulseek_rs::UploadStatus::Completed => "completed",
+                        soulseek_rs::UploadStatus::Cancelled => "cancelled",
+                        soulseek_rs::UploadStatus::TimedOut(_) => "timed_out",
+                        _ => "failed",
                     }
-                    soulseek_rs::UploadStatus::InProgress => "uploading",
-                    soulseek_rs::UploadStatus::Completed => "completed",
-                    soulseek_rs::UploadStatus::Cancelled => "cancelled",
-                    soulseek_rs::UploadStatus::TimedOut(_) => "timed_out",
-                    _ => "failed",
-                }
-                .into(),
-                queue_position: match u.status {
-                    soulseek_rs::UploadStatus::Queued(n)
-                    | soulseek_rs::UploadStatus::CheckingShares(n) => Some(n),
-                    _ => None,
-                },
-                ..Default::default()
-            })
-            .collect();
-        let mut recorded = true;
-        for t in &uploads {
-            match crate::transfers::record_upload(&self.store.connection, t) {
-                Ok(changed) => {
-                    if changed {
-                        self.view.transfer_revision += 1;
+                    .into(),
+                    queue_position: match u.status {
+                        soulseek_rs::UploadStatus::Queued(n)
+                        | soulseek_rs::UploadStatus::CheckingShares(n) => Some(n),
+                        _ => None,
+                    },
+                    ..Default::default()
+                })
+                .collect();
+            let mut recorded = true;
+            for t in &uploads {
+                match crate::transfers::record_upload(&self.store.connection, t) {
+                    Ok(changed) => {
+                        if changed {
+                            self.view.transfer_revision += 1;
+                        }
+                    }
+                    Err(e) => {
+                        recorded = false;
+                        self.view.error = Some(format!("{e:#}"));
                     }
                 }
-                Err(e) => {
-                    recorded = false;
-                    self.view.error = Some(format!("{e:#}"));
+            }
+            if recorded {
+                match crate::transfers::reconcile_uploads(
+                    &self.store.connection,
+                    batch.current_keys(),
+                ) {
+                    Ok(changed) => {
+                        if changed {
+                            self.view.transfer_revision += 1;
+                        }
+                        c.acknowledge_upload_snapshot(batch);
+                    }
+                    Err(e) => {
+                        self.view.error = Some(format!("Could not reconcile upload history: {e:#}"))
+                    }
                 }
             }
         }
-        if recorded {
-            c.clear_upload_history("all");
-        }
         self.view.uploads =
-            crate::transfers::preview(&self.store.connection, "uploads").unwrap_or(uploads);
+            crate::transfers::preview(&self.store.connection, "uploads").unwrap_or_default();
         self.view.rooms = c
             .room_list()
             .into_iter()
@@ -2821,7 +2899,7 @@ impl Engine {
                     for room in rooms {
                         if !self.view.joined_rooms.contains(&room)
                             && !self.room_controller.pending(&room)
-                            && c.join_room(&room).is_ok()
+                            && c.join_private_room(&room).is_ok()
                         {
                             self.room_controller
                                 .joining_private(&mut self.view.room_management, &room);

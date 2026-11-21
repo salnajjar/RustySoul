@@ -508,7 +508,7 @@ mod tests {
         store.save_snapshot(&view).unwrap();
         drop(store);
         let mut store = Store::open(&path).unwrap();
-        store.restore(&mut view, 8).unwrap();
+        store.restore(&mut view).unwrap();
         assert_eq!(view.messages.len(), 500);
         assert_eq!(view.messages[0].id, 1102);
         assert_eq!(

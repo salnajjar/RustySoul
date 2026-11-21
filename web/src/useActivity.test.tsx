@@ -60,3 +60,91 @@ it("does not send input contents and does not clear a fresh error by throwing on
   expect(Object.keys(payload).sort()).toEqual(["idle_seconds", "type"]);
   unmount();
 });
+
+it("captures activity even when a control stops propagation", async () => {
+  vi.useFakeTimers();
+  const fetcher = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(
+      async () => new Response(JSON.stringify({ status: "queued" })),
+    );
+  const { rerender } = renderHook(
+    ({ away }) => useActivity("session", true, away),
+    { initialProps: { away: false } },
+  );
+  await act(async () => {});
+  rerender({ away: true });
+  const control = document.createElement("button");
+  control.addEventListener("pointerdown", (event) => event.stopPropagation());
+  document.body.append(control);
+  try {
+    await act(async () => {
+      control.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  } finally {
+    control.remove();
+  }
+});
+
+it("sends a wake-up immediately after an older activity request finishes", async () => {
+  vi.useFakeTimers();
+  let finish!: (response: Response) => void;
+  const fetcher = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    )
+    .mockImplementation(
+      async () => new Response(JSON.stringify({ status: "queued" })),
+    );
+  const { rerender } = renderHook(
+    ({ away }) => useActivity("session", true, away),
+    { initialProps: { away: false } },
+  );
+  rerender({ away: true });
+  await act(async () => {
+    document.dispatchEvent(new Event("pointerdown"));
+    finish(new Response(JSON.stringify({ status: "queued" })));
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(
+    JSON.parse(fetcher.mock.calls[1][1]!.body as string).idle_seconds,
+  ).toBe(0);
+});
+
+it("retries a failed wake-up without needing another click and bounds retries", async () => {
+  vi.useFakeTimers();
+  const fetcher = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementationOnce(
+      async () => new Response(JSON.stringify({ status: "queued" })),
+    )
+    .mockRejectedValue(new Error("Temporarily unavailable"));
+  const { rerender, unmount } = renderHook(
+    ({ away }) => useActivity("session", true, away),
+    { initialProps: { away: false } },
+  );
+  await act(async () => {});
+  rerender({ away: true });
+  await act(async () => {
+    document.dispatchEvent(new Event("pointerdown"));
+  });
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+  expect(fetcher).toHaveBeenCalledTimes(3);
+  expect(
+    JSON.parse(fetcher.mock.calls[2][1]!.body as string).idle_seconds,
+  ).toBe(2);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60000);
+  });
+  expect(fetcher).toHaveBeenCalledTimes(4);
+  unmount();
+});

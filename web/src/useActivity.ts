@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { api } from "./api";
-/** Reports activity age, never input content. One leading/trailing request per ten seconds. */
+/** Reports activity age, never input content. Wake-up bypasses the normal ten-second throttle. */
 export function useActivity(
   token: string,
   enabled: boolean,
@@ -15,16 +15,32 @@ export function useActivity(
     let active = true,
       inFlight = false,
       lastSent = -Infinity,
-      activity = performance.now();
+      activity = performance.now(),
+      activityVersion = 0,
+      failures = 0,
+      retryAfter = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const delay = () =>
+      Math.max(
+        0,
+        automatic.current && !wakeRequested.current
+          ? retryAfter - performance.now()
+          : 10000 - (performance.now() - lastSent),
+      );
+    const schedule = (wait: number) => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => void flush(), wait);
+    };
     const flush = async () => {
       if (!active || inFlight) return;
       if (timer) clearTimeout(timer);
       timer = undefined;
-      const sentActivity = activity;
+      const sentVersion = activityVersion;
+      const waking = automatic.current && !wakeRequested.current;
       lastSent = performance.now();
-      if (automatic.current) wakeRequested.current = true;
+      if (waking) wakeRequested.current = true;
       inFlight = true;
+      let failed = false;
       try {
         await api(token, "commands", {
           type: "ui_activity",
@@ -33,31 +49,29 @@ export function useActivity(
             Math.max(0, Math.floor((performance.now() - activity) / 1000)),
           ),
         });
+        failures = 0;
+        retryAfter = 0;
       } catch {
-        /* Connectivity failures are already handled by the live connection. */
+        // A rejected/throttled wake-up must not remain marked as acknowledged.
+        // Retry at most twice without further input; keep the original activity age.
+        failed = true;
+        failures++;
+        retryAfter = performance.now() + 2000;
+        if (waking) wakeRequested.current = false;
       } finally {
         inFlight = false;
-        if (active && activity > sentActivity)
-          timer = setTimeout(
-            () => void flush(),
-            Math.max(0, 10000 - (performance.now() - lastSent)),
-          );
+        if (active && activityVersion !== sentVersion) schedule(delay());
+        else if (active && failed && automatic.current && failures < 3)
+          schedule(2000);
       }
     };
     const record = () => {
       activity = performance.now();
-      if (
-        (automatic.current && !wakeRequested.current) ||
-        performance.now() - lastSent >= 10000
-      )
-        void flush();
-      else {
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(
-          () => void flush(),
-          10000 - (performance.now() - lastSent),
-        );
-      }
+      activityVersion++;
+      if (inFlight) return; // finally schedules any activity received during a request.
+      const wait = delay();
+      if (wait === 0) void flush();
+      else schedule(wait);
     };
     const visible = () => {
       if (document.visibilityState === "visible") record();
@@ -70,14 +84,18 @@ export function useActivity(
       "touchstart",
     ];
     for (const event of events)
-      document.addEventListener(event, record, { passive: true });
+      document.addEventListener(event, record, {
+        passive: true,
+        capture: true,
+      });
     window.addEventListener("focus", visible);
     document.addEventListener("visibilitychange", visible);
     visible();
     return () => {
       active = false;
       if (timer) clearTimeout(timer);
-      for (const event of events) document.removeEventListener(event, record);
+      for (const event of events)
+        document.removeEventListener(event, record, true);
       window.removeEventListener("focus", visible);
       document.removeEventListener("visibilitychange", visible);
     };

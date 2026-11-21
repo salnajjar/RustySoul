@@ -1,6 +1,175 @@
 import { test, expect, type Page } from "@playwright/test";
 import { emptySnapshot, type Snapshot, type RoomSummary } from "../src/types";
 
+test("unlimited search tabs scroll to new searches and retain reusable older history", async ({
+  page,
+}) => {
+  let state: Snapshot = {
+    ...emptySnapshot,
+    connection: "connected",
+    searches: Array.from({ length: 80 }, (_, i) => ({
+      id: `history-${i}`,
+      query: `Saved album ${i}`,
+      collecting: false,
+      total: 0,
+      results: [],
+    })),
+  };
+  const commands: any[] = [];
+  await page.route("**/api/v1/searches/**", (route) =>
+    route.fulfill({ json: { files: [], total: 0, offset: 0, users: {} } }),
+  );
+  await page.route("**/api/v1/commands", async (route) => {
+    const command = route.request().postDataJSON();
+    commands.push(command);
+    if (command.type === "search")
+      state = {
+        ...state,
+        searches: [
+          ...state.searches,
+          {
+            id: "new-search",
+            query: command.query,
+            collecting: true,
+            total: 0,
+            results: [],
+          },
+        ],
+      };
+    if (command.type === "forget_search")
+      state = {
+        ...state,
+        searches: state.searches.filter((s) => s.id !== command.id),
+      };
+    await route.fulfill({ status: 202, json: { status: "queued" } });
+    await page.evaluate(
+      (next) => (window as any).pushFixtureState(next),
+      state,
+    );
+  });
+  await fixture(page, state);
+  const tabs = page.getByRole("tablist", { name: "Open searches" });
+  await expect(tabs.getByRole("tab")).toHaveCount(80);
+  await expect(tabs.getByRole("tab", { selected: true })).toContainText(
+    "Saved album 79",
+  );
+  await expect
+    .poll(() => tabs.evaluate((n) => n.scrollLeft))
+    .toBeGreaterThan(0);
+  await expect(
+    page.getByRole("button", { name: "Scroll to newer searches" }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Scroll to older searches" }).click();
+  await tabs.evaluate((n) => {
+    n.scrollLeft = 0;
+  });
+  state = {
+    ...state,
+    searches: state.searches.map((s) => ({ ...s, revision: 2 })),
+  };
+  await page.evaluate((next) => (window as any).pushFixtureState(next), state);
+  await expect.poll(() => tabs.evaluate((n) => n.scrollLeft)).toBe(0);
+  await tabs.getByRole("tab", { name: /^Saved album 0/ }).click();
+  await expect(
+    page.getByLabel("Repeat search terms", { exact: true }),
+  ).toHaveValue("Saved album 0");
+  await page.getByRole("button", { name: "Search again", exact: true }).click();
+  expect(commands).toContainEqual({
+    type: "restart_search",
+    id: "history-0",
+    query: "Saved album 0",
+  });
+  await page
+    .getByRole("button", { name: "Close search Saved album 0", exact: true })
+    .click();
+  await expect(tabs.getByRole("tab")).toHaveCount(79);
+  await page
+    .getByLabel("Search the Soulseek network", { exact: true })
+    .fill("Newest album");
+  await page
+    .getByRole("button", { name: "Search network", exact: true })
+    .click();
+  await expect(tabs.getByRole("tab", { selected: true })).toContainText(
+    "Newest album",
+  );
+  await expect(
+    page.getByRole("button", { name: "Scroll to newer searches" }),
+  ).toBeDisabled();
+  await tabs.getByRole("tab", { selected: true }).focus();
+  await page.keyboard.press("Home");
+  await expect(tabs.getByRole("tab", { selected: true })).toContainText(
+    "Saved album 1",
+  );
+  await page.keyboard.press("ArrowRight");
+  await expect(tabs.getByRole("tab", { selected: true })).toContainText(
+    "Saved album 2",
+  );
+  await page.keyboard.press("End");
+  await expect(tabs.getByRole("tab", { selected: true })).toContainText(
+    "Newest album",
+  );
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
+
+test("four transfer summary cards show the full queue independently of visible history", async ({
+  page,
+}) => {
+  let queued = 315;
+  const state: Snapshot = {
+    ...emptySnapshot,
+    transfer_revision: 1,
+    downloads_total: 400,
+    uploads_total: 400,
+  };
+  await page.route(/\/api\/v1\/transfers\/(downloads|uploads)\?/, (route) =>
+    route.fulfill({
+      json: {
+        transfers: [],
+        total: 0,
+        offset: 0,
+        next_offset: 0,
+        summary: {
+          total: 400,
+          active: 3,
+          queued,
+          speed: 0,
+          clearable: { all: 82 },
+        },
+      },
+    }),
+  );
+  await fixture(page, state);
+  for (const direction of ["Downloads", "Uploads"]) {
+    await page.getByRole("button", { name: direction, exact: true }).click();
+    const cards = page.locator(".transfer-stats .stat-card");
+    await expect(cards).toHaveCount(4);
+    await expect(cards.nth(0)).toHaveText("Total transfers400");
+    await expect(cards.nth(1)).toHaveText("Transferring3");
+    await expect(cards.nth(2)).toHaveText("In queue315");
+    await expect(cards.nth(3)).toContainText("Current speed (5s average)");
+    queued = 314;
+    await page.evaluate((next) => (window as any).pushFixtureState(next), {
+      ...state,
+      transfer_revision: 2,
+    });
+    await expect(cards.nth(2)).toHaveText("In queue314");
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    queued = 315;
+    await page.evaluate(
+      (next) => (window as any).pushFixtureState(next),
+      state,
+    );
+  }
+});
+
 test.beforeEach(async ({ page }) => {
   await page.route("**/api/v1/messages/read", (route) =>
     route.fulfill({ status: 202, json: { status: "queued" } }),
@@ -618,6 +787,10 @@ for (const paged of [false, true]) {
         snapshot(),
       );
       await page.getByRole("button", { name: direction, exact: true }).click();
+      if (direction === "Uploads")
+        await page
+          .getByRole("button", { name: "Expand all users", exact: true })
+          .click();
       const speed = page.getByTitle(
         "Average transfer speed over the last 5 seconds",
       );
@@ -692,6 +865,10 @@ test("upload and download rows show start dates, tick elapsed time and retain fi
         exact: true,
       })
       .click();
+    if (direction === "uploads")
+      await page
+        .getByRole("button", { name: "Expand all users", exact: true })
+        .click();
     const prefix = direction === "uploads" ? "upload" : "download";
     const active = page.locator(".transfer-row").filter({
       has: page.getByText(`${prefix}-active.flac`, { exact: true }),
@@ -845,6 +1022,89 @@ test("private rooms can be created explicitly and invitation and visibility cont
     "name",
   );
 });
+test("creation waits for a confirmed join, opens the room and exposes the owner controls", async ({
+  page,
+}) => {
+  let state = roomState();
+  await roomEntryFixture(page);
+  await page.route("**/api/v1/commands", async (route) => {
+    const command = route.request().postDataJSON();
+    await route.fulfill({ status: 202, json: { status: "queued" } });
+    if (command.type === "create_private_room") {
+      state = {
+        ...state,
+        subscribed_rooms: ["club", "My Club"],
+        room_management: {
+          ...state.room_management!,
+          rooms: {
+            ...state.room_management!.rooms,
+            "My Club": {
+              ...roomSummary(),
+              owner: null,
+              member: false,
+              confirmed: false,
+              owner_live: false,
+              pending: "Creating or joining private room…",
+              revision: 1,
+            },
+          },
+        },
+      };
+      await pushRoomState(page, state);
+    }
+  });
+  await fixture(page, state);
+  await page.getByRole("button", { name: "Rooms", exact: true }).click();
+  await page.locator(".room-join-settings > summary").click();
+  await page.getByLabel("Room name to join", { exact: true }).fill("My Club");
+  await page.getByLabel("Room type", { exact: true }).selectOption("private");
+  await page
+    .getByRole("button", { name: "Create or join private room", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", {
+      name: "Waiting for room confirmation…",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await expect(page.locator(".conversation-header")).toContainText("club");
+  state = {
+    ...state,
+    joined_rooms: ["club", "My Club"],
+    room_members: { ...state.room_members, "My Club": ["fixture-self"] },
+    room_management: {
+      ...state.room_management!,
+      rooms: {
+        ...state.room_management!.rooms,
+        "My Club": {
+          ...roomSummary(),
+          owner: "fixture-self",
+          member: true,
+          confirmed: true,
+          owner_live: true,
+          pending: null,
+          revision: 2,
+        },
+      },
+    },
+  };
+  await pushRoomState(page, state);
+  await expect(page.locator(".conversation-header")).toContainText("My Club");
+  await expect(
+    page.getByRole("button", { name: "Leave room", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("tab", { name: "Room access", exact: true }).click();
+  await expect(
+    page.getByRole("tabpanel", { name: "Room access for My Club" }),
+  ).toContainText("Owner");
+  await expect(
+    page.getByRole("button", {
+      name: "Relinquish room ownership",
+      exact: true,
+    }),
+  ).toBeVisible();
+});
+
 test("room boards load lazily, render text safely and allow offline saved messages", async ({
   page,
 }, info) => {
@@ -2153,6 +2413,10 @@ test("uploads and downloads expose useful stable sort and reverse controls", asy
   await fixture(page, { ...emptySnapshot, downloads, uploads });
   for (const name of ["Downloads", "Uploads"]) {
     await page.getByRole("button", { name, exact: true }).click();
+    if (name === "Uploads")
+      await page
+        .getByRole("button", { name: "Expand all users", exact: true })
+        .click();
     await page
       .getByLabel("Order transfers", { exact: true })
       .selectOption("size");
@@ -3538,6 +3802,9 @@ test("clear transfer history filters finished uploads and downloads and retains 
   await expect
     .poll(() => command)
     .toEqual({ type: "clear_transfers", direction: "uploads", status: "all" });
+  await page
+    .getByRole("button", { name: "Expand all users", exact: true })
+    .click();
   await expect(page.getByText("e.flac", { exact: true })).toBeVisible();
 });
 
@@ -3587,6 +3854,12 @@ test("upload groups collapse independently and historic bandwidth ranges remain 
     page.getByText("All-time uploaded", { exact: true }),
   ).toBeVisible();
   await expect(page.getByText("2.00", { exact: true })).toBeVisible();
+  await expect(page.locator(".transfer-detail>strong")).toHaveCount(0);
+  for (const user of ["alice", "bob"]) {
+    await page
+      .getByRole("button", { name: `Expand uploads for ${user}`, exact: true })
+      .click();
+  }
   await page
     .getByRole("button", { name: "Collapse uploads for alice", exact: true })
     .click();
@@ -3768,11 +4041,11 @@ test("speed reporting overrides and automatic download parallelism are editable"
   await expect(auto).toBeChecked();
   await expect(
     page.getByLabel("Maximum downloads per user", { exact: true }),
-  ).toBeDisabled();
-  await auto.uncheck();
+  ).toBeEnabled();
   await page
     .getByLabel("Maximum downloads per user", { exact: true })
     .fill("2");
+  await expect(auto).not.toBeChecked();
   await page
     .getByRole("button", { name: "Save connection settings", exact: true })
     .click();
@@ -4429,6 +4702,9 @@ test("failed downloads can be retried and a user's uploads can be cancelled in b
   });
   await page.getByRole("button", { name: "Uploads", exact: true }).click();
   await page
+    .getByRole("button", { name: "Expand uploads for alice", exact: true })
+    .click();
+  await page
     .getByLabel("Select upload a.flac for alice", { exact: true })
     .check();
   await page
@@ -5044,6 +5320,9 @@ test("upload timeouts have readable reasons and can be filtered and cleared sepa
     uploads_total: 2,
   });
   await page.getByRole("button", { name: "Uploads", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Expand all users", exact: true })
+    .click();
   await expect(page.locator(".status-tag.timed_out")).toHaveText("timed out");
   await expect(page.getByText(reason, { exact: true })).toBeVisible();
   await page
@@ -5527,6 +5806,84 @@ test("database maintenance queues a restart and shows space reclaimed for the co
     .locator(".maintenance-panel")
     .screenshot({ path: `../artifacts/maintenance-${info.project.name}.png` });
 });
+test("top-right status menu changes presence, disconnects and reconnects", async ({
+  page,
+}, info) => {
+  let state: Snapshot = {
+    ...emptySnapshot,
+    username: "fixture-self",
+    connection: "connected",
+    credentials_configured: true,
+    away: true,
+  };
+  const commands: Record<string, unknown>[] = [];
+  await page.route("**/api/v1/commands", async (route) => {
+    const command = route.request().postDataJSON();
+    commands.push(command);
+    if (command.type === "set_away")
+      state = { ...state, away: command.away, away_automatic: false };
+    if (command.type === "disconnect")
+      state = { ...state, connection: "disconnected" };
+    if (command.type === "connect")
+      state = { ...state, connection: "connected", away: false };
+    await route.fulfill({ status: 202, json: { status: "queued" } });
+    await pushRoomState(page, state);
+  });
+  await fixture(page, state);
+  await page
+    .getByRole("button", { name: "Soulseek status: Away", exact: true })
+    .click();
+  const menu = page.getByRole("region", { name: "Soulseek status options" });
+  await expect(
+    menu.getByRole("button", { name: "Away", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  for (const theme of ["garden", "light", "dark"]) {
+    await page.evaluate(
+      (theme) => (document.documentElement.dataset.theme = theme),
+      theme,
+    );
+    const bounds = await menu.boundingBox();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(
+      page.viewportSize()!.width,
+    );
+    await page.screenshot({
+      path: `../artifacts/network-status-${theme}-${info.project.name}.png`,
+    });
+  }
+  await menu.getByRole("button", { name: "Online", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Soulseek status: Online", exact: true }),
+  ).toBeVisible();
+  await expect(menu).not.toBeVisible();
+  await page
+    .getByRole("button", { name: "Soulseek status: Online", exact: true })
+    .click();
+  await menu.getByRole("button", { name: "Away", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Soulseek status: Away", exact: true })
+    .click();
+  await page.keyboard.press("Escape");
+  await expect(menu).not.toBeVisible();
+  await page
+    .getByRole("button", { name: "Soulseek status: Away", exact: true })
+    .click();
+  await menu.getByRole("button", { name: "Disconnect from Soulseek" }).click();
+  await page
+    .getByRole("button", { name: "Soulseek status: Offline", exact: true })
+    .click();
+  await menu.getByRole("button", { name: "Connect to Soulseek" }).click();
+  await expect(
+    page.getByRole("button", { name: "Soulseek status: Online", exact: true }),
+  ).toBeVisible();
+  expect(commands).toEqual([
+    { type: "set_away", away: false },
+    { type: "set_away", away: true },
+    { type: "disconnect" },
+    { type: "connect" },
+  ]);
+});
+
 test("idle Away settings persist and a UI click reports activity immediately while automatically Away", async ({
   page,
 }) => {
@@ -5591,7 +5948,7 @@ test("idle Away settings persist and a UI click reports activity immediately whi
   state.away_automatic = false;
   await pushRoomState(page, state);
   await expect(
-    page.getByText("Network connected", { exact: true }),
+    page.getByRole("button", { name: "Soulseek status: Online", exact: true }),
   ).toBeVisible();
 });
 
@@ -5810,10 +6167,12 @@ for (const responseDelayMs of [0, 150]) {
         await page.getByLabel("Group by user", { exact: true }).check();
       await expect(
         page.getByRole("button", {
-          name: `Collapse ${direction} for alice`,
+          name: `${direction === "uploads" ? "Expand" : "Collapse"} ${direction} for alice`,
           exact: true,
         }),
       ).toBeVisible();
+      if (direction === "uploads")
+        await expect(page.locator(".transfer-row")).toHaveCount(0);
       await expect(page.locator(".upload-group-heading").first()).toContainText(
         "130 files",
       );
@@ -5949,6 +6308,10 @@ test("download and upload selection supports Ctrl, virtualized Shift ranges, per
       .click();
     if (direction === "downloads")
       await page.getByLabel("Group by user", { exact: true }).check();
+    else
+      await page
+        .getByRole("button", { name: "Expand all users", exact: true })
+        .click();
     await page
       .getByLabel("Order transfers", { exact: true })
       .selectOption("name");
@@ -6145,6 +6508,10 @@ test("priority and manual queue controls work for uploads and downloads without 
         exact: true,
       })
       .click();
+    if (direction === "uploads")
+      await page
+        .getByRole("button", { name: "Expand all users", exact: true })
+        .click();
     await page
       .getByLabel(`Select ${singular} b.flac for alice`, { exact: true })
       .check();
@@ -7021,3 +7388,64 @@ for (const mode of ["topic", "dislikes"] as const) {
     ]);
   });
 }
+
+test("profile speed explains its recipient cohort and preserves manual and hidden reporting", async ({
+  page,
+}) => {
+  const profile = {
+    description: "",
+    picture: null,
+    likes: [],
+    dislikes: [],
+    away_on_startup: false,
+    away_message: "",
+    auto_away_minutes: 0,
+    report_upload_speed: true,
+    reported_upload_speed_kib: null,
+  };
+  const posts: Record<string, unknown>[] = [];
+  await page.route("**/api/v1/profile", (route) => {
+    if (route.request().method() === "POST") {
+      posts.push(route.request().postDataJSON());
+      return route.fulfill({ status: 202, json: { status: "queued" } });
+    }
+    return route.fulfill({ json: profile });
+  });
+  await fixture(page, {
+    ...emptySnapshot,
+    connection: "connected",
+    username: "fixture-self",
+    profile: {
+      ...profile,
+      has_picture: false,
+      revision: 0,
+      measured_upload_speed: 2_000_000,
+      upload_speed_measured: true,
+      upload_speed_recipients: 200,
+      upload_speed_selected_recipients: 20,
+    },
+  });
+  await page
+    .getByRole("button", { name: "Open settings", exact: true })
+    .click();
+  await page.getByRole("tab", { name: "Profile", exact: true }).click();
+  await expect(
+    page.locator("p.hint").filter({ hasText: "Based on the fastest" }),
+  ).toContainText("20 of 200 measured recipients");
+  await page
+    .getByLabel("Custom reported upload speed (KiB/s)", { exact: true })
+    .fill("1234");
+  await page
+    .getByRole("checkbox", {
+      name: "Report my upload speed to other users",
+      exact: true,
+    })
+    .uncheck();
+  await page.getByRole("button", { name: "Save profile", exact: true }).click();
+  await expect.poll(() => posts.length).toBe(1);
+  expect(posts[0]).toMatchObject({
+    report_upload_speed: false,
+    reported_upload_speed_kib: 1234,
+  });
+  expect(posts[0]).not.toHaveProperty("upload_speed_recipients");
+});

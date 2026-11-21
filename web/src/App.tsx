@@ -29,12 +29,14 @@ import {
   HardDrive,
   ShieldCheck,
   Compass,
+  ListOrdered,
 } from "lucide-react";
 import { api, subscribe, bytes, basename, ApiError } from "./api";
 import Credentials from "./Credentials";
 import ApiAccess from "./ApiAccess";
 import Maintenance from "./Maintenance";
 import { useActivity } from "./useActivity";
+import NetworkStatus from "./NetworkStatus";
 import { PrivilegeBadge } from "./Privileges";
 import Locations from "./Locations";
 import ConnectionSettings from "./ConnectionSettings";
@@ -48,6 +50,7 @@ import LibraryProgress from "./LibraryProgress";
 import User, { UserContext, UserDialog, UserStatus } from "./User";
 import ShareBrowser from "./ShareBrowser";
 import SearchResults from "./SearchResults";
+import SearchTabs from "./SearchTabs";
 import Wishlist from "./Wishlist";
 import PeopleSettings from "./PeopleSettings";
 import SharingSettingsForm from "./SharingSettings";
@@ -88,6 +91,7 @@ import {
   transferSorts,
   type TransferSort,
   eta,
+  isQueuedTransfer,
 } from "./transfers";
 import { sortRooms, type RoomSort } from "./rooms";
 import GroupedResults from "./GroupedResults";
@@ -445,14 +449,15 @@ export default function App() {
                 >
                   <LockKeyhole size={16} />
                 </button>
-                <span className={`connection-label ${online ? "online" : ""}`}>
-                  <span className={`dot ${online ? "online" : ""}`} />
-                  {online
-                    ? state.away_automatic
-                      ? "Away (idle)"
-                      : "Network connected"
-                    : "Network offline"}
-                </span>
+                <NetworkStatus
+                  state={state}
+                  busy={busy}
+                  send={send}
+                  openAccounts={() => {
+                    setPage("settings");
+                    setSettingsTab("accounts");
+                  }}
+                />
                 <button
                   className="avatar"
                   title="Settings"
@@ -776,8 +781,8 @@ export default function App() {
                             Soulseek supports Online and Away while connected.
                             Away keeps searches and transfers working; the
                             protocol has no supported invisible mode. Set Away
-                            from the account menu or configure automatic Away in
-                            Profile.
+                            from the top-right status menu or configure
+                            automatic Away in Profile.
                           </p>
                           <p className="hint">
                             Soulseek traffic is not end-to-end encrypted. Use
@@ -1036,35 +1041,17 @@ function SearchPage({
       </div>
       {searches.length > 0 ? (
         <section className="results-panel">
-          <div className="tabs" role="tablist" aria-label="Open searches">
-            {searches.map((s) => (
-              <div
-                className={`tab ${active?.id === s.id ? "active" : ""}`}
-                key={s.id}
-              >
-                <button
-                  role="tab"
-                  aria-selected={active?.id === s.id}
-                  onClick={() => {
-                    setSelected(s.id);
-                    setFilter("");
-                  }}
-                >
-                  {s.collecting && <span className="dot online pulse" />}
-                  {s.query}
-                  <span className="tab-count">
-                    {s.total ?? s.results.length}
-                  </span>
-                </button>
-                <button
-                  aria-label={`Close search ${s.query}`}
-                  onClick={() => send({ type: "forget_search", id: s.id })}
-                >
-                  <X size={13} />
-                </button>
-              </div>
-            ))}
-          </div>
+          <SearchTabs
+            searches={searches}
+            activeId={active?.id}
+            select={(id) => {
+              setSelected(id);
+              setFilter("");
+            }}
+            close={(id) => {
+              send({ type: "forget_search", id });
+            }}
+          />
           {active && (
             <form
               className="search-repeat"
@@ -1111,7 +1098,7 @@ function SearchPage({
               </strong>
               <span>
                 {active?.collecting
-                  ? "Listening for results…"
+                  ? "Listening for results (up to 2 minutes)…"
                   : "Search window complete · all collected files remain browsable"}
               </span>
             </div>
@@ -1277,7 +1264,7 @@ function TransfersPage({
     reverse,
     query,
   );
-  const [defaultCollapsed, setDefaultCollapsed] = useState(false);
+  const [defaultCollapsed, setDefaultCollapsed] = useState(uploads);
   const [collapseExceptions, setCollapseExceptions] = useState<Set<string>>(
     new Set(),
   );
@@ -1415,7 +1402,7 @@ function TransfersPage({
             : "Follow your downloads. The daemon keeps working when you close this tab."
         }
       />
-      <div className="stat-grid">
+      <div className="stat-grid transfer-stats">
         <Stat
           label="Total transfers"
           value={(
@@ -1433,6 +1420,16 @@ function TransfersPage({
               .length
           ).toString()}
           icon={<RefreshCw size={18} />}
+        />
+        <Stat
+          label="In queue"
+          value={
+            paged
+              ? (data?.summary.queued?.toLocaleString() ?? "…")
+              : items.filter(isQueuedTransfer).length.toLocaleString()
+          }
+          detail="Waiting transfers, including paused items, retries and storage or share checks."
+          icon={<ListOrdered size={18} />}
         />
         <Stat
           label="Current speed (5s average)"
@@ -2071,13 +2068,15 @@ function Stat({
   label,
   value,
   icon,
+  detail,
 }: {
   label: string;
   value: ReactNode;
   icon: ReactNode;
+  detail?: string;
 }) {
   return (
-    <div className="stat-card">
+    <div className="stat-card" title={detail}>
       <span>
         {label}
         {icon}
@@ -2496,19 +2495,26 @@ function ChatPage({
             {!privateChat && target && (
               <button
                 className="button small secondary"
-                disabled={!online}
+                disabled={
+                  !online || !!state.room_management?.rooms[target]?.pending
+                }
                 onClick={() =>
                   send({
                     type: state.joined_rooms.includes(target)
                       ? "leave_room"
-                      : "join_room",
+                      : state.room_management?.rooms[target]?.private &&
+                          !state.room_management.rooms[target].member
+                        ? "create_private_room"
+                        : "join_room",
                     room: target,
                   })
                 }
               >
-                {state.joined_rooms.includes(target)
-                  ? "Leave room"
-                  : "Join room"}
+                {state.room_management?.rooms[target]?.pending
+                  ? "Joining…"
+                  : state.joined_rooms.includes(target)
+                    ? "Leave room"
+                    : "Join room"}
               </button>
             )}
           </div>

@@ -52,6 +52,7 @@ pub struct Limits {
     pub peers: usize,
     pub upload_slots: usize,
     pub download_bytes_per_second: u64,
+    /// Legacy setting accepted for existing installations; history is unlimited.
     pub searches: usize,
     pub transfers: usize,
 }
@@ -89,7 +90,7 @@ impl Default for Limits {
             peers: 64,
             upload_slots: 2,
             download_bytes_per_second: 0,
-            searches: 8,
+            searches: 0,
             transfers: 128,
         }
     }
@@ -227,10 +228,6 @@ impl Config {
         ensure!(
             (1..=16).contains(&self.limits.upload_slots),
             "upload_slots must be 1..16"
-        );
-        ensure!(
-            (1..=16).contains(&self.limits.searches),
-            "searches must be 1..16"
         );
         ensure!(
             (1..=1024).contains(&self.limits.transfers),
@@ -403,6 +400,13 @@ mod tests {
         assert_eq!(c.soulseek.listen_port, 4455);
         assert_eq!(c.published_transfer_port, Some(4455));
         assert!(c.apply_deployment_env(Some("invalid"), None, None).is_err());
+    }
+    #[test]
+    fn legacy_search_count_settings_are_accepted_without_limiting_history() {
+        for count in [0, 8, 16, 257] {
+            let config: Config = toml::from_str(&format!("[limits]\nsearches={count}")).unwrap();
+            config.validate().unwrap();
+        }
     }
     #[test]
     fn defaults_are_private_and_bounded() {

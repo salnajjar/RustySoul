@@ -89,7 +89,12 @@ impl Engine {
             .collect();
         // Bound subscriptions and send at most eight new requests each control tick.
         // Explicit lookups and buddies take priority over older search results.
-        let mut wanted = Vec::new();
+        let mut wanted = c
+            .uploads()
+            .into_iter()
+            .filter(|u| matches!(u.status, soulseek_rs::UploadStatus::InProgress))
+            .map(|u| u.username)
+            .collect::<Vec<_>>();
         let mut lookups: Vec<_> = self.lookups.iter().collect();
         lookups.sort_by_key(|(_, at)| std::cmp::Reverse(**at));
         wanted.extend(lookups.into_iter().map(|(u, _)| u.clone()));

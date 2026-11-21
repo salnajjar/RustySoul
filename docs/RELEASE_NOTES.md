@@ -1,3 +1,28 @@
+# RustySoul v0.1.0-beta.5
+
+This beta improves search completeness, transfer reliability, upload reporting and everyday navigation. It includes the changes tested on the daemon since beta.4.
+
+## Changes since beta.4
+
+- Keep unlimited search tabs in creation order. New searches appear on the right; scroll back to reuse, edit or close older searches. History survives restarts. Older results stay in SQLite, with bounded live previews and paged access. Legacy search-count settings are accepted and ignored.
+- Collect search replies for two minutes and handle crowded peer pools, fragmented replies and server backpressure without silently losing results or blocking user controls.
+- Show an **In queue** summary between **Transferring** and **Current speed** on downloads and uploads. It counts the entire pending queue independently of filters and scrolling. Upload users start collapsed, and the maximum-downloads-per-user setting remains editable.
+- Make upload lifecycle recording atomic and retryable, report recent payload speed, reconcile missing transfers, and fail queued/offered/active uploads when the server confirms that the recipient is offline. A closed control socket alone does not stop a healthy file stream.
+- Correlate positive and negative upload replies across replacement control connections, release declined slots promptly, and reconnect queued recipients when an idle control connection disappears. Transfer-offer answer deadlines begin after delivery. Bound direct/reverse connection negotiation separately and prevent stale callbacks from reviving cancelled attempts.
+- Allow 60 seconds without upload payload or Linux TCP send-queue progress. Successful completion waits for queued bytes to drain; failed and cancelled Unix transfers discard unsent payload promptly. Linux send-queue progress extends a blocked writer's deadline without allowing idle probes to keep it alive indefinitely.
+- Estimate automatic profile upload speed from the fastest 10% of the latest 200 distinct recipients, using each recipient's lifetime payload/time average. Parallel files contribute one streaming-time interval per recipient. Manual reporting and privacy overrides remain available.
+- Let completed files inherit destination-directory permissions and ACLs while protecting incomplete payloads. Clean up abandoned incomplete-file stubs without removing live or referenced partial downloads.
+- Restore Online status on UI activity after automatic Away, and use the top-right status menu to choose Online/Away or disconnect. Confirm private-room creation and membership; public rooms retain the network's public-room ownership rules.
+- Preserve accounts, sessions, encrypted credentials, library data, history and settings through the schema-17 upgrade. Expanded protocol, transfer, storage and desktop/mobile regression checks cover these changes.
+
+## Upgrade
+
+Back up persistent application state before upgrading. Pull `ghcr.io/salnajjar/rustysoul:0.1.0-beta.5` for the pinned image, or `ghcr.io/salnajjar/rustysoul:beta` for the current beta, and recreate the container with its existing mounts and environment/configuration. Do not delete its data volume. Docker, Podman and native Linux installations remain supported; no Compose or TOML file is required for environment-based deployment.
+
+SQLite schema 17 validates schema-11 through schema-17 backups and migrates supported older backups on restore. Roll back using the matching earlier database and executable/image together. Historical global upload measurements cannot reconstruct per-recipient streaming time, so the new speed estimator learns from uploads recorded after this upgrade; its initial estimate is 1 MiB/s until measurements are available. Existing reporting overrides and preferences are preserved.
+
+The release workflow gates publication on Rust/SDK tests, UI and desktop/mobile browser checks, CodeQL review, native smoke checks and Docker/Podman installation checks. Public container and native artifacts target Linux amd64/x86-64; the native bundle requires glibc 2.36 or newer. See [installation](https://github.com/salnajjar/RustySoul#readme) and [release verification](https://github.com/salnajjar/RustySoul/blob/main/docs/TESTING.md).
+
 # RustySoul v0.1.0-beta.4
 
 RustySoul is a Linux Soulseek daemon with a responsive browser interface, authenticated API and SQLite persistence. This beta adds easier installation, richer discovery and search, clearer conversations, and stronger filesystem handling.

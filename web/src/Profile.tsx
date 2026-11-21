@@ -214,12 +214,25 @@ export default function Profile({
           </label>
           <p className="hint">
             Leave custom speed blank to use your total upload limit when
-            configured, or the measured upload rate otherwise. Measurements
-            exclude idle periods and survive restarts. A new installation starts
-            at 1 MiB/s until a measurement is available. Hiding speed also hides
-            it in search replies; other clients may retain older server
-            statistics.
+            configured, or the measured upload rate otherwise. Automatic speed
+            averages the fastest 10% of your most recent 200 distinct upload
+            recipients, using each recipient's all-time average. Simultaneous
+            files to one person count together. Queueing, handshakes and idle
+            gaps between files are excluded. Measurements survive restarts and
+            clearing transfer history. At least one recipient is used, rounding
+            the 10% up. Until measurements are available, the starting estimate
+            is 1 MiB/s. Hiding speed also hides it in search replies; other
+            clients may retain older server statistics.
           </p>
+          {state.profile?.upload_speed_measured && (
+            <p className="hint">
+              Based on the fastest{" "}
+              {state.profile.upload_speed_selected_recipients ?? 0} of{" "}
+              {state.profile.upload_speed_recipients ?? 0} measured recipients.
+              Each person has equal weight, regardless of how many files they
+              download.
+            </p>
+          )}
           <p>
             Local{" "}
             {state.profile?.upload_speed_measured

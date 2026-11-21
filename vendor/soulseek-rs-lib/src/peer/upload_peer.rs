@@ -56,6 +56,47 @@ pub fn dial(host: &str, port: u32) -> io::Result<TcpStream> {
 
 const IO_POLL: Duration = Duration::from_millis(500);
 const STALL_DEADLINE: Duration = Duration::from_secs(30);
+const PAYLOAD_STALL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Linux may keep application writes asleep until enough send-buffer space is
+/// free, even while the peer acknowledges smaller amounts of buffered data.
+/// Count actual queue drain as progress, never zero-window probes alone.
+#[derive(Default)]
+struct WireProgress(Option<u64>);
+impl WireProgress {
+    fn observe(&mut self, queued: Option<u64>, progress: &mut Instant, now: Instant) {
+        if let (Some(previous), Some(current)) = (self.0, queued)
+            && current < previous { *progress = now; }
+        self.0 = queued;
+    }
+}
+#[cfg(target_os = "linux")]
+fn pending_output(stream: &TcpStream) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let mut queued: libc::c_int = 0;
+    // SAFETY: the live TCP descriptor is queried with TIOCOUTQ, which writes
+    // exactly one c_int into the valid, exclusively borrowed stack value.
+    let result = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ as _, &raw mut queued) };
+    (result == 0 && queued >= 0).then_some(queued as u64)
+}
+#[cfg(not(target_os = "linux"))]
+fn pending_output(_stream: &TcpStream) -> Option<u64> { None }
+
+fn abort_failed_stream(stream: &TcpStream) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        // SAFETY: SO_LINGER reads this initialized, correctly sized value on
+        // a live TCP descriptor. Dropping the stream then discards unsent data
+        // and resets the failed transfer instead of continuing it in FIN-WAIT.
+        let result = unsafe { libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER,
+            (&raw const linger).cast(), std::mem::size_of_val(&linger) as _) };
+        if result == 0 { return; }
+        crate::warn!("[upload] could not discard failed stream's pending data: {}", io::Error::last_os_error());
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
 
 fn with_deadlines(stream: TcpStream) -> io::Result<TcpStream> {
     // Poll connected socket waits so cancellation does not wait for the entire
@@ -235,7 +276,7 @@ fn stream_file(
         bytes_sent,
         cancel,
         bandwidth,
-        STALL_DEADLINE,
+        PAYLOAD_STALL_DEADLINE,
     )
 }
 fn stream_file_with_timeout(
@@ -247,11 +288,12 @@ fn stream_file_with_timeout(
     bandwidth: Option<&UserBandwidth>,
     timeout: Duration,
 ) -> io::Result<u64> {
+    let outcome = (|| {
     // The downloader replies with an 8-byte START_DOWNLOAD offset first. A
     // non-zero offset means it is resuming and already holds that prefix, so
     // seek past it and count it as sent to keep progress absolute.
     let file_size = file.metadata()?.len();
-    let offset = read_resume_offset(&mut stream, cancel, timeout, file_size == 0)?;
+    let offset = read_resume_offset(&mut stream, cancel, STALL_DEADLINE, file_size == 0)?;
     if offset > file_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -261,9 +303,14 @@ fn stream_file_with_timeout(
     file.seek(SeekFrom::Start(offset))?;
     bytes_sent.fetch_add(offset, Ordering::Relaxed);
 
+    // Multiple files to one recipient share a single wall-clock interval.
+    // Empty files, completed resume prefixes and handshakes add no samples.
+    let _upload_timing = bandwidth.filter(|_| offset < file_size).map(UserBandwidth::begin_upload);
+
     let mut buffer = vec![0u8; 64 * 1024];
     let mut streamed = 0u64;
     let mut progress = Instant::now();
+    let mut wire = WireProgress::default();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
@@ -280,7 +327,7 @@ fn stream_file_with_timeout(
                 cancel,
                 progress,
                 timeout,
-                "The receiving peer stopped accepting file data for 30 seconds.",
+                "No upload payload progress for 60 seconds; the receiving peer or connection stopped accepting data.",
             )?;
             let waiting = Instant::now();
             let allowance = bandwidth
@@ -291,7 +338,7 @@ fn stream_file_with_timeout(
                 cancel,
                 progress,
                 timeout,
-                "The receiving peer stopped accepting file data for 30 seconds.",
+                "No upload payload progress for 60 seconds; the receiving peer or connection stopped accepting data.",
             )?;
             let permitted = allowance.as_ref().map_or(read - written, |a| a.bytes);
             match stream.write(&buffer[written..written + permitted]) {
@@ -304,13 +351,29 @@ fn stream_file_with_timeout(
                     bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                     streamed += n as u64;
                     progress = Instant::now();
+                    wire.0 = None;
                 }
-                Err(e) if transient(&e) => {} // Dropping unused allowance refunds both budgets.
+                Err(e) if transient(&e) => {
+                    wire.observe(pending_output(&stream), &mut progress, Instant::now());
+                } // Dropping unused allowance refunds both budgets.
                 Err(e) => return Err(e),
             }
         }
     }
     stream.flush()?;
+
+    // Completion means the peer has acknowledged the payload, rather than
+    // merely that our kernel accepted the final buffered writes. No peer FIN
+    // is required. Unsupported platforms retain the previous write behavior.
+    loop {
+        if let Some(error) = stream.take_error()? { return Err(error); }
+        let queued = pending_output(&stream);
+        wire.observe(queued, &mut progress, Instant::now());
+        if queued.is_none_or(|n| n == 0) { break; }
+        check_wait(cancel, progress, timeout,
+            "No upload payload progress for 60 seconds; the receiving peer or connection stopped accepting data.")?;
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     // The file is delivered. Soulseek leaves closing to the downloader, but
     // waiting for that costs the upload slot the next peer is queued for —
@@ -323,6 +386,9 @@ fn stream_file_with_timeout(
         stream.peer_addr()
     );
     Ok(streamed)
+    })();
+    if outcome.is_err() { abort_failed_stream(&stream); }
+    outcome
 }
 
 #[cfg(test)]
@@ -333,6 +399,114 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    fn read_closed(stream: &mut TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        match stream.read_to_end(&mut received) {
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => {}
+            Err(error) => panic!("unexpected error awaiting failed stream close: {error}"),
+        }
+        received
+    }
+
+    #[test]
+    fn only_reduced_pending_output_extends_the_payload_progress_deadline() {
+        let at = std::time::Instant::now();
+        let mut progress = at;
+        let mut wire = super::WireProgress::default();
+        wire.observe(Some(1000), &mut progress, at + Duration::from_secs(1));
+        wire.observe(Some(1000), &mut progress, at + Duration::from_secs(2));
+        assert_eq!(progress, at, "ACK probes without delivered data are not progress");
+        wire.observe(Some(900), &mut progress, at + Duration::from_secs(3));
+        assert_eq!(progress, at + Duration::from_secs(3));
+        wire.observe(None, &mut progress, at + Duration::from_secs(4));
+        wire.observe(Some(800), &mut progress, at + Duration::from_secs(5));
+        assert_eq!(progress, at + Duration::from_secs(3), "a failed query cannot invent progress");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_upload_is_not_completed_while_payload_remains_in_the_kernel_send_queue() {
+        use std::os::fd::AsRawFd;
+        let content = vec![0x5a; 128 * 1024];
+        let path = scratch_file("unacknowledged-upload", &content);
+        let dir = path.parent().unwrap().to_path_buf();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let receive_buffer: libc::c_int = 4 * 1024;
+        // SAFETY: a valid initialized int and live socket descriptor; the
+        // accepted socket inherits the receive window negotiated at SYN.
+        unsafe {
+            assert_eq!(libc::setsockopt(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF,
+                (&raw const receive_buffer).cast(), std::mem::size_of_val(&receive_buffer) as _), 0);
+        }
+        let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let send_buffer: libc::c_int = 1024 * 1024;
+        // SAFETY: the initialized option has the exact socklen expected.
+        unsafe {
+            assert_eq!(libc::setsockopt(sender.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
+                (&raw const send_buffer).cast(), std::mem::size_of_val(&send_buffer) as _), 0);
+        }
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let probe = sender.try_clone().unwrap();
+        let counter = Arc::new(AtomicU64::new(0)); let sent = counter.clone();
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = super::stream_file(super::with_deadlines(sender).unwrap(),
+                std::fs::File::open(&path).unwrap(), &path, &sent, &AtomicBool::new(false), None);
+            done.send(outcome).unwrap();
+        });
+        peer.write_all(&0_u64.to_le_bytes()).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while counter.load(Ordering::Relaxed) < content.len() as u64 {
+            assert!(std::time::Instant::now() < until, "sender did not fill its payload buffer");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(super::pending_output(&probe).unwrap() > 0);
+        assert!(matches!(result.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)),
+            "upload completed before the peer acknowledged buffered payload");
+        drop(probe);
+        let mut received = Vec::new(); peer.read_to_end(&mut received).unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), content.len() as u64);
+        worker.join().unwrap(); assert_eq!(received, content);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_receiver_that_never_drains_payload_still_hits_its_bounded_deadline() {
+        use std::os::fd::AsRawFd;
+        let content = vec![0x5a; 1024 * 1024];
+        let path = scratch_file("no-payload-drain", &content);
+        let dir = path.parent().unwrap().to_path_buf();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let buffer: libc::c_int = 4 * 1024;
+        // SAFETY: same inherited receive-window fixture as above.
+        unsafe {
+            assert_eq!(libc::setsockopt(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF,
+                (&raw const buffer).cast(), std::mem::size_of_val(&buffer) as _), 0);
+        }
+        let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        sender.set_write_timeout(Some(Duration::from_millis(20))).unwrap();
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done.send(super::stream_file_with_timeout(sender, std::fs::File::open(&path).unwrap(),
+                &path, &AtomicU64::new(0), &AtomicBool::new(false), None, Duration::from_millis(200))).unwrap();
+        });
+        peer.write_all(&0_u64.to_le_bytes()).unwrap();
+        let error = result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        worker.join().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut received = Vec::new();
+        let reset = peer.read_to_end(&mut received).expect_err("failed upload must discard queued data, not linger in FIN-WAIT");
+        assert!(matches!(reset.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted));
+        assert!(received.len() < content.len());
+        drop(peer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Play the downloader: accept the F connection, drain the PeerInit frame
     /// and the raw token, then reply with the 8-byte START_DOWNLOAD offset.
@@ -535,8 +709,7 @@ mod tests {
         let (bytes_sent, uploader) = spawn_uploader(&listener, path, 780, Arc::default());
 
         let (mut stream, _) = accept_and_send_offset(&listener, 4097);
-        let mut received = Vec::new();
-        stream.read_to_end(&mut received).unwrap();
+        let received = read_closed(&mut stream);
         assert!(received.is_empty());
 
         let error = uploader.join().unwrap().unwrap_err();
@@ -603,11 +776,10 @@ mod tests {
         stream.write_all(&[0; 3]).unwrap();
         let at = std::time::Instant::now();
         cancel.store(true, Ordering::Relaxed);
-        let mut received = Vec::new();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        stream.read_to_end(&mut received).unwrap();
+        let received = read_closed(&mut stream);
         assert!(received.is_empty());
         assert!(at.elapsed() < Duration::from_secs(2));
         assert_eq!(
@@ -633,8 +805,7 @@ mod tests {
         peer.read_exact(&mut token).unwrap();
         assert_eq!(u32::from_le_bytes(token), 9);
         cancel.store(true, Ordering::Relaxed);
-        let mut bytes = Vec::new();
-        peer.read_to_end(&mut bytes).unwrap();
+        let bytes = read_closed(&mut peer);
         assert!(bytes.is_empty());
         assert_eq!(
             worker.join().unwrap().unwrap_err().kind(),

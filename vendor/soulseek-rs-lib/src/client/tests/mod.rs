@@ -48,6 +48,6 @@ fn peer_files(count: usize) -> SearchResult {
     }
 }
 
-use crate::types::{RoomEvent, UploadStatus};
+use crate::types::RoomEvent;
 
 use std::time::{Duration, Instant};

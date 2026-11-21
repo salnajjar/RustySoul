@@ -160,8 +160,12 @@ impl PeerRegistry {
 
     #[must_use]
     pub fn get_peer(&self, username: &str) -> Option<ActorHandle<PeerMessage>> {
+        self.get_peer_with_id(username).map(|(_, handle)| handle)
+    }
+
+    pub(crate) fn get_peer_with_id(&self, username: &str) -> Option<(u64, ActorHandle<PeerMessage>)> {
         match self.peers.lock_safe() {
-            Ok(peers) => peers.get(username).map(|(_, handle)| handle.clone()),
+            Ok(peers) => peers.get(username).cloned(),
             Err(e) => {
                 error!("[peer_registry] get_peer: {}", e);
                 None

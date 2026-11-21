@@ -17,7 +17,7 @@ pub struct SavedDownload {
 
 pub struct Store {
     pub(crate) connection: Connection,
-    searches: String,
+    searches: std::collections::BTreeMap<String, String>,
     rooms: String,
     messages: String,
     browse: String,
@@ -39,12 +39,12 @@ fn read_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_at_schema(path, 16)
+        Self::open_at_schema(path, 17)
     }
     // Used only to construct a trusted expected schema when validating older
     // backups. Never called on an untrusted backup before exact validation.
     pub(crate) fn open_at_schema(path: &Path, target: u32) -> Result<Self> {
-        ensure!((11..=16).contains(&target), "Unsupported schema target");
+        ensure!((11..=17).contains(&target), "Unsupported schema target");
         let connection = Connection::open(path).context("Cannot open SQLite database")?;
         #[cfg(unix)]
         if path != Path::new(":memory:") {
@@ -199,9 +199,16 @@ impl Store {
         if version < 16 && target >= 16 {
             connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE upload_speed_estimate(id INTEGER PRIMARY KEY CHECK(id=1),rate REAL NOT NULL CHECK(rate>0)); PRAGMA user_version=16; COMMIT;")?;
         }
+        if version < 17 && target >= 17 {
+            connection.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE upload_speed_users(username TEXT PRIMARY KEY COLLATE NOCASE,payload_bytes INTEGER NOT NULL CHECK(payload_bytes>0),active_seconds REAL NOT NULL CHECK(active_seconds>0),last_sequence INTEGER NOT NULL CHECK(last_sequence>0));
+                CREATE INDEX upload_speed_users_recent ON upload_speed_users(last_sequence DESC);
+                DROP TABLE upload_speed_estimate;
+                PRAGMA user_version=17; COMMIT;")?;
+        }
         Ok(Self {
             connection,
-            searches: String::new(),
+            searches: Default::default(),
             rooms: String::new(),
             messages: String::new(),
             browse: String::new(),
@@ -372,23 +379,21 @@ impl Store {
         Ok(())
     }
 
-    pub fn restore(&self, view: &mut Snapshot, search_limit: usize) -> Result<()> {
+    pub fn restore(&self, view: &mut Snapshot) -> Result<()> {
         let mut stmt = self
             .connection
-            .prepare("SELECT id,query FROM searches WHERE NOT EXISTS(SELECT 1 FROM search_options o WHERE o.search_id=searches.id AND o.wishlist_id IS NOT NULL) ORDER BY rowid DESC LIMIT ?1")?;
-        let searches = stmt.query_map([i64::try_from(search_limit)?], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+            .prepare("SELECT id,query FROM searches WHERE NOT EXISTS(SELECT 1 FROM search_options o WHERE o.search_id=searches.id AND o.wishlist_id IS NOT NULL) ORDER BY rowid")?;
+        let searches =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for search in searches {
             let (id, query) = search?;
             let total = self.connection.query_row(
-                "SELECT COUNT(*) FROM search_results WHERE search_id=?1",
+                "SELECT COALESCE(SUM(matches),0) FROM search_user_stats WHERE search_id=?1",
                 [&id],
                 |r| r.get::<_, i64>(0),
             )? as usize;
             let scope = crate::search::scope(&self.connection, &id)?;
             view.searches.push(SearchView {
-                results: crate::search::preview(&self.connection, &id)?,
                 id,
                 query,
                 collecting: false,
@@ -396,6 +401,14 @@ impl Store {
                 scope,
                 ..Default::default()
             });
+        }
+
+        let recent = view
+            .searches
+            .len()
+            .saturating_sub(crate::search::SNAPSHOT_PREVIEWS);
+        for search in &mut view.searches[recent..] {
+            search.results = crate::search::preview(&self.connection, &search.id)?;
         }
 
         let mut stmt = self
@@ -465,30 +478,37 @@ impl Store {
 
     /// Called at a limited cadence; each section is committed only when its content changed.
     pub fn save_snapshot(&mut self, view: &Snapshot) -> Result<()> {
-        let searches = serde_json::to_string(&view.searches)?;
+        let searches = view
+            .searches
+            .iter()
+            .map(|s| Ok((s.id.clone(), serde_json::to_string(s)?)))
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         if searches != self.searches {
             let tx = self
                 .connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let ids: Vec<_> = view.searches.iter().map(|s| s.id.as_str()).collect();
             let existing = tx
                 .prepare("SELECT id FROM searches")?
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for id in existing {
-                if !ids.contains(&id.as_str()) && crate::search::wishlist_id(&tx, &id)?.is_none() {
+                if !searches.contains_key(&id) && crate::search::wishlist_id(&tx, &id)?.is_none() {
                     tx.execute("DELETE FROM searches WHERE id=?1", [id])?;
                 }
             }
             for search in &view.searches {
+                if self.searches.get(&search.id) == searches.get(&search.id) {
+                    continue;
+                }
                 crate::search::create(&tx, search)?;
                 // Previews are bounded. Never replace a larger normalized result set.
-                let count = tx.query_row(
-                    "SELECT COUNT(*) FROM search_results WHERE search_id=?1",
-                    [&search.id],
-                    |r| r.get::<_, i64>(0),
-                )?;
-                if count == 0 {
+                let has_results = search.results.is_empty()
+                    || tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM search_results WHERE search_id=?1)",
+                        [&search.id],
+                        |r| r.get::<_, bool>(0),
+                    )?;
+                if !has_results {
                     for f in &search.results {
                         tx.execute("INSERT OR IGNORE INTO search_results(search_id,username,path,size,free_slots,speed,attributes,folder,format,search_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![search.id,f.username,f.path,i64::try_from(f.size)?,f.free_slots,f.speed,serde_json::to_string(&f.attributes)?,crate::search::folder(&f.path),crate::search::format(&f.path),format!("{} {}",f.username,f.path).to_lowercase()])?;
                     }
@@ -782,7 +802,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.downloads().unwrap(), [row]);
         let mut restored = Snapshot::default();
-        store.restore(&mut restored, 8).unwrap();
+        store.restore(&mut restored).unwrap();
         assert_eq!(restored.messages[0].text, "'DROP TABLE downloads;'");
         assert_eq!(restored.searches[0].results[0].path, "track.flac");
         assert!(!restored.searches[0].collecting);
@@ -817,6 +837,85 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.network().unwrap(), Some(settings));
         assert_eq!(store.identity().unwrap(), identity);
+    }
+    #[test]
+    fn unlimited_search_history_restores_in_order_with_bounded_previews_and_durable_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let mut store = Store::open(&path).unwrap();
+        let mut view = Snapshot::default();
+        for i in 0..257 {
+            view.searches.push(SearchView {
+                id: format!("search-{i}"),
+                query: format!("album {i}"),
+                total: 1,
+                results: vec![FileView {
+                    username: "peer".into(),
+                    path: format!("album/{i}.flac"),
+                    size: 123,
+                    free_slots: 1,
+                    speed: 100,
+                    attributes: Default::default(),
+                }],
+                ..Default::default()
+            });
+        }
+        store.save_snapshot(&view).unwrap();
+        crate::search::trim_previews(&mut view.searches);
+        assert_eq!(
+            view.searches.iter().map(|s| s.results.len()).sum::<usize>(),
+            crate::search::SNAPSHOT_PREVIEWS
+        );
+        assert_eq!(view.searches[0].results.capacity(), 0);
+        store.save_snapshot(&view).unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        let mut restored = Snapshot::default();
+        store.restore(&mut restored).unwrap();
+        assert_eq!(restored.searches.len(), 257);
+        for (i, search) in restored.searches.iter().enumerate() {
+            assert_eq!(search.id, format!("search-{i}"));
+            assert_eq!(search.total, 1);
+            assert!(!search.collecting);
+        }
+        assert_eq!(
+            restored
+                .searches
+                .iter()
+                .map(|s| s.results.len())
+                .sum::<usize>(),
+            crate::search::SNAPSHOT_PREVIEWS
+        );
+        let oldest =
+            crate::search::page(&store.connection, "search-0", &Default::default()).unwrap();
+        assert_eq!(oldest.files[0].path, "album/0.flac");
+        // Saving a bounded snapshot must retain every older normalized result.
+        store.save_snapshot(&restored).unwrap();
+        restored.searches.remove(1);
+        store.save_snapshot(&restored).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let mut restored = Snapshot::default();
+        store.restore(&mut restored).unwrap();
+        assert_eq!(restored.searches.len(), 256);
+        assert_eq!(restored.searches[0].id, "search-0");
+        assert_eq!(restored.searches[1].id, "search-2");
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM search_results", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            256
+        );
+        assert!(
+            store
+                .connection
+                .query_row("SELECT id FROM searches WHERE id='search-1'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .is_err()
+        );
     }
     #[test]
     fn replacing_search_removes_orphaned_results() {

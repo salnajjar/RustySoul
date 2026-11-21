@@ -5,6 +5,16 @@ use rusqlite::{Connection, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+// History and normalized results have no search-count limit. Keep only a small
+// recent preview cache in snapshots; older tabs read their results through pages.
+pub const SNAPSHOT_PREVIEWS: usize = 8;
+pub fn trim_previews(searches: &mut [SearchView]) {
+    let older = searches.len().saturating_sub(SNAPSHOT_PREVIEWS);
+    for search in &mut searches[..older] {
+        search.results = Vec::new();
+    }
+}
+
 pub fn format(path: &str) -> &'static str {
     match path
         .rsplit('.')

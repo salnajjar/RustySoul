@@ -78,6 +78,26 @@ fn an_empty_local_share_is_indexed_browsed_and_uploaded_without_payload() {
     init_peer(&mut p, "P");
     send(&mut p, 15, &[]);
     receive_code(&mut p, 16);
+    // These are real responses, not silence: release the offer immediately
+    // and allow a subsequent request from this same user to take its slot.
+    for (reason, status) in [
+        ("Complete", "completed"),
+        ("Cancelled", "cancelled"),
+        ("Busy", "failed"),
+    ] {
+        send(&mut p, 43, &string("public\\empty.txt"));
+        let offer = receive_code(&mut p, 40);
+        let mut reject = offer[4..8].to_vec();
+        reject.push(0);
+        reject.extend(string(reason));
+        send(&mut p, 41, &reject);
+        wait_for(&h, |s| {
+            s.uploads
+                .iter()
+                .any(|t| t.path == "public\\empty.txt" && t.status == status)
+        });
+        assert_eq!(h.snapshot.borrow().traffic.uploaded, 0);
+    }
     send(&mut p, 43, &string("public\\empty.txt"));
     let offer = receive_code(&mut p, 40);
     assert_eq!(
@@ -91,7 +111,13 @@ fn an_empty_local_share_is_indexed_browsed_and_uploaded_without_payload() {
     let token = u32::from_le_bytes(offer[4..8].try_into().unwrap());
     let mut accept = token.to_le_bytes().to_vec();
     accept.push(1);
-    send(&mut p, 41, &accept);
+    // A fresh control connection still belongs to the same peer. Upload
+    // correlation must survive replacement of the actor that sent the offer.
+    let mut replacement = TcpStream::connect(("127.0.0.1", peer_port)).unwrap();
+    init_peer(&mut replacement, "P");
+    send(&mut replacement, 15, &[]);
+    receive_code(&mut replacement, 16);
+    send(&mut replacement, 41, &accept);
     file_listener.set_nonblocking(true).unwrap();
     let end = Instant::now() + Duration::from_secs(5);
     let mut f = loop {
@@ -137,5 +163,6 @@ fn an_empty_local_share_is_indexed_browsed_and_uploaded_without_payload() {
     h.stop.send(()).unwrap();
     h.thread.join().unwrap();
     drop(p);
+    drop(replacement);
     server.join().unwrap();
 }

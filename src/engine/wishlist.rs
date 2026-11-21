@@ -72,6 +72,7 @@ impl Engine {
             self.view.searches.push(view);
         }
         self.searches.insert(key.clone(), (query, Instant::now()));
+        crate::search::trim_previews(&mut self.view.searches);
         self.wishlist_last_sent = now();
         let tx = crate::store::write_transaction(&self.store.connection)?;
         tx.execute(
@@ -133,15 +134,6 @@ impl Engine {
         if self.view.searches.iter().any(|s| s.id == key && s.pinned) {
             return Ok(());
         }
-        ensure!(
-            self.view
-                .searches
-                .iter()
-                .filter(|s| s.wishlist_id.is_none() || s.pinned)
-                .count()
-                < self.config.limits.searches,
-            "Close an existing search before opening wishlist results"
-        );
         if let Some(s) = self.view.searches.iter_mut().find(|s| s.id == key) {
             s.pinned = true;
         } else {
@@ -160,6 +152,7 @@ impl Engine {
                 ..Default::default()
             });
         }
+        crate::search::trim_previews(&mut self.view.searches);
         Ok(())
     }
 }

@@ -19,6 +19,22 @@ impl Client {
     ) {
         let own_username = own_username.to_string();
         match operation {
+            ClientOperation::PeerTransferResponse { token, peer, allowed, reason } => {
+                let upload = match client_context.write_safe() {
+                    Ok(mut ctx) => ctx.answer_upload_offer(&peer.username, token, allowed, reason),
+                    Err(_) => return,
+                };
+                match upload {
+                    Some(true) => Self::on_transfers(
+                        ClientOperation::StartUpload { token }, client_context, &own_username,
+                    ),
+                    Some(false) => Self::pump_upload_queue(client_context),
+                    None if allowed => Self::on_transfers(
+                        ClientOperation::DownloadFromPeer(token, peer, true), client_context, &own_username,
+                    ),
+                    None => {},
+                }
+            }
             ClientOperation::DownloadFromPeer(token, peer, allowed) => {
                 let maybe_download = match client_context.write_safe() {
                     Ok(mut ctx) => {

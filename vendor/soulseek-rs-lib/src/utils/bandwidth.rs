@@ -9,12 +9,81 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Actual payload and non-overlapping streaming time for one upload recipient.
+/// Queueing, connection negotiation and idle gaps between files are excluded.
+#[derive(Debug, Clone)]
+pub struct UploadRateSample {
+    pub username: String,
+    pub bytes: u64,
+    pub seconds: f64,
+    pub last_payload: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct Bandwidth {
     payload_bytes: AtomicU64,
-    payload_users: Mutex<HashMap<String, u64>>,
+    payload_users: Mutex<PayloadCounters>,
     state: Mutex<State>,
     changed: Condvar,
+}
+#[derive(Default)]
+struct PayloadCounters {
+    bytes: HashMap<String, u64>,
+    uploads: HashMap<String, UploadMeasurement>,
+}
+#[derive(Default)]
+struct UploadMeasurement {
+    streams: usize,
+    since: Option<Instant>,
+    elapsed: Duration,
+    bytes: u64,
+    group_has_payload: bool,
+    last_payload: Option<Instant>,
+}
+impl UploadMeasurement {
+    fn begin(&mut self, now: Instant) {
+        if self.streams == 0 {
+            self.since = Some(now);
+            self.group_has_payload = false;
+        }
+        self.streams += 1;
+    }
+    fn end(&mut self, now: Instant) {
+        self.streams -= 1;
+        if self.streams == 0
+            && let Some(since) = self.since.take()
+            && self.group_has_payload
+        {
+            self.elapsed += now.saturating_duration_since(since);
+        }
+    }
+    fn record(&mut self, bytes: u64, now: Instant) {
+        self.bytes += bytes;
+        self.group_has_payload = true;
+        self.last_payload = Some(now);
+    }
+    fn take(&mut self, username: &str, now: Instant) -> Option<UploadRateSample> {
+        // Retain pre-first-byte timing until data arrives; an empty/failed
+        // stream cannot create a recipient or dilute an earlier average.
+        if self.group_has_payload
+            && let Some(since) = self.since
+        {
+            self.elapsed += now.saturating_duration_since(since);
+            self.since = Some(now);
+        }
+        if self.streams == 0 {
+            self.since = None;
+        }
+        let elapsed = std::mem::take(&mut self.elapsed);
+        let bytes = std::mem::take(&mut self.bytes);
+        let last_payload = self.last_payload.take();
+        (elapsed > Duration::ZERO || bytes > 0).then(|| UploadRateSample {
+            username: username.into(),
+            bytes,
+            seconds: elapsed.as_secs_f64(),
+            last_payload,
+        })
+    }
 }
 #[derive(Default)]
 struct State {
@@ -69,7 +138,26 @@ impl Bucket {
 }
 impl Bandwidth {
     pub fn take_payload_users(&self) -> HashMap<String, u64> {
-        std::mem::take(&mut *self.payload_users.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(
+            &mut self
+                .payload_users
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .bytes,
+        )
+    }
+    pub fn take_upload_rate_samples(&self) -> Vec<UploadRateSample> {
+        let mut counters = self.payload_users.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let samples = counters
+            .uploads
+            .iter_mut()
+            .filter_map(|(name, measurement)| measurement.take(name, now))
+            .collect();
+        counters
+            .uploads
+            .retain(|_, measurement| measurement.streams > 0);
+        samples
     }
     pub fn payload_bytes(&self) -> u64 {
         self.payload_bytes.load(Ordering::Relaxed)
@@ -116,6 +204,7 @@ impl Bandwidth {
         UserBandwidth {
             owner: self.clone(),
             name: name.into(),
+            measurement_name: name.to_ascii_lowercase(),
             transferred: Arc::default(),
         }
     }
@@ -123,7 +212,22 @@ impl Bandwidth {
 pub struct UserBandwidth {
     owner: Arc<Bandwidth>,
     name: String,
+    measurement_name: String,
     pub transferred: Arc<AtomicU64>,
+}
+pub(crate) struct UploadTiming<'a>(&'a UserBandwidth);
+impl Drop for UploadTiming<'_> {
+    fn drop(&mut self) {
+        let mut counters = self
+            .0
+            .owner
+            .payload_users
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(measurement) = counters.uploads.get_mut(&self.0.measurement_name) {
+            measurement.end(Instant::now());
+        }
+    }
 }
 pub struct Allowance<'a> {
     user: &'a UserBandwidth,
@@ -131,6 +235,20 @@ pub struct Allowance<'a> {
     used: usize,
 }
 impl UserBandwidth {
+    /// Begin only after the file handshake, for a file with actual bytes left.
+    pub(crate) fn begin_upload(&self) -> UploadTiming<'_> {
+        let mut counters = self
+            .owner
+            .payload_users
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        counters
+            .uploads
+            .entry(self.measurement_name.clone())
+            .or_default()
+            .begin(Instant::now());
+        UploadTiming(self)
+    }
     pub fn take(&self, want: usize, cancelled: impl Fn() -> bool) -> io::Result<Allowance<'_>> {
         if want == 0 {
             return Ok(Allowance {
@@ -181,7 +299,10 @@ impl Allowance<'_> {
                 .payload_users
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *users.entry(self.user.name.clone()).or_default() += self.used as u64;
+            *users.bytes.entry(self.user.name.clone()).or_default() += self.used as u64;
+            if let Some(measurement) = users.uploads.get_mut(&self.user.measurement_name) {
+                measurement.record(self.used as u64, Instant::now());
+            }
         }
         self.user
             .transferred
@@ -222,6 +343,72 @@ impl Drop for UserBandwidth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upload_time_is_the_union_of_parallel_files_and_sampling_never_counts_it_twice() {
+        let at = Instant::now();
+        let mut user = UploadMeasurement::default();
+        user.begin(at);
+        user.record(100, at + Duration::from_secs(1));
+        user.begin(at + Duration::from_secs(2));
+        user.record(200, at + Duration::from_secs(3));
+        let first = user.take("alice", at + Duration::from_secs(4)).unwrap();
+        assert_eq!((first.bytes, first.seconds), (300, 4.));
+        user.end(at + Duration::from_secs(5));
+        user.end(at + Duration::from_secs(8));
+        let second = user.take("alice", at + Duration::from_secs(20)).unwrap();
+        assert_eq!((second.bytes, second.seconds), (0, 4.));
+        assert!(second.last_payload.is_none());
+        assert_eq!(
+            first.seconds + second.seconds,
+            8.,
+            "not 11 summed file-seconds or 20 idle-inclusive seconds"
+        );
+        assert!(user.take("alice", at + Duration::from_secs(30)).is_none());
+    }
+    #[test]
+    fn idle_gaps_and_empty_attempts_add_no_upload_samples() {
+        let at = Instant::now();
+        let mut user = UploadMeasurement::default();
+        user.begin(at);
+        assert!(user.take("alice", at + Duration::from_secs(1)).is_none());
+        user.record(200, at + Duration::from_secs(2));
+        user.end(at + Duration::from_secs(2));
+        user.begin(at + Duration::from_secs(100));
+        user.record(300, at + Duration::from_secs(103));
+        user.end(at + Duration::from_secs(103));
+        user.begin(at + Duration::from_secs(104));
+        user.end(at + Duration::from_secs(134)); // a separate zero-byte failure
+        let sample = user.take("alice", at + Duration::from_secs(200)).unwrap();
+        assert_eq!((sample.bytes, sample.seconds), (500, 5.));
+        let mut empty = UploadMeasurement::default();
+        empty.begin(at);
+        empty.end(at + Duration::from_secs(30));
+        assert!(empty.take("empty", at + Duration::from_secs(31)).is_none());
+    }
+    #[test]
+    fn recipient_measurements_preserve_payload_accounting_and_merge_username_case() {
+        let limits = Arc::new(Bandwidth::default());
+        let alice = limits.for_user("alice");
+        let alias = limits.for_user("ALICE");
+        {
+            let _one = alice.begin_upload();
+            let _two = alias.begin_upload();
+            alice.take(100, || false).unwrap().finish(100);
+            alias.take(200, || false).unwrap().finish(200);
+        }
+        assert_eq!(limits.payload_bytes(), 300);
+        assert_eq!(limits.take_payload_users().values().sum::<u64>(), 300);
+        let samples = limits.take_upload_rate_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            (samples[0].username.as_str(), samples[0].bytes),
+            ("alice", 300)
+        );
+        assert!(samples[0].seconds > 0.);
+        assert!(samples[0].last_payload.is_some());
+        assert!(limits.take_upload_rate_samples().is_empty());
+        assert!(limits.payload_users.lock().unwrap().uploads.is_empty());
+    }
     #[test]
     fn one_users_files_share_one_bucket_and_other_users_have_independent_caps() {
         let limits = Arc::new(Bandwidth::default());

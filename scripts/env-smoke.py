@@ -52,6 +52,6 @@ with tempfile.TemporaryDirectory(prefix='rustysoul-env-smoke-') as temporary:
                 process.wait(timeout=20)
                 assert process.returncode==0
     with sqlite3.connect(root/'state/rustysoul.sqlite3') as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0]==16
+        assert db.execute('PRAGMA user_version').fetchone()[0]==17
         assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
     print('Native environment-only validation, HTTP binding, health, private storage and restart passed without a TOML file.')

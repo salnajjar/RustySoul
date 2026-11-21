@@ -27,16 +27,13 @@ use crate::message::server::UserLeftRoomHandler;
 use crate::message::server::WatchUserHandler;
 use crate::message::server::WishListIntervalHandler;
 use crate::message::server::{
-    CantCreateRoomHandler, OwnRoomStandingHandler, RoomMembersHandler,
-    RoomOperatorsHandler, RoomRosterChangeHandler,
+    CantCreateRoomHandler, OwnRoomStandingHandler, RoomMembersHandler, RoomOperatorsHandler,
+    RoomRosterChangeHandler,
 };
+use crate::message::server::{GetUserStatsHandler, GetUserStatusHandler, RoomListHandler};
 use crate::message::server::{
-    GetUserStatsHandler, GetUserStatusHandler, RoomListHandler,
-};
-use crate::message::server::{
-    GlobalRecommendationsHandler, ItemRecommendationsHandler,
-    ItemSimilarUsersHandler, RecommendationsHandler, SimilarUsersHandler,
-    UserInterestsHandler,
+    GlobalRecommendationsHandler, ItemRecommendationsHandler, ItemSimilarUsersHandler,
+    RecommendationsHandler, SimilarUsersHandler, UserInterestsHandler,
 };
 use crate::message::server::{
     RoomTickerAddedHandler, RoomTickerRemovedHandler, RoomTickersHandler,
@@ -46,8 +43,8 @@ use crate::message::{Message, MessageReader};
 use crate::peer::ConnectionType;
 use crate::peer::Peer;
 use crate::types::{
-    ClientVersion, Recommendation, RoomEvent, RoomInfo, RoomUserStats,
-    SessionLoss, SessionWatch, SimilarUser, UserInterests,
+    ClientVersion, Recommendation, RoomEvent, RoomInfo, RoomUserStats, SessionLoss, SessionWatch,
+    SimilarUser, UserInterests,
 };
 use crate::utils::lock::RwLockExt;
 
@@ -125,8 +122,17 @@ pub enum ServerMessage {
     },
     PrivateMessageReceived(UserMessage),
     RoomListReceived(Vec<RoomInfo>),
-    PrivateRoomList { owned: Vec<RoomInfo>, member: Vec<RoomInfo>, operated: Vec<String> },
-    PrivateRoomJoined { room: String, users: Vec<String>, owner: String, operators: Vec<String> },
+    PrivateRoomList {
+        owned: Vec<RoomInfo>,
+        member: Vec<RoomInfo>,
+        operated: Vec<String>,
+    },
+    PrivateRoomJoined {
+        room: String,
+        users: Vec<String>,
+        owner: String,
+        operators: Vec<String>,
+    },
     RoomInvitationsEnabled(bool),
     /// A `GetUserStatus` (code 7) reply.
     UserStatusReceived {
@@ -292,6 +298,31 @@ pub struct ServerActor {
     shared_file_count: u32,
     session: SessionWatch,
     cancel: CancelHandle,
+    pending_write: std::collections::VecDeque<u8>,
+    write_progress_at: Option<Instant>,
+}
+
+const MAX_SERVER_PENDING_WRITE: usize = 8 * 1024 * 1024;
+const SERVER_WRITE_BUDGET: usize = 64 * 1024;
+const SERVER_WRITE_STALL: Duration = Duration::from_secs(120);
+
+/// Retain exactly the unsent suffix, including across short writes and EAGAIN.
+/// Bound both work and bytes so socket pressure cannot starve incoming replies.
+fn write_pending<W: Write>(writer: &mut W, pending: &mut std::collections::VecDeque<u8>) -> io::Result<usize> {
+    let mut written = 0;
+    for _ in 0..16 {
+        if pending.is_empty() || written == SERVER_WRITE_BUDGET { break; }
+        let bytes = pending.as_slices().0;
+        let bytes = &bytes[..bytes.len().min(SERVER_WRITE_BUDGET - written)];
+        match writer.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "server stopped accepting data")),
+            Ok(n) => { pending.drain(..n); written += n; },
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(written)
 }
 
 /// The messages a client sends right after a successful login: its shared-file
@@ -305,10 +336,7 @@ fn post_login_messages(
     shared_files: u32,
 ) -> Vec<Message> {
     let mut messages = vec![
-        MessageFactory::build_shared_folders_message(
-            shared_folders,
-            shared_files,
-        ),
+        MessageFactory::build_shared_folders_message(shared_folders, shared_files),
         MessageFactory::build_set_status_message(2),
     ];
     if enable_listen {
@@ -345,6 +373,8 @@ impl ServerActor {
             shared_file_count,
             session: SessionWatch::default(),
             cancel: CancelHandle::new(),
+            pending_write: Default::default(),
+            write_progress_at: None,
         }
     }
 
@@ -362,9 +392,7 @@ impl ServerActor {
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| {
-                addrs.find_map(|addr| {
-                    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()
-                })
+                addrs.find_map(|addr| TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok())
             });
         let Some(stream) = stream else {
             error!("[server] Failed to connect to {}", self.address);
@@ -394,8 +422,7 @@ impl ServerActor {
     }
 
     fn initialize_dispatcher(&mut self) {
-        let (dispatcher_sender, dispatcher_receiver) =
-            std::sync::mpsc::channel::<ServerMessage>();
+        let (dispatcher_sender, dispatcher_receiver) = std::sync::mpsc::channel::<ServerMessage>();
 
         self.dispatcher_receiver = Some(dispatcher_receiver);
         self.dispatcher_sender = Some(dispatcher_sender.clone());
@@ -477,9 +504,7 @@ impl ServerActor {
     }
 
     pub fn file_search(&mut self, token: u32, query: &str) {
-        self.queue_message(MessageFactory::build_file_search_message(
-            token, query,
-        ));
+        self.queue_message(MessageFactory::build_file_search_message(token, query));
     }
 
     fn process_read(&mut self) {
@@ -492,8 +517,16 @@ impl ServerActor {
                 return;
             };
 
+            // Room rosters and peer-address bursts must not be throttled to
+            // one KiB per 100 ms tick. Bound the batch to keep control work fair.
             match self.reader.read_from_socket(stream) {
-                Ok(()) => {}
+                Ok(()) => {
+                    for _ in 1..64 {
+                        if self.reader.read_from_socket(stream).is_err() {
+                            break;
+                        }
+                    }
+                }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
                     debug!("[server] Read operation timed out",);
@@ -522,10 +555,7 @@ impl ServerActor {
                         "[server] ← Message #{}: {:?}",
                         extracted_count,
                         message
-                            .get_message_name(
-                                MessageType::Server,
-                                message.get_message_code()
-                            )
+                            .get_message_name(MessageType::Server, message.get_message_code())
                             .map_err(|e| e.to_string())
                     );
                     if let Some(ref dispatcher) = self.dispatcher {
@@ -535,10 +565,7 @@ impl ServerActor {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "[server] Error extracting message: {}. Disconnecting.",
-                        e
-                    );
+                    warn!("[server] Error extracting message: {}. Disconnecting.", e);
                     self.disconnect_with_error();
                     return;
                 }
@@ -553,9 +580,7 @@ impl ServerActor {
 
     /// Forward a chat-room event to the client operations loop.
     fn forward_room_event(&self, event: RoomEvent) {
-        if let Err(e) =
-            self.client_channel.send(ClientOperation::RoomEvent(event))
-        {
+        if let Err(e) = self.client_channel.send(ClientOperation::RoomEvent(event)) {
             error!("[server] Error forwarding room event to client: {}", e);
         }
     }
@@ -577,31 +602,51 @@ impl ServerActor {
         let Some(_live) = cancel.live() else {
             return;
         };
-        let Some(stream) = self.stream.as_mut() else {
+        if self.stream.is_none() {
             error!("[server] Cannot send message: stream is None");
             return;
-        };
+        }
 
         trace!(
             "[server] ➡ {:?}",
             message
                 .get_message_name(
                     MessageType::Server,
-                    u32::from_le_bytes(
-                        message.get_slice(0, 4).try_into().unwrap_or_default()
-                    )
+                    u32::from_le_bytes(message.get_slice(0, 4).try_into().unwrap_or_default())
                 )
                 .map_err(|e| e.to_string())
         );
 
-        if let Err(e) = stream.write_all(&message.get_buffer()) {
-            error!("[server] Error writing message: {}. Disconnecting.", e);
+        let bytes = message.get_buffer();
+        if bytes.len() > MAX_SERVER_PENDING_WRITE.saturating_sub(self.pending_write.len()) {
+            error!("[server] Outbound queue exceeded its bounded capacity. Disconnecting.");
             self.disconnect_with_error();
             return;
         }
+        if self.pending_write.is_empty() { self.write_progress_at = Some(Instant::now()); }
+        self.pending_write.extend(bytes);
+        drop(_live);
+        self.flush_pending_write();
+    }
 
-        if let Err(e) = stream.flush() {
-            error!("[server] Error flushing stream: {}. Disconnecting.", e);
+    fn flush_pending_write(&mut self) {
+        let cancel = self.cancel.clone();
+        let Some(_live) = cancel.live() else { return; };
+        if self.pending_write.is_empty() { self.write_progress_at = None; return; }
+        let Some(stream) = self.stream.as_mut() else { return; };
+        match write_pending(stream, &mut self.pending_write) {
+            Ok(n) if n > 0 => self.write_progress_at = Some(Instant::now()),
+            Ok(_) => {},
+            Err(e) => {
+                error!("[server] Error writing message: {}. Disconnecting.", e);
+                self.disconnect_with_error();
+                return;
+            }
+        }
+        if self.pending_write.is_empty() {
+            self.write_progress_at = None;
+        } else if self.write_progress_at.is_some_and(|at| at.elapsed() >= SERVER_WRITE_STALL) {
+            error!("[server] Outgoing data made no progress for 120 seconds. Disconnecting.");
             self.disconnect_with_error();
         }
     }
@@ -635,6 +680,8 @@ impl ServerActor {
         self.dispatcher_sender = None;
         self.dispatcher_receiver = None;
         self.queued_messages.clear();
+        self.pending_write.clear();
+        self.write_progress_at = None;
         self.reader = MessageReader::new();
         if let Ok(mut ctx) = self.context.write_safe() {
             ctx.logged_in = None;
@@ -642,8 +689,7 @@ impl ServerActor {
     }
 
     fn check_connection_status(&mut self) {
-        let ConnectionState::Connecting { since } = self.connection_state
-        else {
+        let ConnectionState::Connecting { since } = self.connection_state else {
             return;
         };
 
@@ -714,7 +760,9 @@ impl Actor for ServerActor {
             }
             ConnectionState::Connected => {
                 if self.stream.is_some() {
+                    self.flush_pending_write();
                     self.process_read();
+                    self.flush_pending_write();
                 }
             }
             ConnectionState::Disconnected => {}

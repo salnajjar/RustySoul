@@ -1,7 +1,7 @@
 use super::{
-    ActiveUpload, Arc, BrokeredUpload, Client, ClientContext, DownloadStatus,
-    PeerMessage, RwLock, RwLockExt, ServerMessage, collect_failed_tokens,
-    debug, error, warn, next_connect_token, next_upload_token, thread,
+    ActiveUpload, Arc, BrokeredUpload, Client, ClientContext, DownloadStatus, PeerMessage, RwLock,
+    RwLockExt, ServerMessage, collect_failed_tokens, debug, error, next_connect_token,
+    next_upload_token, thread, warn,
 };
 use crate::message::server::MessageFactory;
 use crate::peer::{ConnectionType, upload_peer};
@@ -13,64 +13,236 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 impl Client {
     /// None measures normally; a positive value overrides it; zero withholds speed.
     /// Configuration alone sends no server report and does not inflate upload counts.
-    pub fn configure_upload_speed_reporting(&self, override_speed:Option<u32>, measured:u32) {
-        if let Ok(mut ctx)=self.context.write_safe() {ctx.reported_upload_speed=override_speed;ctx.measured_upload_speed=Some(measured);}
+    pub fn configure_upload_speed_reporting(&self, override_speed: Option<u32>, measured: u32) {
+        if let Ok(mut ctx) = self.context.write_safe() {
+            ctx.reported_upload_speed = override_speed;
+            ctx.measured_upload_speed = Some(measured);
+        }
     }
-    pub fn own_upload_availability(&self)->(u32,bool) {
-        self.context.read_safe().map(|ctx|(ctx.upload_queue.len() as u32,ctx.has_free_upload_slot())).unwrap_or((0,false))
+    pub fn own_upload_availability(&self) -> (u32, bool) {
+        self.context
+            .read_safe()
+            .map(|ctx| (ctx.upload_queue.len() as u32, ctx.has_free_upload_slot()))
+            .unwrap_or((0, false))
     }
     /// Local manual preferences apply within the protocol's privilege classes;
     /// already offered/streaming transfers are not interrupted.
-    pub fn set_upload_queue_order(&self, rules: Vec<(String,String,i8,u64)>) {
-        if let Ok(mut ctx)=self.context.write_safe() {
-            ctx.upload_order=rules.into_iter().take(32768).map(|(u,p,priority,position)|((u.to_lowercase(),p),(priority.clamp(-1,1),position))).collect();
-            let order=ctx.upload_order.clone();
-            for job in &mut ctx.upload_queue { job.manual_order=order.get(&(job.downloader.to_lowercase(),job.virtual_path.clone())).copied(); }
+    pub fn set_upload_queue_order(&self, rules: Vec<(String, String, i8, u64)>) {
+        if let Ok(mut ctx) = self.context.write_safe() {
+            ctx.upload_order = rules
+                .into_iter()
+                .take(32768)
+                .map(|(u, p, priority, position)| {
+                    ((u.to_lowercase(), p), (priority.clamp(-1, 1), position))
+                })
+                .collect();
+            let order = ctx.upload_order.clone();
+            for job in &mut ctx.upload_queue {
+                job.manual_order = order
+                    .get(&(job.downloader.to_lowercase(), job.virtual_path.clone()))
+                    .copied();
+            }
         }
         Self::pump_upload_queue(&self.context);
     }
 
     /// Atomically cancel this user's queued, offered and streaming uploads.
     /// An empty path list means all their current requests, never other users.
-    pub fn cancel_uploads(&self,username:&str,paths:&[String])->Vec<crate::types::UploadInfo>{
-        let matches=|u:&str,p:&str|u==username&&(paths.is_empty()||paths.iter().any(|path|path==p));
-        let (cancelled,registry)=if let Ok(mut ctx)=self.context.write_safe(){
-            let mut cancelled=std::collections::BTreeMap::<String,crate::types::UploadInfo>::new();
-            for mut info in ctx.queued_uploads(){if matches(&info.username,&info.filename){info.status=UploadStatus::Cancelled;cancelled.insert(info.filename.clone(),info);}}
-            ctx.upload_queue.retain(|u|!matches(&u.downloader,&u.virtual_path));
-            ctx.uploads.retain(|_,u|{if !matches(&u.downloader,&u.virtual_path){return true;}cancelled.insert(u.virtual_path.clone(),crate::types::UploadInfo{username:u.downloader.clone(),filename:u.virtual_path.clone(),size:u.size,bytes_sent:0,speed_bytes_per_sec:0.,status:UploadStatus::Cancelled});false});
-            for active in ctx.active_uploads.values_mut().filter(|u|matches(&u.username,&u.filename)&&matches!(u.status,UploadStatus::InProgress)){
-                active.cancel.store(true,Ordering::Relaxed);active.status=UploadStatus::Cancelled;cancelled.insert(active.filename.clone(),crate::types::UploadInfo{username:active.username.clone(),filename:active.filename.clone(),size:active.size,bytes_sent:active.bytes_sent.load(Ordering::Relaxed),speed_bytes_per_sec:0.,status:UploadStatus::Cancelled});
+    pub fn cancel_uploads(
+        &self,
+        username: &str,
+        paths: &[String],
+    ) -> Vec<crate::types::UploadInfo> {
+        let matches = |u: &str, p: &str| {
+            u == username && (paths.is_empty() || paths.iter().any(|path| path == p))
+        };
+        let (cancelled, registry) = if let Ok(mut ctx) = self.context.write_safe() {
+            let mut cancelled =
+                std::collections::BTreeMap::<String, crate::types::UploadInfo>::new();
+            for mut info in ctx.queued_uploads() {
+                if matches(&info.username, &info.filename) {
+                    info.status = UploadStatus::Cancelled;
+                    cancelled.insert(info.filename.clone(), info);
+                }
             }
-            let cancelled=cancelled.into_values().collect::<Vec<_>>();ctx.upload_events.extend(cancelled.iter().cloned());let overflow=ctx.upload_events.len().saturating_sub(256);ctx.upload_events.drain(..overflow);(cancelled,ctx.peer_registry.clone())
-        }else{return Vec::new();};
-        if let Some(registry)=registry{for u in &cancelled{let message=crate::message::Message::new().write_int32(50).write_string(&u.filename).write_string("Cancelled").clone();let _=registry.send_to_peer(username,PeerMessage::SendMessage(message));}}
-        Self::pump_upload_queue(&self.context);cancelled
+            ctx.upload_queue
+                .retain(|u| !matches(&u.downloader, &u.virtual_path));
+            ctx.uploads.retain(|_, u| {
+                if !matches(&u.downloader, &u.virtual_path) {
+                    return true;
+                }
+                cancelled.insert(
+                    u.virtual_path.clone(),
+                    crate::types::UploadInfo {
+                        username: u.downloader.clone(),
+                        filename: u.virtual_path.clone(),
+                        size: u.size,
+                        bytes_sent: 0,
+                        speed_bytes_per_sec: 0.,
+                        status: UploadStatus::Cancelled,
+                    },
+                );
+                false
+            });
+            for active in ctx.active_uploads.values_mut().filter(|u| {
+                matches(&u.username, &u.filename) && matches!(u.status, UploadStatus::InProgress)
+            }) {
+                active.cancel.store(true, Ordering::Relaxed);
+                active.status = UploadStatus::Cancelled;
+                cancelled.insert(
+                    active.filename.clone(),
+                    crate::types::UploadInfo {
+                        username: active.username.clone(),
+                        filename: active.filename.clone(),
+                        size: active.size,
+                        bytes_sent: active.bytes_sent.load(Ordering::Relaxed),
+                        speed_bytes_per_sec: 0.,
+                        status: UploadStatus::Cancelled,
+                    },
+                );
+            }
+            let cancelled = cancelled.into_values().collect::<Vec<_>>();
+            ctx.upload_events
+                .extend(cancelled.iter().cloned().map(Arc::new));
+            let overflow = ctx.upload_events.len().saturating_sub(256);
+            ctx.upload_events.drain(..overflow);
+            (cancelled, ctx.peer_registry.clone())
+        } else {
+            return Vec::new();
+        };
+        if let Some(registry) = registry {
+            for u in &cancelled {
+                let message = crate::message::Message::new()
+                    .write_int32(50)
+                    .write_string(&u.filename)
+                    .write_string("Cancelled")
+                    .clone();
+                let _ = registry.send_to_peer(username, PeerMessage::SendMessage(message));
+            }
+        }
+        Self::pump_upload_queue(&self.context);
+        cancelled
     }
     /// Deny these peers share listings and new uploads; cancel any offered or
     /// running transfers. The legacy protocol does not cryptographically authenticate names.
-    pub fn set_banned_users(&self,users:Vec<String>) {
-        if let Ok(mut ctx)=self.context.write_safe(){
-            ctx.banned_users=users.into_iter().map(|u|u.to_ascii_lowercase()).collect();
-            let users:Vec<_>=ctx.banned_users.iter().cloned().collect();
-            for user in users {ctx.release_upload_slots(&user);for active in ctx.active_uploads.values_mut().filter(|u|u.username.eq_ignore_ascii_case(&user)&&matches!(u.status,crate::types::UploadStatus::InProgress)){active.cancel.store(true,std::sync::atomic::Ordering::Relaxed);active.status=crate::types::UploadStatus::Cancelled;}}
+    pub fn set_banned_users(&self, users: Vec<String>) {
+        if let Ok(mut ctx) = self.context.write_safe() {
+            ctx.banned_users = users.into_iter().map(|u| u.to_ascii_lowercase()).collect();
+            let users: Vec<_> = ctx.banned_users.iter().cloned().collect();
+            for user in users {
+                ctx.release_upload_slots(&user);
+                for active in ctx.active_uploads.values_mut().filter(|u| {
+                    u.username.eq_ignore_ascii_case(&user)
+                        && matches!(u.status, crate::types::UploadStatus::InProgress)
+                }) {
+                    active
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    active.status = crate::types::UploadStatus::Cancelled;
+                }
+            }
         }
         Self::pump_upload_queue(&self.context);
     }
-    pub(super) fn cancel_upload_request(&self,username:&str,filename:&str)->bool {
-        let mut changed=false;
-        if let Ok(mut ctx)=self.context.write_safe(){
-            let before=ctx.upload_queue.len();ctx.upload_queue.retain(|u|u.downloader!=username||u.virtual_path!=filename);changed|=before!=ctx.upload_queue.len();
-            ctx.uploads.retain(|_,u|{let remove=u.downloader==username&&u.virtual_path==filename;changed|=remove;!remove});
-            for u in ctx.active_uploads.values_mut().filter(|u|u.username==username&&u.filename==filename&&matches!(u.status,crate::types::UploadStatus::InProgress)){u.cancel.store(true,std::sync::atomic::Ordering::Relaxed);u.status=crate::types::UploadStatus::Cancelled;changed=true;}
+    pub(super) fn cancel_upload_request(&self, username: &str, filename: &str) -> bool {
+        let mut changed = false;
+        if let Ok(mut ctx) = self.context.write_safe() {
+            let before = ctx.upload_queue.len();
+            ctx.upload_queue
+                .retain(|u| u.downloader != username || u.virtual_path != filename);
+            changed |= before != ctx.upload_queue.len();
+            ctx.uploads.retain(|_, u| {
+                let remove = u.downloader == username && u.virtual_path == filename;
+                changed |= remove;
+                !remove
+            });
+            for u in ctx.active_uploads.values_mut().filter(|u| {
+                u.username == username
+                    && u.filename == filename
+                    && matches!(u.status, crate::types::UploadStatus::InProgress)
+            }) {
+                u.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                u.status = crate::types::UploadStatus::Cancelled;
+                changed = true;
+            }
         }
-        if changed{Self::pump_upload_queue(&self.context);}changed
+        if changed {
+            Self::pump_upload_queue(&self.context);
+        }
+        changed
     }
     /// Forget finished upload records only. Active sockets and files are never touched.
-    pub fn clear_upload_history(&self, status:&str)->usize {
-        let matches=|s:&UploadStatus|match s {UploadStatus::Completed=>status=="all"||status=="completed",UploadStatus::Cancelled=>status=="all"||status=="cancelled",UploadStatus::Failed(_)=>status=="all"||status=="failed",UploadStatus::TimedOut(_)=>status=="all"||status=="timed_out",_=>false};
-        if let Ok(mut ctx)=self.context.write_safe(){let before=ctx.active_uploads.len();ctx.active_uploads.retain(|_,u|!matches(&u.status));ctx.upload_events.retain(|u|!matches(&u.status));before-ctx.active_uploads.len()}else{0}
+    pub fn clear_upload_history(&self, status: &str) -> usize {
+        let matches = |s: &UploadStatus| match s {
+            UploadStatus::Completed => status == "all" || status == "completed",
+            UploadStatus::Cancelled => status == "all" || status == "cancelled",
+            UploadStatus::Failed(_) => status == "all" || status == "failed",
+            UploadStatus::TimedOut(_) => status == "all" || status == "timed_out",
+            _ => false,
+        };
+        if let Ok(mut ctx) = self.context.write_safe() {
+            let before = ctx.active_uploads.len();
+            ctx.active_uploads.retain(|_, u| !matches(&u.status));
+            ctx.upload_events.retain(|u| !matches(&u.status));
+            before - ctx.active_uploads.len()
+        } else {
+            0
+        }
     }
+    /// Take a non-destructive, atomic snapshot for durable history consumers.
+    pub fn upload_snapshot(&self) -> crate::error::Result<super::UploadSnapshot> {
+        let ctx = self.context.read_safe()?;
+        let mut current = Vec::new();
+        let mut terminal = Vec::new();
+        let mut active: Vec<_> = ctx.active_uploads.iter().collect();
+        active.sort_unstable_by_key(|(token, _)| **token);
+        let events = ctx.upload_events.clone();
+        let mut uploads: Vec<_> = events.iter().map(|e| (**e).clone()).collect();
+        for (&token, upload) in active {
+            current.push((upload.username.clone(), upload.filename.clone()));
+            if !matches!(upload.status, UploadStatus::InProgress) {
+                terminal.push((token, upload.bytes_sent.clone()));
+            }
+            uploads.push(upload.info());
+        }
+        let mut queued = ctx.queued_uploads();
+        queued.extend(ctx.uploads.values().map(|u| crate::types::UploadInfo {
+            username: u.downloader.clone(),
+            filename: u.virtual_path.clone(),
+            size: u.size,
+            bytes_sent: 0,
+            speed_bytes_per_sec: 0.,
+            status: UploadStatus::Queued(0),
+        }));
+        current.extend(
+            queued
+                .iter()
+                .map(|u| (u.username.clone(), u.filename.clone())),
+        );
+        uploads.extend(queued);
+        Ok(super::UploadSnapshot {
+            uploads,
+            terminal,
+            events,
+            current,
+        })
+    }
+    /// Forget only terminal attempts and exact events included in a saved snapshot.
+    pub fn acknowledge_upload_snapshot(&self, snapshot: super::UploadSnapshot) {
+        if let Ok(mut ctx) = self.context.write_safe() {
+            for (token, identity) in snapshot.terminal {
+                if ctx.active_uploads.get(&token).is_some_and(|u| {
+                    Arc::ptr_eq(&u.bytes_sent, &identity)
+                        && !matches!(u.status, UploadStatus::InProgress)
+                }) {
+                    ctx.active_uploads.remove(&token);
+                }
+            }
+            ctx.upload_events
+                .retain(|e| !snapshot.events.iter().any(|seen| Arc::ptr_eq(e, seen)));
+        }
+    }
+
     /// Whether the server listed `username` as privileged. Privileged peers are
     /// served before everyone else.
     #[must_use]
@@ -90,7 +262,9 @@ impl Client {
         let Some(handle) = &self.server_handle else {
             return Err(crate::error::SoulseekRs::NotConnected);
         };
-        handle.send(super::ServerMessage::CheckPrivileges).map_err(|_| crate::error::SoulseekRs::NotConnected)?;
+        handle
+            .send(super::ServerMessage::CheckPrivileges)
+            .map_err(|_| crate::error::SoulseekRs::NotConnected)?;
         Ok(())
     }
 
@@ -109,7 +283,8 @@ impl Client {
     #[must_use]
     pub fn own_privilege_observation(&self) -> Option<(u32, u64)> {
         self.context.read_safe().ok().and_then(|ctx| {
-            ctx.own_privileges.map(|seconds| (seconds, ctx.own_privileges_revision))
+            ctx.own_privileges
+                .map(|seconds| (seconds, ctx.own_privileges_revision))
         })
     }
 
@@ -132,12 +307,17 @@ impl Client {
         }
         Self::pump_upload_queue(&self.context);
     }
-    pub fn set_upload_slots_per_user(&self, slots:usize) {
-        if let Ok(mut ctx)=self.context.write_safe(){ctx.upload_slots_per_user=slots.max(1);}
+    pub fn set_upload_slots_per_user(&self, slots: usize) {
+        if let Ok(mut ctx) = self.context.write_safe() {
+            ctx.upload_slots_per_user = slots.max(1);
+        }
         Self::pump_upload_queue(&self.context);
     }
-    pub fn set_upload_limits(&self,total:usize,per_user:usize) {
-        if let Ok(mut ctx)=self.context.write_safe(){ctx.upload_slots=total;ctx.upload_slots_per_user=per_user.max(1);}
+    pub fn set_upload_limits(&self, total: usize, per_user: usize) {
+        if let Ok(mut ctx) = self.context.write_safe() {
+            ctx.upload_slots = total;
+            ctx.upload_slots_per_user = per_user.max(1);
+        }
         Self::pump_upload_queue(&self.context);
     }
 
@@ -160,11 +340,35 @@ impl Client {
     /// Called whenever the queue or the slot count could have changed: a new
     /// request, a finished transfer, or a privileged list that re-ranked who is
     /// waiting.
-    pub(crate) fn pump_upload_queue(
-        client_context: &Arc<RwLock<ClientContext>>,
-    ) {
-        let (registry, offers,denials) = match client_context.write_safe() {
-            Ok(mut ctx) => {let (registry,offers)=ctx.pump_uploads(next_upload_token);let denials=std::mem::take(&mut ctx.sharing_denials);(registry,offers,denials)},
+    pub(crate) fn pump_upload_queue(client_context: &Arc<RwLock<ClientContext>>) {
+        let (registry, offers, denials, reconnects, sender) = match client_context.write_safe() {
+            Ok(mut ctx) => {
+                let registry = ctx.peer_registry.clone();
+                let waiting: std::collections::HashSet<_> = ctx.upload_queue.iter()
+                    .map(|j| j.downloader.clone()).collect();
+                ctx.upload_reconnects.retain(|user, at| waiting.contains(user)
+                    && at.elapsed() < std::time::Duration::from_secs(60)
+                    && registry.as_ref().is_some_and(|r| !r.contains(user)));
+                let mut reconnects = Vec::new();
+                if ctx.has_free_upload_slot() && registry.is_some() && ctx.server_sender.is_some() {
+                    let limit = ctx.upload_slots.min(8);
+                    for index in super::upload_queue::serve_order(&ctx.upload_queue) {
+                        if ctx.upload_reconnects.len() >= limit { break; }
+                        let user = ctx.upload_queue[index].downloader.clone();
+                        if registry.as_ref().is_some_and(|r| !r.contains(&user))
+                            && !ctx.upload_reconnects.contains_key(&user)
+                            && !ctx.pending_connect_tokens.values().any(|(name, _)| name == &user)
+                            && matches!(ctx.upload_decision(&user), super::sharing::Decision::Allow)
+                        {
+                            ctx.upload_reconnects.insert(user.clone(), std::time::Instant::now());
+                            reconnects.push(user);
+                        }
+                    }
+                }
+                let (registry, offers) = ctx.pump_uploads(next_upload_token);
+                let denials = std::mem::take(&mut ctx.sharing_denials);
+                (registry, offers, denials, reconnects, ctx.server_sender.clone())
+            }
             Err(e) => {
                 error!("[client] pump_upload_queue write: {}", e);
                 return;
@@ -173,16 +377,36 @@ impl Client {
         let Some(registry) = registry else {
             return;
         };
-        for (user,path,reason) in denials{let message=crate::message::Message::new().write_int32(50).write_string(&path).write_string(&reason).clone();let _=registry.send_to_peer(&user,PeerMessage::SendMessage(message));}
+        if let Some(sender) = sender {
+            for user in reconnects {
+                let _ = sender.send(ServerMessage::GetPeerAddress(user));
+            }
+        }
+        for (user, path, reason) in denials {
+            let message = crate::message::Message::new()
+                .write_int32(50)
+                .write_string(&path)
+                .write_string(&reason)
+                .clone();
+            let _ = registry.send_to_peer(&user, PeerMessage::SendMessage(message));
+        }
         for offer in offers {
-            let _ = registry.send_to_peer(
-                &offer.requester_key,
-                PeerMessage::ServeUpload {
+            // Bind the job and enqueue the nonblocking mailbox message under
+            // one context guard. Disconnect processing cannot run between
+            // selecting the actor and recording who owns this delivery.
+            if let Ok(mut ctx) = client_context.write_safe() {
+                let Some(job) = ctx.uploads.get_mut(&offer.token) else { continue; };
+                if job.delivery_started.is_none() { continue; }
+                let sent = registry.get_peer_with_id(&offer.requester_key).is_some_and(|(id, handle)| {
+                    job.delivery_actor = Some(id);
+                    handle.send(PeerMessage::ServeUpload {
                     token: offer.token,
                     filename: offer.virtual_path,
                     size: offer.size,
-                },
-            );
+                    }).is_ok()
+                });
+                if !sent { ctx.requeue_upload_offer(offer.token); }
+            }
         }
     }
 
@@ -202,12 +426,13 @@ impl Client {
             return;
         };
         let bytes_sent = Arc::new(AtomicU64::new(0));
-        let bandwidth=ctx.upload_speed_limit.for_user(&job.downloader);
+        let bandwidth = ctx.upload_speed_limit.for_user(&job.downloader);
         let cancel = Arc::new(AtomicBool::new(false));
         ctx.active_uploads.insert(
             token,
             ActiveUpload {
                 payload_bytes: bandwidth.transferred.clone(),
+                rate: Default::default(),
                 username: job.downloader.clone(),
                 filename: job.virtual_path.clone(),
                 size: job.size,
@@ -247,12 +472,7 @@ impl Client {
                 }
             };
             if claimed
-                .compare_exchange(
-                    false,
-                    true,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
                 return;
@@ -285,11 +505,7 @@ impl Client {
         let connect_token = next_connect_token();
         let (claimed, sender) = match context.write_safe() {
             Ok(mut ctx) => (
-                ctx.add_brokered_upload(
-                    connect_token,
-                    token,
-                    real_path.to_path_buf(),
-                ),
+                ctx.add_brokered_upload(connect_token, token, real_path.to_path_buf()),
                 ctx.server_sender.clone(),
             ),
             Err(_) => return None,
@@ -299,11 +515,7 @@ impl Client {
             return None;
         };
         let _ = sender.send(ServerMessage::SendMessage(
-            MessageFactory::build_connect_to_peer(
-                connect_token,
-                downloader,
-                ConnectionType::F,
-            ),
+            MessageFactory::build_connect_to_peer(connect_token, downloader, ConnectionType::F),
         ));
         Some((connect_token, claimed))
     }
@@ -322,10 +534,13 @@ impl Client {
             client_context.write_safe().ok().and_then(|mut ctx| {
                 let active = ctx.active_uploads.get_mut(&upload.token)?;
                 active.started = std::time::Instant::now();
-                let name=active.username.clone();let sent=active.bytes_sent.clone();let cancel=active.cancel.clone();
-                let bandwidth=ctx.upload_speed_limit.for_user(&name);
-                ctx.active_uploads.get_mut(&upload.token)?.payload_bytes=bandwidth.transferred.clone();
-                Some((sent,cancel,bandwidth))
+                let name = active.username.clone();
+                let sent = active.bytes_sent.clone();
+                let cancel = active.cancel.clone();
+                let bandwidth = ctx.upload_speed_limit.for_user(&name);
+                ctx.active_uploads.get_mut(&upload.token)?.payload_bytes =
+                    bandwidth.transferred.clone();
+                Some((sent, cancel, bandwidth))
             })
         else {
             return;
@@ -340,12 +555,7 @@ impl Client {
                 &cancel,
                 Some(&bandwidth),
             );
-            Self::finish_upload(
-                &context,
-                upload.token,
-                &upload.real_path,
-                result,
-            );
+            Self::finish_upload(&context, upload.token, &upload.real_path, result);
         });
     }
 
@@ -355,25 +565,37 @@ impl Client {
         token: u32,
         reason: &str,
     ) {
-        Self::record_upload_failure(client_context, token, UploadStatus::Failed(reason.to_string()));
+        Self::record_upload_failure(
+            client_context,
+            token,
+            UploadStatus::Failed(reason.to_string()),
+        );
     }
     pub(crate) fn timeout_upload(context: &Arc<RwLock<ClientContext>>, token: u32, reason: &str) {
         Self::record_upload_failure(context, token, UploadStatus::TimedOut(reason.to_string()));
     }
-    fn record_upload_failure(context: &Arc<RwLock<ClientContext>>, token: u32, status: UploadStatus) {
+    fn record_upload_failure(
+        context: &Arc<RwLock<ClientContext>>,
+        token: u32,
+        status: UploadStatus,
+    ) {
         if let Ok(mut ctx) = context.write_safe()
             && let Some(upload) = ctx.active_uploads.get_mut(&token)
-            && matches!(upload.status,UploadStatus::InProgress)
+            && matches!(upload.status, UploadStatus::InProgress)
         {
             if upload.cancel.load(Ordering::Relaxed) {
-                upload.status=UploadStatus::Cancelled;
+                upload.status = UploadStatus::Cancelled;
             } else {
-            match &status {
-                UploadStatus::TimedOut(reason) => warn!("[client] upload {token} to {}: {reason}",upload.username),
-                UploadStatus::Failed(reason) => error!("[client] upload {token} to {}: {reason}",upload.username),
-                _ => {},
-            }
-            upload.status = status;
+                match &status {
+                    UploadStatus::TimedOut(reason) => {
+                        warn!("[client] upload {token} to {}: {reason}", upload.username)
+                    }
+                    UploadStatus::Failed(reason) => {
+                        error!("[client] upload {token} to {}: {reason}", upload.username)
+                    }
+                    _ => {}
+                }
+                upload.status = status;
             }
         }
         Self::pump_upload_queue(context);
@@ -395,33 +617,55 @@ impl Client {
         {
             // UI cancellation and a late socket error may race. Cancellation
             // already acknowledged to the user must remain terminal and quiet.
-            if upload.cancel.load(Ordering::Relaxed) || matches!(upload.status,UploadStatus::Cancelled) {
-                upload.status=UploadStatus::Cancelled;
-            } else if matches!(upload.status,UploadStatus::InProgress) {
-                upload.status=match &result {
-                    Ok(_) => { completed_now = true; UploadStatus::Completed },
-                    Err(e) if e.kind()==std::io::ErrorKind::Interrupted => UploadStatus::Cancelled,
-                    Err(e) if e.kind()==std::io::ErrorKind::TimedOut => {
-                        let reason=e.to_string();
-                        warn!("[client] upload {}: {reason}",real_path.display());
+            if matches!(upload.status, UploadStatus::Cancelled)
+                || (upload.cancel.load(Ordering::Relaxed)
+                    && matches!(upload.status, UploadStatus::InProgress))
+            {
+                upload.status = UploadStatus::Cancelled;
+            } else if matches!(upload.status, UploadStatus::InProgress) {
+                upload.status = match &result {
+                    Ok(_) => {
+                        completed_now = true;
+                        UploadStatus::Completed
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        UploadStatus::Cancelled
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        let reason = e.to_string();
+                        warn!("[client] upload {}: {reason}", real_path.display());
                         UploadStatus::TimedOut(reason)
                     }
-                    Err(e) if matches!(e.kind(),std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::WriteZero) => {
-                        let reason="The receiving peer disconnected before the upload finished.".to_owned();
-                        warn!("[client] upload {}: {reason}",real_path.display());
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::WriteZero
+                        ) =>
+                    {
+                        let reason = "The receiving peer disconnected before the upload finished."
+                            .to_owned();
+                        warn!("[client] upload {}: {reason}", real_path.display());
                         UploadStatus::Failed(reason)
                     }
                     Err(e) => {
-                        error!("[client] serve {}: {}",real_path.display(),e);
+                        error!("[client] serve {}: {}", real_path.display(), e);
                         UploadStatus::Failed(e.to_string())
                     }
                 };
             }
             let secs = upload.started.elapsed().as_secs_f64();
-            if let Some(bytes) = streamed && secs>0.0 && completed_now {
-                let speed=(bytes as f64/secs) as u32;ctx.last_upload_speed=speed;
-                let advertised=ctx.advertised_upload_speed();
-                report=ctx.server_sender.clone().map(|s|(s,advertised));
+            if let Some(bytes) = streamed
+                && secs > 0.0
+                && completed_now
+            {
+                let speed = (bytes as f64 / secs) as u32;
+                ctx.last_upload_speed = speed;
+                let advertised = ctx.advertised_upload_speed();
+                report = ctx.server_sender.clone().map(|s| (s, advertised));
             }
         }
         // The server folds each finished upload's rate into the average
@@ -442,9 +686,7 @@ impl Client {
         filename: Option<&str>,
     ) {
         let failed_tokens = match client_context.read_safe() {
-            Ok(context) => {
-                collect_failed_tokens(&context.downloads, username, filename)
-            }
+            Ok(context) => collect_failed_tokens(&context.downloads, username, filename),
             Err(e) => {
                 error!("[client] process_failed_uploads read: {}", e);
                 return;
@@ -478,61 +720,278 @@ impl Client {
 mod outcomes {
     use super::*;
     #[test]
+    fn waiting_uploads_reconnect_missing_controls_without_expiring_unsent_offers_or_flooding() {
+        let client = Client::new("me", "password");
+        let (operations, _receiver) = std::sync::mpsc::channel();
+        let (server, messages) = std::sync::mpsc::channel();
+        {
+            let mut ctx = client.context.write().unwrap();
+            ctx.peer_registry = Some(crate::actor::peer_registry::PeerRegistry::new(
+                std::sync::Arc::new(crate::actor::ActorSystem::new()), operations, "me".into(),
+            ));
+            ctx.server_sender = Some(server);
+            ctx.upload_slots = 2;
+            for name in ["alice", "bob", "carol"] {
+                ctx.enqueue_upload(name, "f.flac", "f.flac".into(), 100);
+            }
+        }
+        for _ in 0..10 { Client::pump_upload_queue(&client.context); }
+        assert!(matches!(messages.try_recv(), Ok(ServerMessage::GetPeerAddress(user)) if user == "alice"));
+        assert!(matches!(messages.try_recv(), Ok(ServerMessage::GetPeerAddress(user)) if user == "bob"));
+        assert!(messages.try_recv().is_err());
+        let mut ctx = client.context.write().unwrap();
+        assert!(ctx.uploads.is_empty());
+        assert_eq!(ctx.upload_queue.len(), 3);
+        assert_eq!(ctx.upload_reconnects.len(), 2);
+        assert!(!ctx.expire_stale_offers(std::time::Instant::now()+std::time::Duration::from_secs(60)));
+    }
+    #[test]
     fn configured_rates_are_reported_once_per_completed_upload_including_hidden_zero() {
-        for (override_speed,expected) in [(None,123456),(Some(555000),555000),(Some(0),0)] {
-            let client=client_with_upload(UploadStatus::InProgress);
-            let (tx,rx)=std::sync::mpsc::channel();
-            client.context.write().unwrap().server_sender=Some(tx);
-            client.configure_upload_speed_reporting(override_speed,123456);
-            assert!(rx.try_recv().is_err(),"Configuration must not add phantom uploaded files");
-            assert_eq!(client.context.read().unwrap().advertised_upload_speed(),expected);
-            Client::finish_upload(&client.context,7,Path::new("a.flac"),Ok(10));
-            let ServerMessage::SendMessage(message)=rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() else {panic!("expected rate report")};
-            assert_eq!(message,MessageFactory::build_send_upload_speed(expected));
-            Client::finish_upload(&client.context,7,Path::new("a.flac"),Ok(10));
-            assert!(rx.try_recv().is_err(),"Duplicate completion must not count twice");
-            client.configure_upload_speed_reporting(None,321000);
-            assert_eq!(client.context.read().unwrap().advertised_upload_speed(),321000);
+        for (override_speed, expected) in [(None, 123456), (Some(555000), 555000), (Some(0), 0)] {
+            let client = client_with_upload(UploadStatus::InProgress);
+            let (tx, rx) = std::sync::mpsc::channel();
+            client.context.write().unwrap().server_sender = Some(tx);
+            client.configure_upload_speed_reporting(override_speed, 123456);
+            assert!(
+                rx.try_recv().is_err(),
+                "Configuration must not add phantom uploaded files"
+            );
+            assert_eq!(
+                client.context.read().unwrap().advertised_upload_speed(),
+                expected
+            );
+            Client::finish_upload(&client.context, 7, Path::new("a.flac"), Ok(10));
+            let ServerMessage::SendMessage(message) =
+                rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected rate report")
+            };
+            assert_eq!(message, MessageFactory::build_send_upload_speed(expected));
+            Client::finish_upload(&client.context, 7, Path::new("a.flac"), Ok(10));
+            assert!(
+                rx.try_recv().is_err(),
+                "Duplicate completion must not count twice"
+            );
+            client.configure_upload_speed_reporting(None, 321000);
+            assert_eq!(
+                client.context.read().unwrap().advertised_upload_speed(),
+                321000
+            );
         }
     }
     #[test]
     fn own_queue_statistics_cover_the_entire_queue_without_preview_limits() {
-        let client=Client::new("fixture","password");
-        assert_eq!(client.own_upload_availability().0,0);
+        let client = Client::new("fixture", "password");
+        assert_eq!(client.own_upload_availability().0, 0);
         {
-            let mut ctx=client.context.write().unwrap();
+            let mut ctx = client.context.write().unwrap();
             for seq in 0..900 {
-                ctx.upload_queue.push(super::super::upload_queue::QueuedUpload {
-                    downloader:"alice".into(),virtual_path:format!("{seq}.flac"),real_path:Path::new("unused").into(),size:10,privileged:false,seq,manual_order:None
-                });
+                ctx.upload_queue
+                    .push(super::super::upload_queue::QueuedUpload {
+                        downloader: "alice".into(),
+                        virtual_path: format!("{seq}.flac"),
+                        real_path: Path::new("unused").into(),
+                        size: 10,
+                        privileged: false,
+                        seq,
+                        manual_order: None,
+                    });
             }
         }
-        assert_eq!(client.own_upload_availability().0,900);
+        assert_eq!(client.own_upload_availability().0, 900);
     }
-    fn client_with_upload(status:UploadStatus)->Client {
-        let client=Client::new("fixture","password");
-        client.context.write().unwrap().active_uploads.insert(7,ActiveUpload{payload_bytes:Arc::new(AtomicU64::new(0)),username:"alice".into(),filename:"a.flac".into(),size:10,bytes_sent:Arc::new(AtomicU64::new(4)),cancel:Arc::new(AtomicBool::new(false)),status,started:std::time::Instant::now()});client
+    fn client_with_upload(status: UploadStatus) -> Client {
+        let client = Client::new("fixture", "password");
+        client.context.write().unwrap().active_uploads.insert(
+            7,
+            ActiveUpload {
+                rate: Default::default(),
+                payload_bytes: Arc::new(AtomicU64::new(0)),
+                username: "alice".into(),
+                filename: "a.flac".into(),
+                size: 10,
+                bytes_sent: Arc::new(AtomicU64::new(4)),
+                cancel: Arc::new(AtomicBool::new(false)),
+                status,
+                started: std::time::Instant::now(),
+            },
+        );
+        client
     }
     #[test]
     fn a_late_socket_error_or_broker_timeout_cannot_overwrite_acknowledged_cancellation() {
-        let client=client_with_upload(UploadStatus::InProgress);assert_eq!(client.cancel_uploads("alice",&[]).len(),1);
-        Client::finish_upload(&client.context,7,Path::new("a.flac"),Err(std::io::ErrorKind::ConnectionReset.into()));
-        Client::timeout_upload(&client.context,7,"Late timeout");
-        assert!(matches!(client.uploads()[0].status,UploadStatus::Cancelled));assert_eq!(client.uploads()[0].bytes_sent,4);
+        let client = client_with_upload(UploadStatus::InProgress);
+        assert_eq!(client.cancel_uploads("alice", &[]).len(), 1);
+        Client::finish_upload(
+            &client.context,
+            7,
+            Path::new("a.flac"),
+            Err(std::io::ErrorKind::ConnectionReset.into()),
+        );
+        Client::timeout_upload(&client.context, 7, "Late timeout");
+        assert!(matches!(
+            client.uploads()[0].status,
+            UploadStatus::Cancelled
+        ));
+        assert_eq!(client.uploads()[0].bytes_sent, 4);
     }
     #[test]
     fn timed_out_uploads_can_be_cleared_by_type_and_disconnections_have_useful_details() {
-        let client=client_with_upload(UploadStatus::InProgress);
-        Client::finish_upload(&client.context,7,Path::new("a.flac"),Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"The receiving peer did not send its resume offset within 30 seconds.")));
-        assert!(matches!(&client.uploads()[0].status,UploadStatus::TimedOut(reason) if reason.contains("resume offset")));assert_eq!(client.uploads()[0].speed_bytes_per_sec,0.);
-        assert_eq!(client.clear_upload_history("failed"),0);assert_eq!(client.clear_upload_history("timed_out"),1);assert!(client.uploads().is_empty());
-        let client=client_with_upload(UploadStatus::InProgress);Client::finish_upload(&client.context,7,Path::new("a.flac"),Err(std::io::ErrorKind::ConnectionReset.into()));
-        assert!(matches!(&client.uploads()[0].status,UploadStatus::Failed(reason) if reason=="The receiving peer disconnected before the upload finished."));
+        let client = client_with_upload(UploadStatus::InProgress);
+        Client::finish_upload(
+            &client.context,
+            7,
+            Path::new("a.flac"),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "The receiving peer did not send its resume offset within 30 seconds.",
+            )),
+        );
+        assert!(
+            matches!(&client.uploads()[0].status,UploadStatus::TimedOut(reason) if reason.contains("resume offset"))
+        );
+        assert_eq!(client.uploads()[0].speed_bytes_per_sec, 0.);
+        assert_eq!(client.clear_upload_history("failed"), 0);
+        assert_eq!(client.clear_upload_history("timed_out"), 1);
+        assert!(client.uploads().is_empty());
+        let client = client_with_upload(UploadStatus::InProgress);
+        Client::finish_upload(
+            &client.context,
+            7,
+            Path::new("a.flac"),
+            Err(std::io::ErrorKind::ConnectionReset.into()),
+        );
+        assert!(
+            matches!(&client.uploads()[0].status,UploadStatus::Failed(reason) if reason=="The receiving peer disconnected before the upload finished.")
+        );
     }
     #[test]
     fn genuine_local_file_errors_remain_failures_and_success_stays_completed() {
-        let client=client_with_upload(UploadStatus::InProgress);Client::finish_upload(&client.context,7,Path::new("a.flac"),Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"Library file not readable")));
-        assert!(matches!(&client.uploads()[0].status,UploadStatus::Failed(reason) if reason=="Library file not readable"));
-        let client=client_with_upload(UploadStatus::InProgress);Client::finish_upload(&client.context,7,Path::new("a.flac"),Ok(10));assert!(matches!(client.uploads()[0].status,UploadStatus::Completed));
+        let client = client_with_upload(UploadStatus::InProgress);
+        Client::finish_upload(
+            &client.context,
+            7,
+            Path::new("a.flac"),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Library file not readable",
+            )),
+        );
+        assert!(
+            matches!(&client.uploads()[0].status,UploadStatus::Failed(reason) if reason=="Library file not readable")
+        );
+        let client = client_with_upload(UploadStatus::InProgress);
+        Client::finish_upload(&client.context, 7, Path::new("a.flac"), Ok(10));
+        assert!(matches!(
+            client.uploads()[0].status,
+            UploadStatus::Completed
+        ));
+    }
+    #[test]
+    fn finishing_between_snapshot_and_acknowledgement_does_not_lose_terminal_state() {
+        let client = client_with_upload(UploadStatus::InProgress);
+        let before = client.upload_snapshot().unwrap();
+        assert!(matches!(
+            before.uploads()[0].status,
+            UploadStatus::InProgress
+        ));
+        Client::finish_upload(
+            &client.context,
+            7,
+            Path::new("a.flac"),
+            Err(std::io::ErrorKind::ConnectionReset.into()),
+        );
+        client.acknowledge_upload_snapshot(before);
+        let terminal = client.upload_snapshot().unwrap();
+        assert!(matches!(
+            terminal.uploads()[0].status,
+            UploadStatus::Failed(_)
+        ));
+        assert_eq!(terminal.uploads()[0].speed_bytes_per_sec, 0.);
+        // A database failure means no acknowledgement: observation is repeatable.
+        assert!(matches!(
+            client.upload_snapshot().unwrap().uploads()[0].status,
+            UploadStatus::Failed(_)
+        ));
+        client.acknowledge_upload_snapshot(terminal);
+        assert!(client.upload_snapshot().unwrap().uploads().is_empty());
+    }
+    #[test]
+    fn snapshot_acknowledgement_preserves_events_added_while_history_is_saved() {
+        let client = client_with_upload(UploadStatus::InProgress);
+        let before = client.upload_snapshot().unwrap();
+        client.cancel_uploads("alice", &[]);
+        client.acknowledge_upload_snapshot(before);
+        let terminal = client.upload_snapshot().unwrap();
+        assert!(
+            terminal
+                .uploads()
+                .iter()
+                .any(|u| matches!(u.status, UploadStatus::Cancelled))
+        );
+        client.acknowledge_upload_snapshot(terminal);
+        assert!(client.upload_snapshot().unwrap().uploads().is_empty());
+    }
+    #[test]
+    fn offline_receiver_fails_upload_and_late_worker_cannot_change_it_to_cancelled() {
+        let client = client_with_upload(UploadStatus::InProgress);
+        client
+            .context
+            .write()
+            .unwrap()
+            .apply_user_status("ALICE".into(), 1, false);
+        assert!(matches!(
+            client.uploads()[0].status,
+            UploadStatus::InProgress
+        ));
+        client
+            .context
+            .write()
+            .unwrap()
+            .apply_user_status("ALICE".into(), 0, false);
+        assert!(
+            client.context.read().unwrap().active_uploads[&7]
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+        Client::finish_upload(
+            &client.context,
+            7,
+            Path::new("a.flac"),
+            Err(std::io::ErrorKind::Interrupted.into()),
+        );
+        let info = client.uploads().remove(0);
+        assert!(matches!(info.status, UploadStatus::Failed(ref text) if text.contains("offline")));
+        assert_eq!(info.bytes_sent, 4);
+        assert_eq!(info.speed_bytes_per_sec, 0.);
+    }
+    #[test]
+    fn offline_watch_reply_fails_only_that_receivers_pending_and_active_uploads() {
+        let client = client_with_upload(UploadStatus::InProgress);
+        {
+            let mut ctx = client.context.write().unwrap();
+            ctx.enqueue_upload("Alice", "next.flac", "next.flac".into(), 30);
+            ctx.enqueue_upload("bob", "other.flac", "other.flac".into(), 40);
+            ctx.apply_watched_user("ALICE".into(), true, Some(0), None, None, None);
+        }
+        let snapshot = client.upload_snapshot().unwrap();
+        assert!(
+            snapshot
+                .uploads()
+                .iter()
+                .any(|u| u.filename == "next.flac" && matches!(u.status, UploadStatus::Failed(_)))
+        );
+        assert!(
+            snapshot
+                .uploads()
+                .iter()
+                .any(|u| u.username == "bob" && matches!(u.status, UploadStatus::Queued(_)))
+        );
+        assert!(
+            snapshot
+                .uploads()
+                .iter()
+                .any(|u| u.filename == "a.flac" && matches!(u.status, UploadStatus::Failed(_)))
+        );
     }
 }

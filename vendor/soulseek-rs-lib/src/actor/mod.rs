@@ -1,6 +1,9 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
-use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
 use std::time::{Duration, Instant};
 
 use crate::{error, trace};
@@ -35,7 +38,7 @@ pub trait Actor: Send + 'static {
 #[derive(Clone)]
 pub struct ActorHandle<M: Send> {
     pub(crate) sender: Sender<ActorMessage<M>>,
-    pub(crate) stopped:Arc<AtomicBool>,
+    pub(crate) stopped: Arc<AtomicBool>,
 }
 
 impl<M: Send> ActorHandle<M> {
@@ -47,7 +50,7 @@ impl<M: Send> ActorHandle<M> {
 
     /// Request actor to stop gracefully
     pub fn stop(&self) -> Result<(), String> {
-        self.stopped.store(true,Ordering::Release);
+        self.stopped.store(true, Ordering::Release);
         self.sender
             .send(ActorMessage::Stop)
             .map_err(|e| format!("Failed to send stop signal: {e}"))
@@ -88,11 +91,7 @@ impl ActorSystem {
 
     /// Spawn a new actor with initialization callback and return its handle
     /// The callback receives the actor handle before `on_start` is called
-    pub fn spawn_with_handle<A: Actor, F>(
-        &self,
-        actor: A,
-        init: F,
-    ) -> ActorHandle<A::Message>
+    pub fn spawn_with_handle<A: Actor, F>(&self, actor: A, init: F) -> ActorHandle<A::Message>
     where
         F: FnOnce(&mut A, ActorHandle<A::Message>) + Send + 'static,
     {
@@ -103,7 +102,10 @@ impl ActorSystem {
                 // A handle nobody serves: sends fail, which callers of the
                 // infallible spawn already tolerate.
                 let (sender, _) = channel();
-                ActorHandle { sender,stopped:Arc::default() }
+                ActorHandle {
+                    sender,
+                    stopped: Arc::default(),
+                }
             }
         }
     }
@@ -121,13 +123,24 @@ impl ActorSystem {
     where
         F: FnOnce(&mut A, ActorHandle<A::Message>) + Send + 'static,
     {
-        self.try_spawn_guarded(actor,init,())
+        self.try_spawn_guarded(actor, init, ())
     }
-    pub(crate) fn try_spawn_guarded<A:Actor,F,G:Send+'static>(&self,mut actor:A,init:F,guard:G)->std::io::Result<ActorHandle<A::Message>> where F:FnOnce(&mut A,ActorHandle<A::Message>)+Send+'static {
+    pub(crate) fn try_spawn_guarded<A: Actor, F, G: Send + 'static>(
+        &self,
+        mut actor: A,
+        init: F,
+        guard: G,
+    ) -> std::io::Result<ActorHandle<A::Message>>
+    where
+        F: FnOnce(&mut A, ActorHandle<A::Message>) + Send + 'static,
+    {
         let (sender, receiver) = channel::<ActorMessage<A::Message>>();
-        let handle = ActorHandle { sender,stopped:Arc::default() };
+        let handle = ActorHandle {
+            sender,
+            stopped: Arc::default(),
+        };
         let handle_for_init = handle.clone();
-        let stopped=handle.stopped.clone();
+        let stopped = handle.stopped.clone();
 
         thread::Builder::new()
             .name("soulseek-actor".to_string())
@@ -135,7 +148,7 @@ impl ActorSystem {
             .spawn(move || {
                 init(&mut actor, handle_for_init);
                 actor.on_start();
-                Self::run_actor_loop(&mut actor, receiver,&stopped);
+                Self::run_actor_loop(&mut actor, receiver, &stopped);
                 actor.on_stop();
                 drop(guard);
             })?;
@@ -146,7 +159,7 @@ impl ActorSystem {
     fn run_actor_loop<A: Actor>(
         actor: &mut A,
         receiver: Receiver<ActorMessage<A::Message>>,
-        stopped:&AtomicBool,
+        stopped: &AtomicBool,
     ) {
         let tick_interval = Duration::from_millis(100);
         let mut last_tick = Instant::now();
@@ -160,24 +173,20 @@ impl ActorSystem {
                     actor.handle(msg);
                 }
                 Ok(ActorMessage::Stop) => {
-                    trace!(
-                        "[actor_system] Received Stop message, breaking loop"
-                    );
+                    trace!("[actor_system] Received Stop message, breaking loop");
                     break;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if last_tick.elapsed() >= tick_interval {
-                        tick_count += 1;
-                        actor.tick();
-                        last_tick = Instant::now();
-                    }
-                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    trace!(
-                        "[actor_system] Channel disconnected, breaking loop"
-                    );
+                    trace!("[actor_system] Channel disconnected, breaking loop");
                     break;
                 }
+            }
+            // A busy mailbox must not starve socket reads or connection timers.
+            if last_tick.elapsed() >= tick_interval && !stopped.load(Ordering::Acquire) {
+                tick_count += 1;
+                actor.tick();
+                last_tick = Instant::now();
             }
         }
         trace!(
@@ -192,6 +201,44 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_busy_mailbox_does_not_starve_socket_ticks() {
+        struct Busy {
+            handled: Arc<AtomicUsize>,
+            ticks: Arc<AtomicUsize>,
+        }
+        impl Actor for Busy {
+            type Message = ();
+            fn handle(&mut self, _: ()) {
+                std::thread::sleep(Duration::from_millis(2));
+                self.handled.fetch_add(1, Ordering::SeqCst);
+            }
+            fn tick(&mut self) {
+                self.ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let handled = Arc::new(AtomicUsize::new(0));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let actor = ActorSystem::new().spawn(Busy {
+            handled: handled.clone(),
+            ticks: ticks.clone(),
+        });
+        for _ in 0..200 {
+            actor.send(()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handled.load(Ordering::SeqCst) < 80 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let observed = ticks.load(Ordering::SeqCst);
+        actor.stop().unwrap();
+        assert!(
+            observed > 0,
+            "continuous messages prevented socket progress"
+        );
+    }
 
     struct CounterActor {
         count: Arc<AtomicUsize>,

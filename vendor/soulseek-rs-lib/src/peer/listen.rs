@@ -34,10 +34,10 @@ const MAX_HANDSHAKES: usize = 32;
 const MAX_PEER_INIT_BYTES: usize = 4096;
 
 #[derive(Clone)]
-struct ConnectionContext {
-    client_sender: Sender<ClientOperation>,
-    client_context: Arc<RwLock<ClientContext>>,
-    own_username: String,
+pub(crate) struct ConnectionContext {
+    pub(crate) client_sender: Sender<ClientOperation>,
+    pub(crate) client_context: Arc<RwLock<ClientContext>>,
+    pub(crate) own_username: String,
 }
 
 struct PeerInitData {
@@ -132,9 +132,7 @@ fn wait_for_download_registration(
 ) -> Option<Download> {
     loop {
         let download = match client_context.write_safe() {
-            Ok(mut context) => {
-                context.downloads.claim_for_peer(token, username)
-            }
+            Ok(mut context) => context.downloads.claim_for_peer(token, username),
             Err(e) => {
                 error!("[listener] client context lock: {}", e);
                 return None;
@@ -158,12 +156,57 @@ fn wait_for_download_registration(
     }
 }
 
-fn handle_peer_connection(
+pub(crate) fn handle_peer_connection(
     peer: Peer,
-    stream: TcpStream,
-    reader: MessageReader,
+    mut stream: TcpStream,
+    mut reader: MessageReader,
     context: &ConnectionContext,
 ) -> bool {
+    // A search reply is usually a short-lived connection. It must not need a
+    // long-lived actor slot already occupied by transfers and queued users.
+    // Keep this path under the listener's bounded worker permit, and preserve
+    // the normal actor path for peers with requests/transfer state to serve.
+    let standalone = context
+        .client_context
+        .read_safe()
+        .is_ok_and(|ctx| !ctx.protected_peers().contains(&peer.username));
+    if standalone {
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+        let mut consumed = false;
+        for _ in 0..64 {
+            if reader.peek_message_code().is_some_and(|code| code != 9) {
+                break;
+            }
+            if reader.peek_message_code() == Some(9)
+                && let Ok(Some(mut message)) = reader.extract_message()
+            {
+                message.set_pointer(8);
+                if let Ok(result) = crate::types::SearchResult::new_from_message(&mut message)
+                    && let Ok(mut ctx) = context.client_context.write_safe()
+                {
+                    ctx.accept_search_result(result);
+                }
+                consumed = true;
+                if reader.buffer_len() == 0 {
+                    break;
+                }
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let _ = stream.set_read_timeout(Some(remaining));
+                if reader.read_from_socket(&mut stream).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = stream.set_read_timeout(None);
+        if consumed && reader.buffer_len() == 0 {
+            return false;
+        }
+    }
     // The peer actor multiplexes socket reads with its mailbox on a single
     // thread: `tick()` reads the socket, but outgoing messages (e.g. a queued
     // QueueUpload for a download) are delivered through the mailbox between
@@ -176,12 +219,7 @@ fn handle_peer_connection(
     }
     stream.set_nodelay(true).ok();
 
-    Client::register_peer_or_fail(
-        &context.client_context,
-        peer,
-        Some(stream),
-        Some(reader),
-    )
+    Client::register_peer_or_fail(&context.client_context, peer, Some(stream), Some(reader))
 }
 
 fn handle_file_connection(
@@ -198,8 +236,7 @@ fn handle_file_connection(
         token, peer
     );
 
-    if let Err(e) = wait_for_transfer_token(&mut stream, &mut reader, deadline)
-    {
+    if let Err(e) = wait_for_transfer_token(&mut stream, &mut reader, deadline) {
         debug!(
             "[listener:{}:{}] no transfer token arrived: {e}",
             peer.host, peer.port
@@ -207,17 +244,19 @@ fn handle_file_connection(
         return;
     }
 
-    let download =
-        take_transfer_token(&mut reader).and_then(|transfer_token| {
-            wait_for_download_registration(
-                &context.client_context,
-                transfer_token,
-                &peer.username,
-                Instant::now() + TOKEN_REGISTRATION_TIMEOUT,
-            )
-        });
+    let download = take_transfer_token(&mut reader).and_then(|transfer_token| {
+        wait_for_download_registration(
+            &context.client_context,
+            transfer_token,
+            &peer.username,
+            Instant::now() + TOKEN_REGISTRATION_TIMEOUT,
+        )
+    });
     let Some(download) = download else {
-        debug!("[listener:{}] ignored an unrequested, expired or already claimed file connection", peer.username);
+        debug!(
+            "[listener:{}] ignored an unrequested, expired or already claimed file connection",
+            peer.username
+        );
         return;
     };
     drop(permit);
@@ -230,11 +269,8 @@ fn handle_file_connection(
         context.own_username.clone(),
     );
 
-    match download_peer.download_file(
-        context.client_context.clone(),
-        Some(download),
-        Some(stream),
-    ) {
+    match download_peer.download_file(context.client_context.clone(), Some(download), Some(stream))
+    {
         Ok((download, filename)) => {
             info!(
                 "Successfully downloaded {} bytes to {}",
@@ -242,8 +278,12 @@ fn handle_file_connection(
             );
         }
         Err(DownloadError::Cancelled | DownloadError::Disconnected) => {}
-                        Err(DownloadError::StorageHold { reason, .. }) => { debug!("Download waiting for storage: {reason}"); }
-        Err(e) if e.is_peer_failure() => { warn!("Download from {} ended: {}", peer.username, e); }
+        Err(DownloadError::StorageHold { reason, .. }) => {
+            debug!("Download waiting for storage: {reason}");
+        }
+        Err(e) if e.is_peer_failure() => {
+            warn!("Download from {} ended: {}", peer.username, e);
+        }
         Err(e) => {
             error!(
                 "Failed to download file from {}:{} (token: {}) - Error: {}",
@@ -272,11 +312,7 @@ fn handle_pierce_firewall(
         Ok(mut ctx) => {
             if let Some(upload) = ctx.take_brokered_upload(token) {
                 drop(ctx);
-                crate::client::Client::serve_pierced(
-                    &context.client_context,
-                    upload,
-                    stream,
-                );
+                crate::client::Client::serve_pierced(&context.client_context, upload, stream);
                 return;
             }
             ctx.take_pending_connect(token)
@@ -312,11 +348,7 @@ fn handle_pierce_firewall(
     }
 }
 
-fn handle_incoming_connection(
-    mut stream: TcpStream,
-    context: ConnectionContext,
-    permit: Permit,
-) {
+fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext, permit: Permit) {
     let Ok(peer_addr) = stream.peer_addr() else {
         // A reset accepted socket may already be disconnected before its
         // worker runs. This is normal pre-handshake peer churn.
@@ -330,30 +362,23 @@ fn handle_incoming_connection(
 
     // A peer that dials and then goes away is routine, not an error.
     let deadline = Instant::now() + PEER_INIT_TIMEOUT;
-    let message =
-        match read_peer_init_message(&mut stream, &mut reader, deadline) {
-            Ok(message) => message,
-            Err(e) => {
-                debug!(
-                    "[listener:{peer_ip}:{peer_port}] no peer init message: {e}"
-                );
-                return;
-            }
-        };
+    let message = match read_peer_init_message(&mut stream, &mut reader, deadline) {
+        Ok(message) => message,
+        Err(e) => {
+            debug!("[listener:{peer_ip}:{peer_port}] no peer init message: {e}");
+            return;
+        }
+    };
 
     // A firewalled peer brokered through the server connects back with a
     // PierceFirewall (code 0) instead of a PeerInit (code 1).
     if message.get_init_code() == 0 {
-        handle_pierce_firewall(
-            message, stream, reader, &context, &peer_ip, peer_port,
-        );
+        handle_pierce_firewall(message, stream, reader, &context, &peer_ip, peer_port);
         return;
     }
 
     let Some(init_data) = parse_peer_init_message(message) else {
-        error!(
-            "[listener:{peer_ip}:{peer_port}] Invalid or unknown peer init message"
-        );
+        error!("[listener:{peer_ip}:{peer_port}] Invalid or unknown peer init message");
         return;
     };
 
@@ -380,7 +405,6 @@ fn handle_incoming_connection(
 
     match init_data.connection_type {
         ConnectionType::P => {
-            drop(permit);
             if handle_peer_connection(peer, stream, reader, &context) {
                 // Inbound peers don't self-announce, so nudge the client to
                 // flush anything queued for this now-connected peer — same as
@@ -407,11 +431,10 @@ fn handle_incoming_connection(
                 "[listener:{peer_ip}:{peer_port}] distributed child {} offered",
                 init_data.username
             );
-            let _ =
-                context.client_sender.send(ClientOperation::ChildConnected {
-                    username: init_data.username,
-                    stream,
-                });
+            let _ = context.client_sender.send(ClientOperation::ChildConnected {
+                username: init_data.username,
+                stream,
+            });
         }
     }
 }
@@ -479,9 +502,16 @@ impl Listen {
             // One thread per connection: the peer-init handshake blocks, and a
             // peer that is slow to send one must not stop us accepting anybody
             // else — a wedged accept loop makes us unreachable to every peer.
-            if let Err(error)=thread::Builder::new().name("soulseek-init".into()).stack_size(256*1024).spawn(move || {
-                handle_incoming_connection(stream, context, permit);
-            }) {error!("[listener] could not start bounded handshake worker: {error}");thread::sleep(ACCEPT_BACKOFF);}
+            if let Err(error) = thread::Builder::new()
+                .name("soulseek-init".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    handle_incoming_connection(stream, context, permit);
+                })
+            {
+                error!("[listener] could not start bounded handshake worker: {error}");
+                thread::sleep(ACCEPT_BACKOFF);
+            }
         }
     }
 }

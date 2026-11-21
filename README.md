@@ -6,7 +6,7 @@ It has a modern React browser interface, an authenticated API and SQLite persist
 
 **[Explore the project website →](https://salnajjar.github.io/RustySoul/)** — screenshots, features and installation options.
 
-**Current beta: v0.1.0-beta.4.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
+**Current beta: v0.1.0-beta.5.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
 
 ## Quick start with Docker
 
@@ -28,7 +28,7 @@ docker run -d --name rustysoul --restart unless-stopped \
   ghcr.io/salnajjar/rustysoul:beta
 ```
 
-Open **http://127.0.0.1:8484**. For a server elsewhere, use `ssh -L 8484:127.0.0.1:8484 your-server` or an HTTPS reverse proxy. To publish HTTP on another host adapter, change the host address in `-p`. For a pinned image use `ghcr.io/salnajjar/rustysoul:0.1.0-beta.4`. Public pulls need no registry login.
+Open **http://127.0.0.1:8484**. For a server elsewhere, use `ssh -L 8484:127.0.0.1:8484 your-server` or an HTTPS reverse proxy. To publish HTTP on another host adapter, change the host address in `-p`. For a pinned image use `ghcr.io/salnajjar/rustysoul:0.1.0-beta.5`. Public pulls need no registry login.
 
 Initial administrator credentials are **admin / change-me-now**, unless changed with the two deployment variables above. First sign-in requires replacing **both** the username and password (minimum eight characters). Existing accounts survive restarts and are never reset by these bootstrap variables. Soulseek credentials are entered and verified separately under **Settings → Accounts**.
 

@@ -239,6 +239,7 @@ pub struct Session<'a> {
 }
 enum Expected {
     Action(Action, Option<String>),
+    Create,
     Join,
     Ticker(String),
 }
@@ -252,7 +253,7 @@ impl Controller {
     pub fn expects_private(&self, room: &str) -> bool {
         self.pending
             .get(room)
-            .is_some_and(|(_, e)| matches!(e, Expected::Join))
+            .is_some_and(|(_, e)| matches!(e, Expected::Join | Expected::Create))
     }
     pub fn disconnected(&mut self, view: &mut View) {
         self.pending.clear();
@@ -294,6 +295,7 @@ impl Controller {
             }
             if let Some(s) = view.rooms.get_mut(&room) {
                 s.pending = None;
+                s.revision = s.revision.wrapping_add(1);
                 s.error=Some("The server has not confirmed this request. Check the current room access or leave and rejoin before retrying.".into());
             }
         }
@@ -309,6 +311,7 @@ impl Controller {
         self.expired.remove(room);
         self.pending.insert(room.into(), (Instant::now(), expected));
         let s = view.rooms.entry(room.into()).or_default();
+        s.revision = s.revision.wrapping_add(1);
         s.pending = Some(label.into());
         s.error = None;
     }
@@ -348,7 +351,7 @@ impl Controller {
         self.expect(
             view,
             room,
-            Expected::Join,
+            Expected::Create,
             "Creating or joining private room…",
         );
         Ok(())
@@ -557,6 +560,21 @@ impl Controller {
             for room in completed {
                 self.confirm(view, &room);
             }
+            // Some servers announce creation through the ownership list before
+            // acknowledging a chat join. Ownership alone is not a joined room:
+            // allow one explicit private join, then wait for its code-14 reply.
+            let created: Vec<_> = self
+                .pending
+                .iter()
+                .filter_map(|(room, (_, expected))| {
+                    (matches!(expected, Expected::Create)
+                        && access.get(room).is_some_and(|(owner, _)| *owner))
+                    .then_some(room.clone())
+                })
+                .collect();
+            for room in created {
+                self.confirm(view, &room);
+            }
             return Ok(private_subscriptions(db, account)?
                 .into_iter()
                 .filter(|r| access.contains_key(r))
@@ -621,7 +639,7 @@ impl Controller {
                 if self
                     .pending
                     .get(room)
-                    .is_some_and(|(_, e)| matches!(e, Expected::Join))
+                    .is_some_and(|(_, e)| matches!(e, Expected::Join | Expected::Create))
                 {
                     s.pending = None;
                     s.error=Some("This name is a public room. RustySoul left it; choose another private-room name.".into());
@@ -751,7 +769,7 @@ impl Controller {
             .get(room)
             .or_else(|| self.expired.get(room))
             .is_some_and(|(_, expected)| match (expected, event) {
-                (Expected::Join, RoomEvent::PrivateJoined { .. }) => true,
+                (Expected::Join | Expected::Create, RoomEvent::PrivateJoined { .. }) => true,
                 (
                     Expected::Ticker(text),
                     RoomEvent::TickerAdded {

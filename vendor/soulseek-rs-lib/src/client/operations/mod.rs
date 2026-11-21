@@ -1,9 +1,7 @@
 use super::{
-    Arc, Client, ClientContext, ClientOperation, ConnectionType, 
-    DownloadPeer, DownloadStatus, Duration, Instant, Peer, PeerMessage,
-    PeerRegistry, Receiver, RwLock, RwLockExt, ServerMessage,
-    build_search_response, debug, error, info, mpsc, next_connect_token,
-    thread, trace, warn,
+    Arc, Client, ClientContext, ClientOperation, ConnectionType, DownloadPeer, DownloadStatus,
+    Duration, Instant, Peer, PeerMessage, PeerRegistry, Receiver, RwLock, RwLockExt, ServerMessage,
+    build_search_response, debug, error, info, mpsc, next_connect_token, thread, trace, warn,
 };
 use crate::message::server::MessageFactory;
 use crate::peer::DownloadError;
@@ -44,12 +42,8 @@ impl Client {
                     Self::pump_upload_queue(&client_context);
                     if let Ok(mut ctx) = client_context.write_safe() {
                         ctx.expire_pending_peer_messages(Instant::now());
-                        if let Some(branch) =
-                            ctx.leaf.due_announcement(Instant::now())
-                        {
-                            super::distributed::announce_move(
-                                &mut ctx, &branch, true,
-                            );
+                        if let Some(branch) = ctx.leaf.due_announcement(Instant::now()) {
+                            super::distributed::announce_move(&mut ctx, &branch, true);
                         }
                     }
                 }
@@ -65,7 +59,9 @@ impl Client {
                 match operation {
                     ClientOperation::UndeliveredPeerMessages(username, messages) => {
                         if let Ok(mut ctx) = client_context.write_safe() {
-                            for message in messages { ctx.queue_peer_message(&username, message); }
+                            for message in messages {
+                                ctx.queue_peer_message(&username, message);
+                            }
                         }
                     }
                     ClientOperation::ConnectToPeer(peer) => {
@@ -99,34 +95,19 @@ impl Client {
                                 continue;
                             }
                         };
-                        let result_token = search_result.token;
-
-                        // Find the search with matching token
-                        for search in context.searches.values_mut() {
-                            if search.token == result_token {
-                                search.accept(search_result);
-                                break;
-                            }
-                        }
+                        context.accept_search_result(search_result);
                     }
                     operation @ (ClientOperation::PeerDisconnected(..)
                     | ClientOperation::PeerConnectFailed(..)
                     | ClientOperation::ChildConnected { .. }) => {
-                        Self::on_peers(
-                            operation,
-                            &client_context,
-                            &own_username,
-                        );
+                        Self::on_peers(operation, &client_context, &own_username);
                     }
                     operation @ (ClientOperation::DownloadFromPeer(..)
                     | ClientOperation::UpdateDownloadTokens(..)
                     | ClientOperation::StartUpload { .. }
+                    | ClientOperation::PeerTransferResponse { .. }
                     | ClientOperation::QueueUpload { .. }) => {
-                        Self::on_transfers(
-                            operation,
-                            &client_context,
-                            &own_username,
-                        );
+                        Self::on_transfers(operation, &client_context, &own_username);
                     }
                     ClientOperation::GetPeerAddressResponse {
                         username,
@@ -137,11 +118,7 @@ impl Client {
                     } => {
                         debug!(
                             "Received peer address for {}: {}:{} (obf_type: {}, obf_port: {})",
-                            username,
-                            host,
-                            port,
-                            obfuscation_type,
-                            obfuscated_port
+                            username, host, port, obfuscation_type, obfuscated_port
                         );
 
                         // Port 0 is the server saying it does not know
@@ -166,15 +143,9 @@ impl Client {
                         let waiting_serves = match client_context.write_safe() {
                             Ok(mut ctx) => {
                                 if port != 0 {
-                                    ctx.cache_peer_address(
-                                        &username,
-                                        host.clone(),
-                                        port,
-                                    );
+                                    ctx.cache_peer_address(&username, host.clone(), port);
                                 }
-                                ctx.pending_serves
-                                    .remove(&username)
-                                    .unwrap_or_default()
+                                ctx.pending_serves.remove(&username).unwrap_or_default()
                             }
                             Err(_) => Vec::new(),
                         };
@@ -194,10 +165,7 @@ impl Client {
                                 .as_ref()
                                 .is_some_and(|r| r.contains(&username)),
                             Err(e) => {
-                                error!(
-                                    "[client] GetPeerAddressResponse read: {}",
-                                    e
-                                );
+                                error!("[client] GetPeerAddressResponse read: {}", e);
                                 continue;
                             }
                         };
@@ -240,9 +208,9 @@ impl Client {
                         place,
                     } => match client_context.write_safe() {
                         Ok(mut ctx) => {
-                            let updated = ctx.downloads.update_queue_position(
-                                &username, &filename, place,
-                            );
+                            let updated = ctx
+                                .downloads
+                                .update_queue_position(&username, &filename, place);
                             if !updated {
                                 debug!(
                                     "[client] PlaceInQueueUpdate: no matching download for {}/{}",
@@ -254,26 +222,21 @@ impl Client {
                             error!("[client] PlaceInQueueUpdate write: {}", e);
                         }
                     },
-                    ClientOperation::SetServerSender(sender) => {
-                        match client_context.write_safe() {
-                            Ok(mut ctx) => {
-                                ctx.server_sender = Some(sender);
-                                debug!("[client] Server sender initialized");
-                            }
-                            Err(e) => {
-                                error!("[client] SetServerSender write: {}", e);
-                            }
+                    ClientOperation::SetServerSender(sender) => match client_context.write_safe() {
+                        Ok(mut ctx) => {
+                            ctx.server_sender = Some(sender);
+                            debug!("[client] Server sender initialized");
                         }
-                    }
+                        Err(e) => {
+                            error!("[client] SetServerSender write: {}", e);
+                        }
+                    },
                     ClientOperation::PrivateMessageReceived(user_message) => {
                         match client_context.write_safe() {
                             Ok(mut ctx) => {
                                 ctx.push_private_message(user_message);
                             }
-                            Err(e) => error!(
-                                "[client] PrivateMessageReceived write: {}",
-                                e
-                            ),
+                            Err(e) => error!("[client] PrivateMessageReceived write: {}", e),
                         }
                     }
                     ClientOperation::UserStatusReceived {
@@ -312,10 +275,7 @@ impl Client {
                                 }
                             }
                             Err(e) => {
-                                error!(
-                                    "[client] UserStatsReceived write: {}",
-                                    e
-                                );
+                                error!("[client] UserStatsReceived write: {}", e);
                             }
                         }
                         if own {
@@ -349,22 +309,17 @@ impl Client {
                                 }
                             }
                             Err(e) => {
-                                error!(
-                                    "[client] WatchedUserReceived write: {}",
-                                    e
-                                );
+                                error!("[client] WatchedUserReceived write: {}", e);
                             }
                         }
                         if own {
                             Self::announce_child_capacity(&client_context);
                         }
                     }
-                    ClientOperation::RoomEvent(event) => {
-                        match client_context.write_safe() {
-                            Ok(mut ctx) => ctx.apply_room_event(event),
-                            Err(e) => error!("[client] RoomEvent write: {}", e),
-                        }
-                    }
+                    ClientOperation::RoomEvent(event) => match client_context.write_safe() {
+                        Ok(mut ctx) => ctx.apply_room_event(event),
+                        Err(e) => error!("[client] RoomEvent write: {}", e),
+                    },
                     ClientOperation::RoomMemberStats { room, stats } => {
                         match client_context.write_safe() {
                             Ok(mut ctx) => {
@@ -386,29 +341,24 @@ impl Client {
                         // downloads that were queued for this peer while it
                         // was unreachable. Collect under a read guard, then
                         // act without it held.
-                        let (registry, files): (
-                            Option<PeerRegistry>,
-                            Vec<String>,
-                        ) = match client_context.read_safe() {
-                            Ok(ctx) => (
-                                ctx.peer_registry.clone(),
-                                ctx.get_downloads()
-                                    .iter()
-                                    .filter(|d| {
-                                        d.username == username
-                                            && matches!(
-                                                d.status,
-                                                DownloadStatus::Queued
-                                            )
-                                    })
-                                    .map(|d| d.filename.clone())
-                                    .collect(),
-                            ),
-                            Err(e) => {
-                                error!("[client] PeerConnected read: {}", e);
-                                continue;
-                            }
-                        };
+                        let (registry, files): (Option<PeerRegistry>, Vec<String>) =
+                            match client_context.read_safe() {
+                                Ok(ctx) => (
+                                    ctx.peer_registry.clone(),
+                                    ctx.get_downloads()
+                                        .iter()
+                                        .filter(|d| {
+                                            d.username == username
+                                                && matches!(d.status, DownloadStatus::Queued)
+                                        })
+                                        .map(|d| d.filename.clone())
+                                        .collect(),
+                                ),
+                                Err(e) => {
+                                    error!("[client] PeerConnected read: {}", e);
+                                    continue;
+                                }
+                            };
                         // Also flush any peer messages (e.g. search
                         // responses) queued while connecting.
                         let queued_messages = client_context
@@ -417,30 +367,25 @@ impl Client {
                             .unwrap_or_default();
                         if let Some(registry) = registry {
                             for filename in files {
-                                let _ =
-                                    registry.queue_upload(&username, filename);
+                                let _ = registry.queue_upload(&username, filename);
                             }
                             for message in queued_messages {
-                                let _ = registry.send_to_peer(
-                                    &username,
-                                    PeerMessage::SendMessage(message),
-                                );
+                                let _ = registry
+                                    .send_to_peer(&username, PeerMessage::SendMessage(message));
                             }
                         }
                     }
+                    ClientOperation::UploadOfferSent { username, token } => {
+                        if let Ok(mut ctx) = client_context.write_safe() { ctx.mark_offer_sent(&username, token); }
+                    }
                     operation @ ClientOperation::IncomingSearch { .. } => {
-                        Self::on_search(
-                            operation,
-                            &client_context,
-                            &own_username,
-                        );
+                        Self::on_search(operation, &client_context, &own_username);
                     }
                     ClientOperation::PlaceInQueueRequested {
                         requester_key,
                         filename,
                     } => {
-                        let (registry, place) = match client_context.read_safe()
-                        {
+                        let (registry, place) = match client_context.read_safe() {
                             Ok(ctx) => (
                                 ctx.peer_registry.clone(),
                                 ctx.place_in_queue(&requester_key, &filename),
@@ -464,38 +409,24 @@ impl Client {
                     }
                     ClientOperation::PossibleParents(candidates) => {
                         let (dials, ops) = match client_context.write_safe() {
-                            Ok(mut ctx) => (
-                                ctx.leaf.consider(candidates),
-                                ctx.operations.clone(),
-                            ),
+                            Ok(mut ctx) => (ctx.leaf.consider(candidates), ctx.operations.clone()),
                             Err(_) => continue,
                         };
                         let Some(ops) = ops else { continue };
                         for dial in dials {
-                            super::distributed::spawn_link(
-                                dial,
-                                own_username.clone(),
-                                ops.clone(),
-                            );
+                            super::distributed::spawn_link(dial, own_username.clone(), ops.clone());
                         }
                     }
                     operation @ (ClientOperation::ParentSearch { .. }
-                    | ClientOperation::ParentBranchLevel {
-                        ..
-                    }
-                    | ClientOperation::ParentBranchRoot {
-                        ..
-                    }
+                    | ClientOperation::ParentBranchLevel { .. }
+                    | ClientOperation::ParentBranchRoot { .. }
                     | ClientOperation::ParentClosed { .. }
                     | ClientOperation::ResetDistributed) => {
                         Self::on_tree(operation, &client_context);
                     }
                     ClientOperation::PrivilegedUsers(users) => {
                         if let Ok(mut ctx) = client_context.write_safe() {
-                            debug!(
-                                "[client] {} privileged users listed",
-                                users.len()
-                            );
+                            debug!("[client] {} privileged users listed", users.len());
                             ctx.set_privileged_users(users);
                         }
                         // Someone already waiting may have just been
@@ -506,7 +437,8 @@ impl Client {
                     ClientOperation::OwnPrivileges(seconds) => {
                         if let Ok(mut ctx) = client_context.write_safe() {
                             ctx.own_privileges = Some(seconds);
-                            ctx.own_privileges_revision = ctx.own_privileges_revision.wrapping_add(1);
+                            ctx.own_privileges_revision =
+                                ctx.own_privileges_revision.wrapping_add(1);
                         }
                     }
                     ClientOperation::Recommendations {
@@ -515,11 +447,7 @@ impl Client {
                         unrecommended,
                     } => {
                         if let Ok(mut ctx) = client_context.write_safe() {
-                            ctx.apply_recommendations(
-                                global,
-                                recommended,
-                                unrecommended,
-                            );
+                            ctx.apply_recommendations(global, recommended, unrecommended);
                         }
                     }
                     ClientOperation::ItemRecommendations {
@@ -527,10 +455,7 @@ impl Client {
                         recommendations,
                     } => {
                         if let Ok(mut ctx) = client_context.write_safe() {
-                            ctx.apply_item_recommendations(
-                                item,
-                                recommendations,
-                            );
+                            ctx.apply_item_recommendations(item, recommendations);
                         }
                     }
                     ClientOperation::SimilarUsers(users) => {
@@ -567,11 +492,7 @@ impl Client {
                             directories.len()
                         );
                         if let Ok(mut ctx) = client_context.write_safe() {
-                            ctx.store_folder_contents(
-                                username,
-                                folder,
-                                directories,
-                            );
+                            ctx.store_folder_contents(username, folder, directories);
                         }
                     }
                     ClientOperation::ParentMinSpeed(speed) => {
@@ -590,12 +511,8 @@ impl Client {
                         // Interests live in the server only for the session
                         // that set them, so a new one starts by sending ours
                         // again — what Nicotine+ does from its config file.
-                        let (sender, interests) = match client_context
-                            .read_safe()
-                        {
-                            Ok(ctx) => {
-                                (ctx.server_sender.clone(), ctx.own_interests())
-                            }
+                        let (sender, interests) = match client_context.read_safe() {
+                            Ok(ctx) => (ctx.server_sender.clone(), ctx.own_interests()),
                             Err(_) => continue,
                         };
                         let Some(sender) = sender else { continue };
@@ -629,20 +546,16 @@ impl Client {
                         // token is the correlation we sent, so it names the
                         // peer: end the wait now instead of letting every
                         // queued download for them sit until the timeout.
-                        let (username, upload) =
-                            match client_context.write_safe() {
-                                Ok(mut ctx) => (
-                                    ctx.take_pending_connect(token),
-                                    ctx.take_brokered_upload(token),
-                                ),
-                                Err(e) => {
-                                    error!(
-                                        "[client] CantConnectToPeer write: {}",
-                                        e
-                                    );
-                                    (None, None)
-                                }
-                            };
+                        let (username, upload) = match client_context.write_safe() {
+                            Ok(mut ctx) => (
+                                ctx.take_pending_connect(token),
+                                ctx.take_brokered_upload(token),
+                            ),
+                            Err(e) => {
+                                error!("[client] CantConnectToPeer write: {}", e);
+                                (None, None)
+                            }
+                        };
                         if let Some(upload) = upload
                             && upload.claim()
                         {
@@ -657,60 +570,51 @@ impl Client {
                                 "[client] {} cannot connect back (token {})",
                                 username, token
                             );
-                            Self::fail_queued_downloads(
-                                &client_context,
-                                &username,
-                            );
+                            Self::fail_queued_downloads(&client_context, &username);
                         }
                     }
                     ClientOperation::ShareListRequested { requester_key } => {
-                        if client_context.read_safe().is_ok_and(|c|c.banned_users.contains(&requester_key.to_ascii_lowercase())){continue;}
-                        Self::reply_to_peer(
-                            &client_context,
-                            &requester_key,
-                            |ctx| {
-                                crate::message::peer::build_shared_file_list(
-                                    &ctx.shares.directories(),
-                                )
-                            },
-                        );
+                        if client_context.read_safe().is_ok_and(|c| {
+                            c.banned_users.contains(&requester_key.to_ascii_lowercase())
+                        }) {
+                            continue;
+                        }
+                        Self::reply_to_peer(&client_context, &requester_key, |ctx| {
+                            crate::message::peer::build_shared_file_list(&ctx.shares.directories())
+                        });
                     }
                     ClientOperation::UserInfoRequested { requester_key } => {
-                        Self::reply_to_peer(
-                            &client_context,
-                            &requester_key,
-                            |ctx| {
-                                crate::message::peer::build_user_info_profile(
-                                    &ctx.public_description,&ctx.public_picture,ctx.upload_slots as u32,
-                                    ctx.upload_queue.len() as u32,
-                                    ctx.has_free_upload_slot(),
-                                )
-                            },
-                        );
+                        Self::reply_to_peer(&client_context, &requester_key, |ctx| {
+                            crate::message::peer::build_user_info_profile(
+                                &ctx.public_description,
+                                &ctx.public_picture,
+                                ctx.upload_slots as u32,
+                                ctx.upload_queue.len() as u32,
+                                ctx.has_free_upload_slot(),
+                            )
+                        });
                     }
                     ClientOperation::FolderContentsRequested {
                         requester_key,
                         token,
                         folder,
                     } => {
-                        if client_context.read_safe().is_ok_and(|c|c.banned_users.contains(&requester_key.to_ascii_lowercase())){continue;}
+                        if client_context.read_safe().is_ok_and(|c| {
+                            c.banned_users.contains(&requester_key.to_ascii_lowercase())
+                        }) {
+                            continue;
+                        }
                         // ponytail: walks the whole share for one folder, as a
                         // browse does; index by directory if it ever shows up.
-                        Self::reply_to_peer(
-                            &client_context,
-                            &requester_key,
-                            |ctx| {
-                                let dirs: Vec<_> = ctx
-                                    .shares
-                                    .directories()
-                                    .into_iter()
-                                    .filter(|dir| dir.name == folder)
-                                    .collect();
-                                crate::message::peer::build_folder_contents(
-                                    token, &folder, &dirs,
-                                )
-                            },
-                        );
+                        Self::reply_to_peer(&client_context, &requester_key, |ctx| {
+                            let dirs: Vec<_> = ctx
+                                .shares
+                                .directories()
+                                .into_iter()
+                                .filter(|dir| dir.name == folder)
+                                .collect();
+                            crate::message::peer::build_folder_contents(token, &folder, &dirs)
+                        });
                     }
                     ClientOperation::BrowseResult {
                         username,
@@ -746,10 +650,8 @@ impl Client {
             if !registry.contains(&username) {
                 continue;
             }
-            let request =
-                MessageFactory::build_place_in_queue_request(&filename);
-            let _ = registry
-                .send_to_peer(&username, PeerMessage::SendMessage(request));
+            let request = MessageFactory::build_place_in_queue_request(&filename);
+            let _ = registry.send_to_peer(&username, PeerMessage::SendMessage(request));
         }
     }
 
@@ -770,10 +672,7 @@ impl Client {
             Err(_) => return,
         };
         let Some(sender) = sender else { return };
-        let message =
-            crate::message::server::MessageFactory::build_accept_children(
-                has_room,
-            );
+        let message = crate::message::server::MessageFactory::build_accept_children(has_room);
         let _ = sender.send(ServerMessage::SendMessage(message));
     }
 
@@ -788,8 +687,7 @@ impl Client {
             Err(_) => return,
         };
         if let Some(registry) = registry {
-            let _ = registry
-                .send_to_peer(requester_key, PeerMessage::SendMessage(message));
+            let _ = registry.send_to_peer(requester_key, PeerMessage::SendMessage(message));
         }
     }
 
@@ -818,7 +716,10 @@ impl Client {
             Self::timeout_upload(
                 client_context,
                 upload.token,
-                &format!("The receiving peer did not connect back within {} seconds. They may be offline or unreachable.",super::BROKER_CONNECT_TIMEOUT.as_secs()),
+                &format!(
+                    "The receiving peer did not establish the file connection within {} seconds.",
+                    super::UPLOAD_CONNECT_TIMEOUT.as_secs()
+                ),
             );
         }
     }

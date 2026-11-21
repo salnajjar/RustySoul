@@ -1,6 +1,6 @@
 # Container deployment
 
-Public beta image: `ghcr.io/salnajjar/rustysoul:beta`; pin a version such as `:0.1.0-beta.4` for reproducible upgrades. Published binaries currently target Linux amd64. Docker Engine and rootless/rootful Podman are supported, with environment-based `run` commands as the default setup. See the repository README for first sign-in and account setup.
+Public beta image: `ghcr.io/salnajjar/rustysoul:beta`; pin a version such as `:0.1.0-beta.5` for reproducible upgrades. Published binaries currently target Linux amd64. Docker Engine and rootless/rootful Podman are supported, with environment-based `run` commands as the default setup. See the repository README for first sign-in and account setup.
 
 Registry images use Docker media types so Podman retains the embedded health check. The release workflow tests the published digest with Podman before creating the GitHub release, in addition to the Docker installation matrix.
 

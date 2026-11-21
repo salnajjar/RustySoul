@@ -25,7 +25,7 @@ const MAGIC: &[u8; 16] = b"RustySoulBackup1";
 const CHUNK: usize = 64 * 1024;
 pub const MAX_DATABASE: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_UPLOAD: usize = (MAX_DATABASE + 4 * 1024 * 1024) as usize;
-const SCHEMA: u32 = 16;
+const SCHEMA: u32 = 17;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Summary {
@@ -1174,6 +1174,13 @@ mod tests {
     fn encrypted_snapshot_roundtrip_strips_sessions_and_preserves_the_live_database() {
         let (_temp, config, token) = fixture();
         let store = crate::store::Store::open(&config.data_dir.join("rustysoul.sqlite3")).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO upload_speed_users VALUES('measured-peer',4000000,2.0,1)",
+                [],
+            )
+            .unwrap();
         for path in ["a.flac", "b.flac"] {
             store.connection.execute("INSERT INTO downloads(username,path,directory,size,status) VALUES('queue-user',?1,?2,CASE WHEN ?1='a.flac' THEN 0 ELSE 100 END,'waiting')", rusqlite::params![path, config.download_dir.as_ref().unwrap().to_str().unwrap()]).unwrap();
         }
@@ -1197,6 +1204,8 @@ mod tests {
         assert_eq!(verified.summary.administrator, "backup-admin");
         assert_eq!(verified.summary.schema, SCHEMA);
         let db = Connection::open(verified.file()).unwrap();
+        let estimate = crate::upload_speed::Estimate::load(&db).unwrap();
+        assert_eq!((estimate.measured(), estimate.recipients()), (2_000_000, 1));
         assert_eq!(
             db.query_row(
                 "SELECT started_at,finished_at FROM downloads WHERE path='a.flac'",
@@ -1224,8 +1233,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_schema_eleven_through_fifteen_archives_restore_before_migration() {
-        for legacy in [11, 12, 13, 14, 15] {
+    fn legacy_schema_eleven_through_sixteen_archives_restore_before_migration() {
+        for legacy in [11, 12, 13, 14, 15, 16] {
             let (_temp, config, _) = fixture_at_schema(legacy);
             if legacy >= 12 {
                 let db = Connection::open(config.data_dir.join("rustysoul.sqlite3")).unwrap();

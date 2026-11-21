@@ -95,6 +95,8 @@ export interface Snapshot {
     has_picture: boolean;
     measured_upload_speed?: number;
     upload_speed_measured?: boolean;
+    upload_speed_recipients?: number;
+    upload_speed_selected_recipients?: number;
     revision: number;
   };
   traffic?: { downloaded: number; uploaded: number; since: number };
@@ -310,7 +312,7 @@ export const emptySnapshot: Snapshot = {
   notice: null,
   credentials_configured: false,
   credentials_revision: 0,
-  version: "0.1.0-beta.4",
+  version: "0.1.0-beta.5",
   connection: "disconnected",
   error: null,
   username: "",

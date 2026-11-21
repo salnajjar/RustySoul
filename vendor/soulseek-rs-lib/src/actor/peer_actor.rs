@@ -100,14 +100,13 @@ pub struct PeerActor {
     /// Registry-assigned unique id, echoed in terminal notifications so the
     /// client evicts only this actor and never a newer namesake.
     id: u64,
-    /// Transfer tokens for uploads we are serving to this peer. A TransferResponse
-    /// for one of these is our upload being accepted, not a download offer.
-    serving_tokens: std::collections::HashSet<u32>,
     /// Bytes queued for the peer that the socket would not take yet. The stream
     /// is non-blocking (so socket reads never starve the mailbox), so a message
     /// larger than the send buffer — a full share listing is easily megabytes —
     /// only partly fits; the rest drains on later ticks.
     pending_write: Vec<u8>,
+    written_bytes: u64,
+    pending_offers: std::collections::VecDeque<(u64, u32)>,
     /// When bytes last moved on this connection, in either direction. A peer
     /// that goes quiet is eventually reaped: nothing else ever closes an idle
     /// control connection, and each one holds a descriptor and a thread for
@@ -165,8 +164,9 @@ impl PeerActor {
             established: false,
             disconnect_reported: false,
             id,
-            serving_tokens: std::collections::HashSet::new(),
             pending_write: Vec::new(),
+            written_bytes: 0,
+            pending_offers: Default::default(),
             last_activity: Instant::now(),
             retire_deadline: None,
         }
@@ -435,44 +435,8 @@ impl PeerActor {
             username, token, allowed
         );
 
-        // If this token is one of our uploads, the peer just accepted
-        // our offer — start streaming. This leaves the download path
-        // (every other token) byte-for-byte unchanged.
-        if self.serving_tokens.remove(&token) {
-            if allowed {
-                let _ = self
-                    .client_channel
-                    .send(ClientOperation::StartUpload { token });
-            }
-            return;
-        }
-
-        if allowed {
-            debug!(
-                "[peer:{}] Transfer allowed, ready to connect with token {:}",
-                username, token
-            );
-            let Some(peer_snapshot) = self.peer_snapshot() else {
-                return;
-            };
-            if let Err(e) =
-                self.client_channel.send(ClientOperation::DownloadFromPeer(
-                    token,
-                    peer_snapshot,
-                    allowed,
-                ))
-            {
-                error!(
-                    "[peer:{}] failed to send DownloadFromPeer: {}",
-                    username, e
-                );
-            }
-        } else if let Some(reason_text) = reason {
-            debug!(
-                "[peer:{}] Transfer rejected: {} - token {}, waiting for TransferRequest...",
-                username, reason_text, token
-            );
-        }
+        let Some(peer) = self.peer_snapshot() else { return; };
+        self.forward(ClientOperation::PeerTransferResponse { token, peer, allowed, reason });
     }
 
     fn handle_place_in_queue_response(&self, filename: String, place: u32) {
@@ -519,7 +483,6 @@ impl PeerActor {
     }
 
     fn handle_serve_upload(&mut self, token: u32, filename: String, size: u64) {
-        self.serving_tokens.insert(token);
         let message = MessageFactory::build_upload_transfer_request(
             &filename, token, size,
         );
@@ -680,7 +643,14 @@ impl PeerActor {
 
         // Queue then drain, so messages always leave in order even when an
         // earlier one is still partly buffered.
-        self.pending_write.extend_from_slice(&message.get_buffer());
+        let bytes = message.get_buffer();
+        let data = message.get_data();
+        if data.len() >= 12 && data[..4] == 40_u32.to_le_bytes() && data[4..8] == 1_u32.to_le_bytes() {
+            let token = u32::from_le_bytes(data[8..12].try_into().unwrap());
+            let end = self.written_bytes + self.pending_write.len() as u64 + bytes.len() as u64;
+            self.pending_offers.push_back((end, token));
+        }
+        self.pending_write.extend_from_slice(&bytes);
         self.flush_pending_write();
     }
 
@@ -721,6 +691,11 @@ impl PeerActor {
             }
         };
         self.pending_write.drain(..written);
+        self.written_bytes += written as u64;
+        while self.pending_offers.front().is_some_and(|(end, _)| *end <= self.written_bytes) {
+            let (_, token) = self.pending_offers.pop_front().unwrap();
+            self.forward(ClientOperation::UploadOfferSent { username: username.clone(), token });
+        }
         if written > 0 {
             self.last_activity = Instant::now();
         }
@@ -785,7 +760,13 @@ impl PeerActor {
         let op = if self.outbound && !self.established {
             // Requests arriving during a direct dial live in this actor, not
             // the client queue. Preserve them for the brokered fallback.
-            let messages: Vec<_> = std::mem::take(&mut self.queued_messages).into_iter().filter_map(|m| match m { PeerMessage::SendMessage(message) => Some(message), _ => None }).collect();
+            let messages: Vec<_> = std::mem::take(&mut self.queued_messages).into_iter().filter_map(|m| match m {
+                PeerMessage::SendMessage(message) => Some(message),
+                // Upload jobs are recovered by actor id from shared state;
+                // raw replay would resurrect a cancelled or replaced token.
+                PeerMessage::ServeUpload { .. } => None,
+                _ => None,
+            }).collect();
             if !messages.is_empty() {let _ = self.client_channel.send(ClientOperation::UndeliveredPeerMessages(username.clone(), messages));}
             ClientOperation::PeerConnectFailed(
                 self.id,
@@ -809,6 +790,8 @@ impl PeerActor {
         debug!("[peer:{}] disconnect", username);
 
         self.stream.take();
+        self.pending_write.clear();
+        self.pending_offers.clear();
         self.connection_state = ConnectionState::Disconnected;
 
         if self.disconnect_reported {

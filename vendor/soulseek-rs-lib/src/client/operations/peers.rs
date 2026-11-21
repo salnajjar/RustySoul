@@ -19,28 +19,31 @@ impl Client {
         let own_username = own_username.to_string();
         match operation {
             ClientOperation::PeerDisconnected(id, username, error) => {
-                // Scope the read guard: process_failed_uploads
+                // Scope the write guard: process_failed_uploads
                 // below acquires a write lock on the same
                 // RwLock, which would self-deadlock the entire
                 // client ops loop if this read guard were still
                 // held on this thread. Evict only if this exact
                 // actor still occupies the slot, so a replaced
                 // actor's shutdown can't remove its successor.
-                {
-                    let context = match client_context.read_safe() {
+                let (recovered, superseded) = {
+                    let mut context = match client_context.write_safe() {
                         Ok(c) => c,
                         Err(e) => {
-                            error!("[client] PeerDisconnected read: {}", e);
+                            error!("[client] PeerDisconnected write: {}", e);
                             return;
                         }
                     };
-                    if let Some(ref registry) = context.peer_registry
-                        && let Some(handle) =
-                            registry.remove_peer_if(&username, id)
-                    {
-                        let _ = handle.stop();
+                    let mut superseded = false;
+                    if let Some(ref registry) = context.peer_registry {
+                        if let Some(handle) = registry.remove_peer_if(&username, id) {
+                            let _ = handle.stop();
+                        } else {
+                            superseded = true;
+                        }
                     }
-                }
+                    (context.recover_undelivered_upload_offers(id), superseded)
+                };
                 // Only an error is evidence the peer is gone. A clean
                 // close — our idle reaper, or a remote client tidying
                 // an idle socket while it waits in our queue — must
@@ -49,7 +52,7 @@ impl Client {
                 // peer wedging uploads shut is still covered: its
                 // erroring transfer fails within the socket deadlines
                 // and the error branch here frees its slots.
-                if let Some(error) = error {
+                if let Some(error) = error.filter(|_| !superseded && recovered == 0) {
                     warn!(
                         "[client] Peer {} disconnected with error: {:?}",
                         username, error
@@ -58,6 +61,7 @@ impl Client {
                     Self::fail_queued_downloads(client_context,&username);
                     Self::release_upload_slots(client_context, &username);
                 }
+                if recovered > 0 { Self::pump_upload_queue(client_context); }
             }
             ClientOperation::PeerConnectFailed(
                 id,
@@ -73,7 +77,7 @@ impl Client {
                 // dial falls back to the broker below.
                 if let Some(peer_token) = brokered_token {
                     let server_sender = match client_context.write_safe() {
-                        Ok(ctx) => {
+                        Ok(mut ctx) => {
                             if let Some(handle) = ctx
                                 .peer_registry
                                 .as_ref()
@@ -81,6 +85,7 @@ impl Client {
                             {
                                 let _ = handle.stop();
                             }
+                            ctx.recover_undelivered_upload_offers(id);
                             ctx.server_sender.clone()
                         }
                         Err(e) => {
@@ -122,6 +127,12 @@ impl Client {
                             .and_then(|r| r.remove_peer_if(&username, id))
                         {
                             let _ = handle.stop();
+                        }
+                        ctx.recover_undelivered_upload_offers(id);
+                        if ctx.peer_registry.as_ref().is_some_and(|r| r.contains(&username)) {
+                            drop(ctx);
+                            Self::pump_upload_queue(client_context);
+                            return;
                         }
                         ctx.add_pending_connect(token, username.clone());
                         ctx.server_sender.clone()

@@ -36,7 +36,7 @@ Booleans accept `true` or `false`. Folder lists accept one absolute path or a JS
 | `RUSTYSOUL_DOWNLOAD_BYTES_PER_SECOND` | `0` (unlimited); initial total download speed limit |
 | `RUSTYSOUL_MAX_SEARCH_RESULTS` | `100000`; 100–1000000 |
 | `RUSTYSOUL_MAX_BROWSE_FILES` | `1000000`; 100–2000000 |
-| `RUSTYSOUL_MAX_SEARCHES` | `8`; 1–16 |
+| `RUSTYSOUL_MAX_SEARCHES` | Legacy setting accepted and ignored; search history has no count limit. |
 | `RUSTYSOUL_MAX_TRANSFERS` | `128`; 1–1024 |
 | `RUST_LOG` | `rustysoul=info` when unset; diagnostic logging filter |
 

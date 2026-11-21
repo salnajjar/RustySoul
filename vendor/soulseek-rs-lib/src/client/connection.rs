@@ -1,8 +1,7 @@
 use super::{
-    Arc, AtomicBool, Client, ClientContext, ClientOperation, ConnectionType,
-    DownloadPeer, Listen, Peer, PeerRegistry, Receiver, Result, RwLock,
-    RwLockExt, Sender, ServerActor, ServerMessage, Shares, SoulseekRs,
-    TcpStream, debug,error, info, mpsc, thread, trace, warn,
+    Arc, AtomicBool, Client, ClientContext, ClientOperation, ConnectionType, DownloadPeer, Listen,
+    Peer, PeerRegistry, Receiver, Result, RwLock, RwLockExt, Sender, ServerActor, ServerMessage,
+    Shares, SoulseekRs, TcpStream, debug, error, info, mpsc, thread, trace, warn,
 };
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::RecvTimeoutError;
@@ -13,8 +12,7 @@ const LOGIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Ceiling on the wait for a login verdict. Generous enough for a slow server
 /// and a retrying connect, short enough that an unattended caller ends.
-const LOGIN_RESPONSE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(45);
+const LOGIN_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Soft open-file limit below which a session should expect "too many open
 /// files": every peer holds a socket, and one busy search talks to hundreds
@@ -50,10 +48,8 @@ impl Client {
     pub fn connect(&mut self) -> Result<()> {
         warn_if_open_file_limit_is_low();
 
-        let (sender, message_reader): (
-            Sender<ClientOperation>,
-            Receiver<ClientOperation>,
-        ) = mpsc::channel();
+        let (sender, message_reader): (Sender<ClientOperation>, Receiver<ClientOperation>) =
+            mpsc::channel();
 
         let mut ctx = self.context.write_safe()?;
         let peer_registry = PeerRegistry::with_capacity(
@@ -135,13 +131,7 @@ impl Client {
             self.listener_released = released.clone();
 
             thread::spawn(move || {
-                Listen::serve(
-                    &listener,
-                    client_sender,
-                    context,
-                    own_username,
-                    stopped,
-                );
+                Listen::serve(&listener, client_sender, context, own_username, stopped);
                 drop(listener);
                 released.store(true, Ordering::Relaxed);
             });
@@ -201,9 +191,7 @@ impl Client {
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             let deadline = Instant::now() + LISTENER_RELEASE_TIMEOUT;
-            while !self.listener_released.load(Ordering::Relaxed)
-                && Instant::now() < deadline
-            {
+            while !self.listener_released.load(Ordering::Relaxed) && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
         }
@@ -236,13 +224,10 @@ impl Client {
         loop {
             match rx.recv_timeout(LOGIN_POLL_INTERVAL) {
                 Ok(result) => return result,
-                Err(RecvTimeoutError::Timeout)
-                    if self.cancel.is_cancelled() =>
-                {
+                Err(RecvTimeoutError::Timeout) if self.cancel.is_cancelled() => {
                     return Err(SoulseekRs::NotConnected);
                 }
-                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {
-                }
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
                 Err(_) => return Err(SoulseekRs::Timeout),
             }
         }
@@ -265,11 +250,25 @@ impl Client {
         Ok(())
     }
 
-    pub fn peer_capacity(&self)->usize {self.context.read_safe().map(|c|c.max_peers.load(Ordering::Relaxed)).unwrap_or(0)}
+    pub fn peer_capacity(&self) -> usize {
+        self.context
+            .read_safe()
+            .map(|c| c.max_peers.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
     pub fn set_max_peers(&self, max_peers: usize) {
         if let Ok(ctx) = self.context.read_safe() {
-            let safe=std::fs::read_to_string("/sys/fs/cgroup/pids.max").ok().and_then(|s|s.trim().parse::<usize>().ok()).map(|limit|limit.saturating_sub(112).clamp(1,128)).unwrap_or(usize::MAX);
-            ctx.max_peers.store(max_peers.max(1).min(safe),std::sync::atomic::Ordering::Relaxed);
+            // Leave room for handshake/transfer workers, retiring actors and
+            // the HTTP blocking pool during a burst of search replies.
+            let safe = std::fs::read_to_string("/sys/fs/cgroup/pids.max")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .map(|limit| limit.saturating_sub(160).clamp(1, 128))
+                .unwrap_or(usize::MAX);
+            ctx.max_peers.store(
+                max_peers.max(1).min(safe),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -306,12 +305,22 @@ impl Client {
             };
             if let Some(ref registry) = context.peer_registry {
                 let protected = context.protected_peers();
-                match registry
-                    .register_peer_protected(peer, stream, reader, &protected)
-                {
+                match registry.register_peer_protected(peer, stream, reader, &protected) {
                     Ok(_) => true,
                     Err(e) => {
-                        if e.starts_with("peer thread capacity")||e.starts_with("peer registry at capacity"){debug!("[client] peer connection backpressure for {:?}: {}",username,e);}else{warn!("[client] refusing peer connection for {:?}: {}",username,e);}
+                        if e.starts_with("peer thread capacity")
+                            || e.starts_with("peer registry at capacity")
+                        {
+                            debug!(
+                                "[client] peer connection backpressure for {:?}: {}",
+                                username, e
+                            );
+                        } else {
+                            warn!(
+                                "[client] refusing peer connection for {:?}: {}",
+                                username, e
+                            );
+                        }
                         false
                     }
                 }
@@ -339,9 +348,7 @@ impl Client {
         };
         let Some(sender) = sender else { return };
         let message =
-            crate::message::server::MessageFactory::build_cant_connect_to_peer(
-                token, username,
-            );
+            crate::message::server::MessageFactory::build_cant_connect_to_peer(token, username);
         let _ = sender.send(ServerMessage::SendMessage(message));
     }
 
@@ -358,12 +365,7 @@ impl Client {
         );
         match peer.connection_type {
             ConnectionType::P => {
-                Self::register_peer_or_fail(
-                    &client_context,
-                    peer_clone,
-                    stream,
-                    None,
-                );
+                Self::register_peer_or_fail(&client_context, peer_clone, stream, None);
             }
 
             ConnectionType::F => {
@@ -372,10 +374,7 @@ impl Client {
                     peer.username, peer.token
                 );
                 let Some(token) = peer.token else {
-                    error!(
-                        "[client] F connection from {} without token",
-                        peer.username
-                    );
+                    error!("[client] F connection from {} without token", peer.username);
                     return;
                 };
                 let download_peer = DownloadPeer::new(
@@ -389,11 +388,7 @@ impl Client {
 
                 let brokered = peer_clone.brokered;
                 let username = peer_clone.username;
-                match download_peer.download_file(
-                    client_context.clone(),
-                    None,
-                    None,
-                ) {
+                match download_peer.download_file(client_context.clone(), None, None) {
                     Ok((download, filename)) => {
                         trace!(
                             "[client] downloaded {} bytes {:?} ",
@@ -407,11 +402,7 @@ impl Client {
                         // CantConnectToPeer, exactly as a control connection
                         // does: it is waiting on this token.
                         if brokered {
-                            Self::report_cant_connect(
-                                &client_context,
-                                token,
-                                &username,
-                            );
+                            Self::report_cant_connect(&client_context, token, &username);
                         }
                     }
                 }
@@ -422,11 +413,7 @@ impl Client {
                 // leave it waiting; wire the outbound half if firewalled
                 // children turn out to matter.
                 if let (true, Some(token)) = (peer.brokered, peer.token) {
-                    Self::report_cant_connect(
-                        &client_context,
-                        token,
-                        &peer.username,
-                    );
+                    Self::report_cant_connect(&client_context, token, &peer.username);
                 }
             }
         }

@@ -847,7 +847,7 @@ fn login_search_messages_and_room_list_use_reference_wire_format() {
         "Fixture public profile <script>literal</script>"
     );
     let mut restored = rustysoul::model::Snapshot::default();
-    store.restore(&mut restored, 8).unwrap();
+    store.restore(&mut restored).unwrap();
     assert_eq!(
         restored.messages[0].text,
         "Hello 👋 🌍 <script>not code</script>"

@@ -61,10 +61,21 @@ export default function ConnectionSettings({
           min={min}
           max={max}
           required
-          value={settings[key]}
+          value={
+            key === "download_slots_per_user" &&
+            (settings.automatic_download_parallelism ?? true)
+              ? Math.max(1, settings.download_slots)
+              : settings[key]
+          }
           disabled={disabled}
           onChange={(e) =>
-            setSettings({ ...settings, [key]: Number(e.target.value) })
+            setSettings({
+              ...settings,
+              [key]: Number(e.target.value),
+              ...(key === "download_slots_per_user"
+                ? { automatic_download_parallelism: false }
+                : {}),
+            })
           }
         />
       </label>
@@ -146,7 +157,6 @@ export default function ConnectionSettings({
               "download_slots_per_user",
               1,
               32,
-              settings.automatic_download_parallelism ?? true,
             )}
           </div>
           <label className="checkbox-label">
@@ -165,7 +175,9 @@ export default function ConnectionSettings({
           <p className="hint">
             Uses additional slots when a peer accepts more files, up to your
             total download limit. Peers still control their own upload limits.
-            Turn this off to set a manual per-user maximum.
+            Editing the per-user maximum switches to manual mode. Turn automatic
+            mode back on to use the total download limit as the per-user
+            maximum.
           </p>
           <p className="hint">
             Zero total slots pauses new transfers. Lowering a limit lets

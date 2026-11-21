@@ -89,7 +89,8 @@ jobs:
           import os
           from pathlib import Path
           version = os.environ['VERSION']
-          notes = Path('docs/RELEASE_NOTES.md').read_text()
+          notes = Path('docs/RELEASE_NOTES.md').read_text().split('\n# ', 1)[0].rstrip() + '\n'
+          assert notes.startswith('# RustySoul ' + os.environ['RELEASE_TAG'] + '\n'), 'Release notes must start with this version'
           notes += '\nContainer: `ghcr.io/salnajjar/rustysoul:' + version + '` (Linux amd64).\n'
           notes += '\nImage digest: `' + os.environ['IMAGE_DIGEST'] + '`.\n'
           Path('artifacts/release-notes.md').write_text(notes)

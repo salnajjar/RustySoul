@@ -3,33 +3,22 @@
 use super::*;
 
 #[test]
-fn upload_speed_is_reported_only_while_running() {
-    let two_seconds_ago = Instant::now()
-        .checked_sub(Duration::from_secs(2))
-        .expect("clock supports a 2s offset");
-
-    // 1 KiB over ~2s is ~512 B/s.
-    let rate = upload_speed(&UploadStatus::InProgress, 1024, two_seconds_ago);
-    assert!((rate - 512.0).abs() < 50.0, "unexpected rate {rate}");
-
-    // A finished upload reports no rate, exactly as a finished download
-    // does, so the Speed column renders "-" rather than a stale figure.
-    for status in [
-        UploadStatus::Completed,
-        UploadStatus::Cancelled,
-        UploadStatus::Failed("nope".to_string()),
-        UploadStatus::TimedOut("Peer stopped responding".to_string()),
-    ] {
-        let rate = upload_speed(&status, 1024, two_seconds_ago);
-        assert!(rate.abs() < f64::EPSILON, "unexpected rate {rate}");
+fn upload_speed_uses_recent_payload_and_reaches_zero_after_a_stall() {
+    let start = Instant::now();
+    let mut rate = super::super::UploadRate::default();
+    assert_eq!(rate.sample(start, 0), 0.);
+    assert_eq!(rate.sample(start + Duration::from_secs(1), 1024), 1024.);
+    for n in 2..=7 {
+        rate.sample(start + Duration::from_secs(n), 1024);
     }
-
-    // A just-started upload must not divide by a zero elapsed time.
-    let rate = upload_speed(&UploadStatus::InProgress, 0, Instant::now());
-    assert!(
-        rate.is_finite() && rate.abs() < f64::EPSILON,
-        "unexpected rate {rate}"
-    );
+    assert_eq!(rate.sample(start + Duration::from_secs(8), 1024), 0.);
+    for n in 0..1000 {
+        rate.sample(
+            start + Duration::from_secs(9) + Duration::from_millis(n),
+            2048,
+        );
+    }
+    assert!(rate.samples.len() <= 8);
 }
 
 // A clean disconnect — the idle reaper, or a remote client tidying an idle
@@ -40,11 +29,7 @@ fn upload_speed_is_reported_only_while_running() {
 fn a_clean_disconnect_keeps_queued_uploads_an_error_drops_them() {
     let client = Client::new("test-user", "test-password");
     let (ops, ops_rx) = mpsc::channel();
-    Client::listen_to_client_operations(
-        ops_rx,
-        client.context.clone(),
-        "me".to_string(),
-    );
+    Client::listen_to_client_operations(ops_rx, client.context.clone(), "me".to_string());
 
     client.context.write().unwrap().enqueue_upload(
         "amy",
@@ -108,13 +93,85 @@ fn a_pending_connect_expires_after_the_broker_timeout() {
 
     assert!(context.take_expired_connects(Instant::now()).is_empty());
 
-    let after_deadline =
-        Instant::now() + BROKER_CONNECT_TIMEOUT + Duration::from_secs(1);
+    let after_deadline = Instant::now() + BROKER_CONNECT_TIMEOUT + Duration::from_secs(1);
     assert_eq!(
         context.take_expired_connects(after_deadline),
         vec!["ghost".to_string()]
     );
     assert!(context.take_pending_connect(7).is_none());
+}
+
+#[test]
+fn upload_reverse_connect_allows_legacy_clients_45_seconds_without_extending_control_dials() {
+    let mut ctx = ClientContext::new();
+    ctx.add_brokered_upload(11, 22, "f.flac".into());
+    assert!(ctx.take_expired_brokered_uploads(Instant::now() + Duration::from_secs(30)).is_empty());
+    assert_eq!(ctx.take_expired_brokered_uploads(Instant::now() + Duration::from_secs(46)).len(), 1);
+    assert_eq!(BROKER_CONNECT_TIMEOUT, Duration::from_secs(20));
+}
+
+#[test]
+fn a_closed_control_recovers_a_reserved_offer_and_reconnects_instead_of_timing_out() {
+    for error in [None, Some(crate::error::SoulseekRs::NotConnected)] {
+        let client = Client::new("me", "password");
+        let (ops, rx) = mpsc::channel();
+        let (server, messages) = mpsc::channel();
+        {
+            let mut ctx = client.context.write().unwrap();
+            ctx.enqueue_upload("alice", "album\\track.flac", "track.flac".into(), 100);
+            ctx.pump_uploads(|| 10);
+            ctx.uploads.get_mut(&10).unwrap().delivery_actor = Some(7);
+            ctx.peer_registry = Some(PeerRegistry::new(ctx.actor_system.clone(), ops.clone(), "me".into()));
+            ctx.server_sender = Some(server);
+        }
+        Client::listen_to_client_operations(rx, client.context.clone(), "me".into());
+        ops.send(ClientOperation::PeerDisconnected(7, "alice".into(), error)).unwrap();
+        ops.send(ClientOperation::OwnPrivileges(7)).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while client.own_privilege_seconds() != Some(7) {
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut ctx = client.context.write().unwrap();
+        assert!(ctx.uploads.is_empty(), "the dead actor must not retain its reserved offer");
+        assert_eq!(ctx.place_in_queue("alice", "album\\track.flac"), Some(1));
+        assert!(matches!(messages.try_recv(), Ok(ServerMessage::GetPeerAddress(user)) if user == "alice"));
+        assert!(!ctx.expire_stale_offers(Instant::now() + Duration::from_secs(61)));
+    }
+}
+
+#[test]
+fn a_replaced_control_error_cannot_release_its_successors_uploads() {
+    use std::net::{TcpListener, TcpStream};
+    let client = Client::new("me", "password");
+    let (ops, rx) = mpsc::channel();
+    let registry = PeerRegistry::new(Arc::new(crate::actor::ActorSystem::new()), ops.clone(), "me".into());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let peer = Peer::new("alice".into(), ConnectionType::P, "127.0.0.1".into(), 0, None, 0, 0, 0);
+    registry.register_peer(peer, Some(stream), None).unwrap();
+    let (current_id, _) = registry.get_peer_with_id("alice").unwrap();
+    {
+        let mut ctx = client.context.write().unwrap();
+        ctx.enqueue_upload("alice", "new.flac", "new.flac".into(), 100);
+        ctx.pump_uploads(|| 10);
+        ctx.uploads.get_mut(&10).unwrap().delivery_actor = Some(current_id);
+        ctx.peer_registry = Some(registry.clone());
+    }
+    Client::listen_to_client_operations(rx, client.context.clone(), "me".into());
+    ops.send(ClientOperation::PeerDisconnected(current_id + 1000, "alice".into(), Some(crate::error::SoulseekRs::NotConnected))).unwrap();
+    ops.send(ClientOperation::OwnPrivileges(7)).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while client.own_privilege_seconds() != Some(7) {
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(registry.contains("alice"));
+    assert!(client.context.read().unwrap().uploads.contains_key(&10));
+    registry.stop_all();
+    drop(remote);
 }
 
 #[test]
@@ -172,7 +229,6 @@ fn the_server_is_told_our_child_capacity_only_when_it_changes() {
     );
     assert_eq!(ctx.accept_children_change(), None, "unchanged, so silent");
 }
-
 
 #[test]
 fn repeated_privilege_balances_have_distinct_observation_revisions() {

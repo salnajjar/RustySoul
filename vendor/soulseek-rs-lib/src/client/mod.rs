@@ -1,15 +1,13 @@
 use crate::actor::ActorHandle;
-use crate::actor::server_actor::{
-    PeerAddress, ServerActor, ServerMessage, UserMessage,
-};
+use crate::actor::server_actor::{PeerAddress, ServerActor, ServerMessage, UserMessage};
 use crate::download_store::{DownloadStore, collect_failed_tokens};
 use crate::types::{
     ClientVersion, DiscoveryEvent, DownloadMetadata, DownloadStatus, Recommendation, RoomEvent,
-    RoomInfo, RoomTicker, RoomUserStats, SessionLoss, SessionWatch,
-    SimilarUser, UserInfo, UserInterests, UserPresence, UserStats, UserStatus,
+    RoomInfo, RoomTicker, RoomUserStats, SessionLoss, SessionWatch, SimilarUser, UserInfo,
+    UserInterests, UserPresence, UserStats, UserStatus,
 };
-use crate::utils::logger;
 use crate::utils::bandwidth::Bandwidth;
+use crate::utils::logger;
 use crate::{
     Transfer,
     actor::{ActorSystem, peer_registry::PeerRegistry},
@@ -59,6 +57,9 @@ pub const DEFAULT_UPLOAD_SLOTS: usize = 10;
 /// How long to wait for a server-brokered (firewalled) peer to connect back
 /// before giving up and failing the download. Matches the direct-dial timeout.
 const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+// Legacy clients may spend ~30s attempting the other direction before asking
+// the server to connect back. Match the reference client's 45s transfer budget.
+const UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 
 const DEFAULT_MAX_PEERS: usize = 512;
 /// How long a message waits for a control connection to its peer.
@@ -110,8 +111,12 @@ struct UploadJob {
     real_path: std::path::PathBuf,
     virtual_path: String,
     size: u64,
-    /// When the offer went out; `None` once the peer has answered it.
+    /// When the complete offer reached the socket; absent before delivery or after acceptance.
     offered: Option<Instant>,
+    delivery_started: Option<Instant>,
+    /// Actor responsible for delivering this offer, not merely the username.
+    delivery_actor: Option<u64>,
+    queue_seq: u64,
 }
 
 /// An upload waiting for its downloader to connect back to our listener while
@@ -135,6 +140,7 @@ impl BrokeredUpload {
 /// Live bookkeeping for an upload being served (or recently finished).
 struct ActiveUpload {
     payload_bytes: Arc<std::sync::atomic::AtomicU64>,
+    rate: std::sync::Mutex<UploadRate>,
     username: String,
     filename: String,
     size: u64,
@@ -145,26 +151,79 @@ struct ActiveUpload {
     started: Instant,
 }
 
-/// Transfer rate of an in-progress upload, in bytes per second. Finished,
-/// cancelled and failed uploads report zero, matching how a download reports
-/// its speed only while running.
-///
-/// an average over the whole transfer rather than the rolling window
-/// the download path samples. Enough to fill the Speed column; sample a window
-/// if the figure ever needs to track sudden stalls.
-fn upload_speed(
-    status: &crate::types::UploadStatus,
-    bytes_sent: u64,
-    started: Instant,
-) -> f64 {
-    if !matches!(status, crate::types::UploadStatus::InProgress) {
-        return 0.0;
+/// Bounded recent payload window. The UI applies its separate five-second average.
+/// Resume prefixes never enter this counter.
+#[derive(Default)]
+struct UploadRate {
+    samples: std::collections::VecDeque<(Instant, u64)>,
+}
+impl UploadRate {
+    fn sample(&mut self, now: Instant, bytes: u64) -> f64 {
+        let cutoff = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        while self.samples.len() > 1 && self.samples[1].0 <= cutoff {
+            self.samples.pop_front();
+        }
+        let rate = self.samples.front().map_or(0., |(at, old)| {
+            let seconds = now.saturating_duration_since(*at).as_secs_f64();
+            if seconds > 0. {
+                bytes.saturating_sub(*old) as f64 / seconds
+            } else {
+                0.
+            }
+        });
+        if self
+            .samples
+            .back()
+            .is_none_or(|(at, _)| now.saturating_duration_since(*at) >= Duration::from_millis(200))
+        {
+            self.samples.push_back((now, bytes));
+        }
+        rate
     }
-    let elapsed = started.elapsed().as_secs_f64();
-    if elapsed <= 0.0 {
-        return 0.0;
+}
+
+/// A consistent upload observation. Acknowledge only after durable persistence;
+/// uploads finishing after this observation remain available to the next one.
+pub struct UploadSnapshot {
+    uploads: Vec<crate::types::UploadInfo>,
+    terminal: Vec<(u32, Arc<std::sync::atomic::AtomicU64>)>,
+    events: Vec<Arc<crate::types::UploadInfo>>,
+    current: Vec<(String, String)>,
+}
+impl UploadSnapshot {
+    pub fn uploads(&self) -> &[crate::types::UploadInfo] {
+        &self.uploads
     }
-    bytes_sent as f64 / elapsed
+    pub fn current_keys(&self) -> &[(String, String)] {
+        &self.current
+    }
+}
+
+impl ActiveUpload {
+    fn info(&self) -> crate::types::UploadInfo {
+        let now = Instant::now();
+        let mut rate = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        if rate.samples.is_empty() {
+            rate.samples.push_back((self.started, 0));
+        }
+        let speed = rate.sample(
+            now,
+            self.payload_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        crate::types::UploadInfo {
+            username: self.username.clone(),
+            filename: self.filename.clone(),
+            size: self.size,
+            bytes_sent: self.bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+            speed_bytes_per_sec: if matches!(self.status, crate::types::UploadStatus::InProgress) {
+                speed
+            } else {
+                0.
+            },
+            status: self.status.clone(),
+        }
+    }
 }
 
 /// Build a `FileSearchResponse` for `query` against `shares`, or `None` if
@@ -194,9 +253,7 @@ fn build_search_response(
     // anyway is what it is asking us not to do.
     let entries: Vec<FileEntry> = matches
         .iter()
-        .filter(|f| {
-            !path_carries_excluded_phrase(&f.virtual_path, excluded_phrases)
-        })
+        .filter(|f| !path_carries_excluded_phrase(&f.virtual_path, excluded_phrases))
         .take(crate::types::MAX_SEARCH_REPLY_FILES)
         .map(|f| FileEntry {
             name: &f.virtual_path,
@@ -252,10 +309,7 @@ pub struct ClientSettings {
 }
 
 impl ClientSettings {
-    pub fn new(
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             username: username.into(),
             password: password.into(),
@@ -269,10 +323,7 @@ impl Default for ClientSettings {
         Self {
             username: String::new(),
             password: String::new(),
-            server_address: PeerAddress::new(
-                "server.slsknet.org".to_string(),
-                2416,
-            ),
+            server_address: PeerAddress::new("server.slsknet.org".to_string(), 2416),
             enable_listen: true,
             listen_port: DEFAULT_LISTEN_PORT,
             shared_directories: Vec::new(),
@@ -351,6 +402,15 @@ pub enum ClientOperation {
     StartUpload {
         token: u32,
     },
+    /// Route responses by peer and token in shared state: the peer may have
+    /// replaced its control connection since the offer was sent.
+    PeerTransferResponse {
+        token: u32,
+        peer: Peer,
+        allowed: bool,
+        reason: Option<String>,
+    },
+    UploadOfferSent { username: String, token: u32 },
     /// A peer asked to browse our shared files; send our SharedFileListResponse.
     ShareListRequested {
         requester_key: String,
@@ -519,8 +579,7 @@ pub struct ClientContext {
     /// Peer messages waiting for a control connection to that peer, and
     /// when the last was queued: a peer that never answers must not keep
     /// them forever.
-    pending_peer_messages:
-        HashMap<String, (Instant, Vec<crate::message::Message>)>,
+    pending_peer_messages: HashMap<String, (Instant, Vec<crate::message::Message>)>,
     /// Uploads we have offered, keyed by our transfer token.
     uploads: HashMap<u32, UploadJob>,
     active_uploads: HashMap<u32, ActiveUpload>,
@@ -536,8 +595,8 @@ pub struct ClientContext {
     folder_contents: HashMap<(String, String), Vec<SharedDirectory>>,
     /// What peers said about themselves (peer code 16), keyed by peer.
     peer_infos: HashMap<String, crate::message::peer::PeerInfo>,
-    public_description:String,
-    public_picture:Vec<u8>,
+    public_description: String,
+    public_picture: Vec<u8>,
     pending_browses: HashMap<String, Instant>,
     /// Latest snapshot of the public chat-room list (from `RoomList`, code 64).
     room_list: Vec<RoomInfo>,
@@ -588,8 +647,11 @@ pub struct ClientContext {
     /// Everyone the server listed as privileged (code 69). They sort ahead of
     /// other peers in [`Self::upload_queue`].
     privileged_users: HashSet<String>,
-    banned_users:HashSet<String>,
-    upload_policy:UploadPolicy,sharing_checks:HashMap<String,Instant>,sharing_stats_at:HashMap<String,Instant>,sharing_denials:Vec<(String,String,String)>,
+    banned_users: HashSet<String>,
+    upload_policy: UploadPolicy,
+    sharing_checks: HashMap<String, Instant>,
+    sharing_stats_at: HashMap<String, Instant>,
+    sharing_denials: Vec<(String, String, String)>,
     /// Seconds of our own privileges left (code 92), once we have asked.
     own_privileges: Option<u32>,
     own_privileges_revision: u64,
@@ -598,9 +660,11 @@ pub struct ClientContext {
     excluded_search_phrases: Vec<String>,
     /// Peers waiting for one of our upload slots.
     upload_queue: Vec<QueuedUpload>,
+    /// Bound/rate-limit attempts to reconnect users waiting after idle closes.
+    upload_reconnects: HashMap<String, Instant>,
     /// Arrival counter for the queue's first-come tie-break.
     upload_seq: u64,
-    upload_order: HashMap<(String,String),(i8,u64)>,
+    upload_order: HashMap<(String, String), (i8, u64)>,
     /// How many uploads may be in flight at once.
     upload_slots: usize,
     upload_slots_per_user: usize,
@@ -613,7 +677,7 @@ pub struct ClientContext {
     /// [`Client::uploads`]. A caller sampling that snapshot would otherwise
     /// never see a peer that queued and was served inside one poll interval,
     /// and "it waited" is exactly the fact a transfer log must not lose.
-    upload_events: Vec<crate::types::UploadInfo>,
+    upload_events: Vec<Arc<crate::types::UploadInfo>>,
     actor_system: Arc<ActorSystem>,
 }
 /// A roster sorted and de-duplicated, so membership lookups can binary-search
@@ -644,10 +708,7 @@ impl ClientContext {
     pub fn get_download_by_token(&self, token: u32) -> Option<&Download> {
         self.downloads.get_by_token(token)
     }
-    pub fn get_download_by_token_mut(
-        &mut self,
-        token: u32,
-    ) -> Option<&mut Download> {
+    pub fn get_download_by_token_mut(&mut self, token: u32) -> Option<&mut Download> {
         self.downloads.get_by_token_mut(token)
     }
     #[must_use]
@@ -658,11 +719,7 @@ impl ClientContext {
     pub const fn get_downloads(&self) -> &Vec<Download> {
         self.downloads.list()
     }
-    pub fn update_download_with_status(
-        &mut self,
-        token: u32,
-        status: DownloadStatus,
-    ) {
+    pub fn update_download_with_status(&mut self, token: u32, status: DownloadStatus) {
         self.downloads.update_status(token, status);
     }
 }
@@ -697,14 +754,18 @@ impl Drop for Client {
 impl Client {
     /// RustySoul adapter: install an incrementally built index without rescanning files.
     pub fn replace_share_index(&self, dirs: Vec<String>, shares: Arc<Shares>) -> Result<()> {
-        let folders=shares.folder_count(); let files=shares.file_count();
-        { let mut ctx=self.context.write_safe()?;ctx.shares=shares;ctx.shared_directories=dirs; }
-        self.send_server_message(crate::message::server::MessageFactory::build_shared_folders_message(folders,files))
+        let folders = shares.folder_count();
+        let files = shares.file_count();
+        {
+            let mut ctx = self.context.write_safe()?;
+            ctx.shares = shares;
+            ctx.shared_directories = dirs;
+        }
+        self.send_server_message(
+            crate::message::server::MessageFactory::build_shared_folders_message(folders, files),
+        )
     }
-    pub fn new(
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self::with_settings(ClientSettings::new(username, password))
     }
 
@@ -813,29 +874,19 @@ impl Client {
                 tokens.sort_unstable();
                 let mut all: Vec<crate::types::UploadInfo> = tokens
                     .into_iter()
-                    .map(|token| {
-                        let upload = &ctx.active_uploads[token];
-                        let bytes_sent = upload
-                            .bytes_sent
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        crate::types::UploadInfo {
-                            username: upload.username.clone(),
-                            filename: upload.filename.clone(),
-                            size: upload.size,
-                            bytes_sent,
-                            speed_bytes_per_sec: upload_speed(
-                                &upload.status,
-                                upload.payload_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                                upload.started,
-                            ),
-                            status: upload.status.clone(),
-                        }
-                    })
+                    .map(|token| ctx.active_uploads[token].info())
                     .collect();
                 all.extend(ctx.queued_uploads());
                 // Offers reserve slots while waiting for the peer's answer.
                 // Include them so user controls also cover this handshake stage.
-                all.extend(ctx.uploads.values().map(|u|crate::types::UploadInfo{username:u.downloader.clone(),filename:u.virtual_path.clone(),size:u.size,bytes_sent:0,speed_bytes_per_sec:0.,status:crate::types::UploadStatus::Queued(0)}));
+                all.extend(ctx.uploads.values().map(|u| crate::types::UploadInfo {
+                    username: u.downloader.clone(),
+                    filename: u.virtual_path.clone(),
+                    size: u.size,
+                    bytes_sent: 0,
+                    speed_bytes_per_sec: 0.,
+                    status: crate::types::UploadStatus::Queued(0),
+                }));
                 all
             },
         )
@@ -845,7 +896,7 @@ impl Client {
     /// Returns whether a matching in-progress upload was found.
     #[must_use = "returns whether a matching upload was found"]
     pub fn cancel_upload(&self, username: &str, filename: &str) -> bool {
-        self.cancel_upload_request(username,filename)
+        self.cancel_upload_request(username, filename)
     }
 
     /// Replace the shared directories at runtime: rescan into a fresh
@@ -896,9 +947,9 @@ mod downloads;
 mod operations;
 mod rooms;
 mod search;
+mod sharing;
 mod social;
 mod upload_queue;
-mod sharing;
 pub use sharing::UploadPolicy;
 mod uploads;
 

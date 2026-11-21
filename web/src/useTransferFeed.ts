@@ -21,6 +21,7 @@ export interface TransferPage {
   summary: {
     total: number;
     active: number;
+    queued?: number;
     speed: number;
     clearable: Record<string, number>;
   };

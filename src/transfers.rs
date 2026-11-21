@@ -37,6 +37,29 @@ pub fn record_upload(db: &Connection, t: &TransferView) -> Result<bool> {
     let speed = if t.status == "uploading" { t.speed } else { 0. };
     Ok(db.execute("INSERT INTO uploads(username,path,size,transferred,speed,status,queue_position,added_at,updated_at,file_name,parent_folder,detail) VALUES(?1,?2,?3,?4,?5,?6,?7,strftime('%s','now'),strftime('%s','now'),?8,?9,?10) ON CONFLICT(username,path) DO UPDATE SET size=excluded.size,transferred=excluded.transferred,speed=excluded.speed,status=excluded.status,queue_position=excluded.queue_position,updated_at=excluded.updated_at,file_name=excluded.file_name,parent_folder=excluded.parent_folder,detail=excluded.detail WHERE uploads.size<>excluded.size OR uploads.transferred<>excluded.transferred OR uploads.speed<>excluded.speed OR uploads.status<>excluded.status OR uploads.queue_position IS NOT excluded.queue_position OR uploads.detail<>excluded.detail",params![t.username,t.path,t.size as i64,t.transferred as i64,speed,t.status,t.queue_position,names(&t.path).0,names(&t.path).1,t.detail])?>0)
 }
+/// A complete SDK observation is authoritative for live states. Old databases
+/// can contain uploads whose terminal event was lost before acknowledgement.
+pub fn reconcile_uploads(db: &Connection, current: &[(String, String)]) -> Result<bool> {
+    let current: std::collections::HashSet<_> = current
+        .iter()
+        .map(|(u, p)| (u.as_str(), p.as_str()))
+        .collect();
+    let candidates = db.prepare("SELECT username,path FROM uploads WHERE status IN ('uploading','queued','checking_shares')")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let missing: Vec<_> = candidates
+        .into_iter()
+        .filter(|(u, p)| !current.contains(&(u.as_str(), p.as_str())))
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    let tx = crate::store::write_transaction(db)?;
+    for (u, p) in missing {
+        tx.execute("UPDATE uploads SET status='failed',speed=0,queue_position=NULL,detail='The upload is no longer active; the receiving peer disconnected or became unreachable.',finished_at=CASE WHEN started_at IS NOT NULL THEN MAX(started_at,updated_at) END,updated_at=strftime('%s','now') WHERE username=?1 AND path=?2 AND status IN ('uploading','queued','checking_shares')",params![u,p])?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
 /// An unopened retry has unknown progress, so it must not erase saved bytes.
 /// Known zero from a newly opened/truncated partial must reset them.
 /// Queue status stays owned by save_downloads; progress captures only the first
@@ -102,6 +125,7 @@ impl Default for Query {
 pub struct Summary {
     pub total: usize,
     pub active: usize,
+    pub queued: usize,
     pub speed: f64,
     pub clearable: std::collections::BTreeMap<String, usize>,
 }
@@ -298,6 +322,18 @@ pub fn page(db: &Connection, kind: &str, q: &Query) -> Result<Page> {
     {
         let (status, count, speed) = row?;
         summary.total += count;
+        if matches!(
+            status.as_str(),
+            "waiting"
+                | "queued"
+                | "waiting_for_space"
+                | "retry_waiting"
+                | "paused"
+                | "paused_waiting"
+                | "checking_shares"
+        ) {
+            summary.queued += count;
+        }
         if matches!(status.as_str(), "downloading" | "uploading") {
             summary.active += count;
             summary.speed += speed;
@@ -342,6 +378,103 @@ pub fn preview(db: &Connection, kind: &str) -> Result<Vec<TransferView>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queue_totals_cover_the_whole_direction_independent_of_page_or_filter() {
+        let store = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        for kind in ["downloads", "uploads"] {
+            let waiting: &[&str] = if kind == "downloads" {
+                &[
+                    "waiting",
+                    "queued",
+                    "waiting_for_space",
+                    "retry_waiting",
+                    "paused",
+                    "paused_waiting",
+                ]
+            } else {
+                &["queued", "checking_shares"]
+            };
+            let active = if kind == "downloads" {
+                "downloading"
+            } else {
+                "uploading"
+            };
+            let statuses = waiting.iter().copied().chain([
+                active,
+                "completed",
+                "cancelled",
+                "failed",
+                "timed_out",
+                "blocked",
+                "interrupted",
+                "finalizing",
+            ]);
+            for (i, status) in statuses.enumerate() {
+                store.connection.execute(&format!("INSERT INTO {kind}(username,path,size,status,speed,transferred,added_at,updated_at) VALUES('peer',?1,100,?2,?3,0,1,1)"), params![format!("{i}.flac"), status, if status == active { 123. } else { 0. }]).unwrap();
+            }
+            let page = page(
+                &store.connection,
+                kind,
+                &Query {
+                    status: "completed".into(),
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(page.transfers.len(), 1);
+            assert_eq!(page.total, 1);
+            assert_eq!(page.summary.queued, waiting.len());
+            assert_eq!(page.summary.active, 1);
+            assert_eq!(page.summary.speed, 123.);
+            assert_eq!(page.summary.total, waiting.len() + 8);
+        }
+    }
+    #[test]
+    fn missing_live_upload_becomes_failed_without_changing_live_or_completed_history() {
+        let db = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let db = &db.connection;
+        for (user, status) in [
+            ("gone", "uploading"),
+            ("live", "uploading"),
+            ("done", "completed"),
+        ] {
+            record_upload(
+                db,
+                &TransferView {
+                    username: user.into(),
+                    path: "a.flac".into(),
+                    size: 100,
+                    transferred: 75,
+                    speed: 5511216.,
+                    status: status.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE uploads SET started_at=100,updated_at=105 WHERE username='gone'",
+            [],
+        )
+        .unwrap();
+        assert!(reconcile_uploads(db, &[("live".into(), "a.flac".into())]).unwrap());
+        let gone: (String,f64,i64,i64,String) = db.query_row("SELECT status,speed,transferred,finished_at,detail FROM uploads WHERE username='gone'",[],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(
+            (gone.0.as_str(), gone.1, gone.2, gone.3),
+            ("failed", 0., 75, 105)
+        );
+        assert!(gone.4.contains("no longer active"));
+        assert!(!reconcile_uploads(db, &[("live".into(), "a.flac".into())]).unwrap());
+        let page = page(db, "uploads", &Query::default()).unwrap();
+        assert_eq!(page.summary.active, 1);
+        assert_eq!(page.summary.speed, 5511216.);
+        assert!(
+            page.transfers
+                .iter()
+                .any(|t| t.username == "done" && t.status == "completed")
+        );
+    }
     #[test]
     fn unopened_retries_preserve_saved_progress_but_known_zero_resets_it() {
         let store = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();

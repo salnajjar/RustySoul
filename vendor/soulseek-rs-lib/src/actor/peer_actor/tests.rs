@@ -5,6 +5,25 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::Receiver;
 
 #[test]
+fn a_replacement_control_actor_forwards_upload_responses_without_connection_local_token_state() {
+    let (mut actor, operations, _peer) = connected_actor();
+    while operations.try_recv().is_ok() {}
+    for (allowed, reason) in [(false, Some("Complete".to_string())), (true, None)] {
+        actor.handle_transfer_response(1234, allowed, reason.clone());
+        match operations.try_recv().unwrap() {
+            ClientOperation::PeerTransferResponse { token, peer, allowed: response, reason: message } => {
+                assert_eq!(token, 1234);
+                assert_eq!(peer.username, "bob");
+                assert_eq!(response, allowed);
+                assert_eq!(message, reason);
+            },
+            other => panic!("upload answer lost: {other:?}"),
+        }
+        assert!(operations.try_recv().is_err());
+    }
+}
+
+#[test]
 fn legacy_download_requests_use_the_upload_queue_and_never_register_a_download() {
     use std::io::Read;
     let (mut actor, operations, mut peer) = connected_actor();
@@ -56,9 +75,39 @@ fn dial_failure_preserves_requests_for_the_reverse_connection() {
     actor.connection_state = ConnectionState::Connecting { since: Instant::now() };
     actor.handle_message(PeerMessage::SendMessage(MessageFactory::build_get_share_file_list()));
     actor.handle_message(PeerMessage::SendMessage(crate::message::peer::build_user_info_request()));
+    actor.handle_message(PeerMessage::ServeUpload { token: 123, filename: "folder\\file.flac".into(), size: 456 });
     actor.disconnect_with_error(Error::from(io::ErrorKind::ConnectionRefused));
-    match rx.try_recv() {Ok(ClientOperation::UndeliveredPeerMessages(username,messages))=>{assert_eq!(username,"bob");assert_eq!(messages.len(),2);},other=>panic!("requests were lost: {other:?}")}
+    match rx.try_recv() {Ok(ClientOperation::UndeliveredPeerMessages(username,messages))=>{assert_eq!(username,"bob");assert_eq!(messages.len(),2);assert_eq!(messages[0].get_buffer(),MessageFactory::build_get_share_file_list().get_buffer());},other=>panic!("requests were lost: {other:?}")}
     assert!(matches!(rx.try_recv(),Ok(ClientOperation::PeerConnectFailed(7,_,_))));
+}
+
+#[test]
+fn an_upload_offer_behind_buffered_bytes_is_not_announced_until_the_whole_frame_is_written() {
+    use std::io::Read;
+    let (mut actor, operations, mut remote) = connected_actor();
+    while operations.try_recv().is_ok() {}
+    let mut expected = vec![b'x'; 6 * 1024 * 1024];
+    actor.pending_write.extend_from_slice(&expected);
+    let offer = MessageFactory::build_upload_transfer_request("folder\\file.flac", 123, 456);
+    expected.extend(offer.get_buffer());
+    // Raw fallback messages need the same delivery notification as ServeUpload.
+    actor.handle_message(PeerMessage::SendMessage(offer));
+    if !actor.pending_write.is_empty() { assert!(operations.try_recv().is_err()); }
+    let count = expected.len();
+    remote.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut actual = vec![0; count]; remote.read_exact(&mut actual).unwrap(); actual
+    });
+    let end = Instant::now() + Duration::from_secs(10);
+    while !actor.pending_write.is_empty() {
+        assert!(Instant::now() < end);
+        actor.flush_pending_write();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(receiver.join().unwrap(), expected);
+    assert!(actor.pending_offers.is_empty());
+    assert!(matches!(operations.try_recv(), Ok(ClientOperation::UploadOfferSent { username, token: 123 }) if username == "bob"));
+    assert!(operations.try_recv().is_err());
 }
 #[test]
 fn late_messages_after_disconnect_never_generate_new_output_or_operations() {

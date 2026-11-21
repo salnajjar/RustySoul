@@ -1,5 +1,16 @@
 import type { Transfer } from "./types";
 import { basename } from "./api";
+export function isQueuedTransfer(transfer: Transfer) {
+  return [
+    "waiting",
+    "queued",
+    "waiting_for_space",
+    "retry_waiting",
+    "paused",
+    "paused_waiting",
+    "checking_shares",
+  ].includes(transfer.status);
+}
 export const transferSorts = [
   ["activity", "Active transfers first"],
   ["speed", "Speed"],

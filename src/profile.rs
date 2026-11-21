@@ -112,6 +112,8 @@ pub struct View {
     pub reported_upload_speed_kib: Option<u32>,
     pub measured_upload_speed: u32,
     pub upload_speed_measured: bool,
+    pub upload_speed_recipients: usize,
+    pub upload_speed_selected_recipients: usize,
 }
 impl Profile {
     pub fn view(&self, revision: u64) -> View {
@@ -128,6 +130,8 @@ impl Profile {
             reported_upload_speed_kib: self.reported_upload_speed_kib,
             measured_upload_speed: 0,
             upload_speed_measured: false,
+            upload_speed_recipients: 0,
+            upload_speed_selected_recipients: 0,
         }
     }
     pub fn validate(&self) -> Result<()> {

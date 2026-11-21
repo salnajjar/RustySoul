@@ -5,8 +5,8 @@
 //! rather than have every line that clones it rewritten.
 
 use super::{
-    Arc, Client, ClientContext, ClientOperation, Instant, PeerMessage, RwLock,
-    RwLockExt, ServerMessage, build_search_response, error,
+    Arc, Client, ClientContext, ClientOperation, Instant, PeerMessage, RwLock, RwLockExt,
+    ServerMessage, build_search_response, error,
 };
 
 impl Client {
@@ -25,7 +25,12 @@ impl Client {
         else {
             return;
         };
-        if client_context.read_safe().is_ok_and(|c|c.banned_users.contains(&username.to_ascii_lowercase())){return;}
+        if client_context
+            .read_safe()
+            .is_ok_and(|c| c.banned_users.contains(&username.to_ascii_lowercase()))
+        {
+            return;
+        }
         {
             // Every search we receive comes from the tree: from
             // our parent, or from the server acting as one. That
@@ -45,8 +50,7 @@ impl Client {
                     // Answering costs a scan of everything we
                     // share, so the budget applies to searches
                     // from the tree. The server's own are few.
-                    let answer =
-                        !from_parent || ctx.leaf.admit_search(Instant::now());
+                    let answer = !from_parent || ctx.leaf.admit_search(Instant::now());
                     // A child whose socket has gone is dropped by
                     // that write, which frees a slot the server
                     // should hear about.
@@ -65,53 +69,58 @@ impl Client {
             if username == own_username {
                 return;
             }
-            let response = match client_context.read_safe() {
-                Ok(ctx) => build_search_response(
-                    &ctx.shares,
-                    &own_username,
-                    token,
-                    &query,
+            let settings = match client_context.read_safe() {
+                Ok(ctx) => (
+                    ctx.shares.clone(),
                     ctx.has_free_upload_slot(),
                     ctx.advertised_upload_speed(),
                     ctx.upload_queue.len() as u32,
-                    &ctx.excluded_search_phrases,
+                    ctx.excluded_search_phrases.clone(),
                 ),
                 Err(e) => {
                     error!("[client] IncomingSearch read: {}", e);
                     return;
                 }
             };
+            // The immutable share snapshot can be searched/compressed without
+            // blocking result admission, room controls or UI activity on the
+            // global client-context lock.
+            let response = build_search_response(
+                &settings.0,
+                &own_username,
+                token,
+                &query,
+                settings.1,
+                settings.2,
+                settings.3,
+                &settings.4,
+            );
             let Some(message) = response else {
                 return; // no matching shares
             };
 
             // Deliver to the searcher: send now if we have a
             // control connection, else open one and queue.
-            let (connected, registry, server_sender) =
-                match client_context.read_safe() {
-                    Ok(ctx) => (
-                        ctx.peer_registry
-                            .as_ref()
-                            .is_some_and(|r| r.contains(&username)),
-                        ctx.peer_registry.clone(),
-                        ctx.server_sender.clone(),
-                    ),
-                    Err(_) => return,
-                };
+            let (connected, registry, server_sender) = match client_context.read_safe() {
+                Ok(ctx) => (
+                    ctx.peer_registry
+                        .as_ref()
+                        .is_some_and(|r| r.contains(&username)),
+                    ctx.peer_registry.clone(),
+                    ctx.server_sender.clone(),
+                ),
+                Err(_) => return,
+            };
             if connected {
                 if let Some(registry) = registry {
-                    let _ = registry.send_to_peer(
-                        &username,
-                        PeerMessage::SendMessage(message),
-                    );
+                    let _ = registry.send_to_peer(&username, PeerMessage::SendMessage(message));
                 }
             } else {
                 if let Ok(mut ctx) = client_context.write_safe() {
                     ctx.queue_peer_message(&username, message);
                 }
                 if let Some(sender) = server_sender {
-                    let _ =
-                        sender.send(ServerMessage::GetPeerAddress(username));
+                    let _ = sender.send(ServerMessage::GetPeerAddress(username));
                 }
             }
         }

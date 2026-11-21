@@ -21,7 +21,8 @@ const MAX_UPLOAD_EVENTS: usize = 256;
 /// How long an offered slot waits for the peer's TransferResponse. A peer that
 /// never answers, having gone away or hung, would otherwise hold the slot for
 /// the life of the process; with two slots, two of them shut uploads down.
-const OFFER_TIMEOUT: Duration = Duration::from_secs(30);
+const OFFER_TIMEOUT: Duration = Duration::from_secs(45);
+const OFFER_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A queued upload that has just been given a slot, ready to be offered to the
 /// peer that asked for it.
@@ -45,13 +46,18 @@ pub struct QueuedUpload {
     pub privileged: bool,
     /// Arrival order, so the tie-break among equals is first-come.
     pub seq: u64,
-    pub manual_order: Option<(i8,u64)>,
+    pub manual_order: Option<(i8, u64)>,
 }
 
 /// What decides the order: donors first, then whoever asked first.
 fn rank(job: &QueuedUpload) -> (bool, std::cmp::Reverse<i8>, u64, u64) {
-    let(priority,position)=job.manual_order.unwrap_or((0,u64::MAX));
-    (!job.privileged, std::cmp::Reverse(priority), position, job.seq)
+    let (priority, position) = job.manual_order.unwrap_or((0, u64::MAX));
+    (
+        !job.privileged,
+        std::cmp::Reverse(priority),
+        position,
+        job.seq,
+    )
 }
 
 /// Indices of `queue` in the order they will be served.
@@ -82,17 +88,10 @@ fn as_place(zero_based: usize) -> u32 {
 /// `PlaceInQueueResponse` does. `None` when that peer is not waiting for it,
 /// which is also the answer once the file has been handed over.
 #[must_use]
-pub fn place_in_queue(
-    queue: &[QueuedUpload],
-    downloader: &str,
-    filename: &str,
-) -> Option<u32> {
+pub fn place_in_queue(queue: &[QueuedUpload], downloader: &str, filename: &str) -> Option<u32> {
     serve_order(queue)
         .into_iter()
-        .position(|i| {
-            queue[i].downloader == downloader
-                && queue[i].virtual_path == filename
-        })
+        .position(|i| queue[i].downloader == downloader && queue[i].virtual_path == filename)
         .map(as_place)
 }
 
@@ -109,8 +108,27 @@ impl ClientContext {
         real_path: std::path::PathBuf,
         size: u64,
     ) {
-        if self.banned_users.contains(&downloader.to_ascii_lowercase()){return;}
-        if self.upload_queue.len()>=4096 || self.upload_queue.iter().filter(|u|u.downloader==downloader).count()>=128 || self.upload_queue.iter().any(|u|u.downloader==downloader&&u.virtual_path==filename) || self.uploads.values().any(|u|u.downloader==downloader&&u.virtual_path==filename){return;}
+        if self.banned_users.contains(&downloader.to_ascii_lowercase()) {
+            return;
+        }
+        if self.upload_queue.len() >= 4096
+            || self
+                .upload_queue
+                .iter()
+                .filter(|u| u.downloader == downloader)
+                .count()
+                >= 128
+            || self
+                .upload_queue
+                .iter()
+                .any(|u| u.downloader == downloader && u.virtual_path == filename)
+            || self
+                .uploads
+                .values()
+                .any(|u| u.downloader == downloader && u.virtual_path == filename)
+        {
+            return;
+        }
         self.begin_sharing_check(downloader);
         self.upload_seq += 1;
         self.upload_queue.push(QueuedUpload {
@@ -120,7 +138,10 @@ impl ClientContext {
             size,
             privileged: self.privileged_users.contains(downloader),
             seq: self.upload_seq,
-            manual_order: self.upload_order.get(&(downloader.to_lowercase(),filename.into())).copied(),
+            manual_order: self
+                .upload_order
+                .get(&(downloader.to_lowercase(), filename.into()))
+                .copied(),
         });
     }
 
@@ -134,17 +155,68 @@ impl ClientContext {
         &mut self,
         mut next_token: impl FnMut() -> u32,
     ) -> (Option<PeerRegistry>, Vec<UploadOffer>) {
-        let checks:std::collections::HashSet<_>=self.upload_queue.iter().filter(|j|matches!(self.upload_decision(&j.downloader),super::sharing::Decision::Checking)).map(|j|j.downloader.clone()).collect();for user in checks{self.begin_sharing_check(&user);}
-        let denied:Vec<_>=self.upload_queue.iter().enumerate().filter_map(|(i,j)|match self.upload_decision(&j.downloader){super::sharing::Decision::Deny(reason)=>Some((i,reason)),_=>None}).collect();
-        for (index,reason) in denied.into_iter().rev(){let job=self.upload_queue.remove(index);self.upload_events.retain(|u|u.username!=job.downloader||u.filename!=job.virtual_path);self.upload_events.push(UploadInfo{username:job.downloader.clone(),filename:job.virtual_path.clone(),size:job.size,bytes_sent:0,speed_bytes_per_sec:0.,status:UploadStatus::Failed(format!("Sharing protection: {reason}"))});self.sharing_denials.push((job.downloader,job.virtual_path,reason));}
-        self.sharing_checks.retain(|u,_|self.upload_queue.iter().any(|j|&j.downloader==u));
-        let ttl=self.upload_policy.cache_seconds.max(30);self.sharing_stats_at.retain(|_,t|t.elapsed()<Duration::from_secs(ttl));
+        let checks: std::collections::HashSet<_> = self
+            .upload_queue
+            .iter()
+            .filter(|j| {
+                matches!(
+                    self.upload_decision(&j.downloader),
+                    super::sharing::Decision::Checking
+                )
+            })
+            .map(|j| j.downloader.clone())
+            .collect();
+        for user in checks {
+            self.begin_sharing_check(&user);
+        }
+        let denied: Vec<_> = self
+            .upload_queue
+            .iter()
+            .enumerate()
+            .filter_map(|(i, j)| match self.upload_decision(&j.downloader) {
+                super::sharing::Decision::Deny(reason) => Some((i, reason)),
+                _ => None,
+            })
+            .collect();
+        for (index, reason) in denied.into_iter().rev() {
+            let job = self.upload_queue.remove(index);
+            self.upload_events
+                .retain(|u| u.username != job.downloader || u.filename != job.virtual_path);
+            self.upload_events.push(std::sync::Arc::new(UploadInfo {
+                username: job.downloader.clone(),
+                filename: job.virtual_path.clone(),
+                size: job.size,
+                bytes_sent: 0,
+                speed_bytes_per_sec: 0.,
+                status: UploadStatus::Failed(format!("Sharing protection: {reason}")),
+            }));
+            self.sharing_denials
+                .push((job.downloader, job.virtual_path, reason));
+        }
+        self.sharing_checks
+            .retain(|u, _| self.upload_queue.iter().any(|j| &j.downloader == u));
+        let ttl = self.upload_policy.cache_seconds.max(30);
+        self.sharing_stats_at
+            .retain(|_, t| t.elapsed() < Duration::from_secs(ttl));
         let mut offers = Vec::new();
         while self.has_free_upload_slot() {
             let Some(index) = serve_order(&self.upload_queue).into_iter().find(|&i| {
-                let name=&self.upload_queue[i].downloader;
-                let in_flight=self.uploads.values().filter(|u|&u.downloader==name).count()+self.active_uploads.values().filter(|u|&u.username==name && matches!(u.status,UploadStatus::InProgress)).count();
-                matches!(self.upload_decision(name),super::sharing::Decision::Allow)&&in_flight<self.upload_slots_per_user
+                let name = &self.upload_queue[i].downloader;
+                let in_flight = self
+                    .uploads
+                    .values()
+                    .filter(|u| &u.downloader == name)
+                    .count()
+                    + self
+                        .active_uploads
+                        .values()
+                        .filter(|u| {
+                            &u.username == name && matches!(u.status, UploadStatus::InProgress)
+                        })
+                        .count();
+                matches!(self.upload_decision(name), super::sharing::Decision::Allow)
+                    && in_flight < self.upload_slots_per_user
+                    && self.peer_registry.as_ref().is_none_or(|r| r.contains(name))
             }) else {
                 break;
             };
@@ -163,7 +235,10 @@ impl ClientContext {
                     real_path: job.real_path,
                     virtual_path: job.virtual_path,
                     size: job.size,
-                    offered: Some(Instant::now()),
+                    offered: None,
+                    delivery_started: Some(Instant::now()),
+                    delivery_actor: None,
+                    queue_seq: job.seq,
                 },
             );
         }
@@ -173,12 +248,12 @@ impl ClientContext {
         // was served between two polls — and with a small slot count that is
         // the common case, not the rare one.
         for waiting in self.queued_uploads() {
-            let already = self.upload_events.iter().any(|seen| {
-                seen.username == waiting.username
-                    && seen.filename == waiting.filename
-            });
+            let already = self
+                .upload_events
+                .iter()
+                .any(|seen| seen.username == waiting.username && seen.filename == waiting.filename);
             if !already {
-                self.upload_events.push(waiting);
+                self.upload_events.push(std::sync::Arc::new(waiting));
             }
         }
         // A caller that never drains must not grow this without bound.
@@ -193,6 +268,9 @@ impl ClientContext {
     /// Take the queued-upload states recorded since the last call.
     pub fn take_upload_events(&mut self) -> Vec<UploadInfo> {
         std::mem::take(&mut self.upload_events)
+            .into_iter()
+            .map(|e| (*e).clone())
+            .collect()
     }
 
     /// Uploads occupying a slot: offered but not yet accepted, plus those
@@ -206,9 +284,7 @@ impl ClientContext {
             + self
                 .active_uploads
                 .values()
-                .filter(|upload| {
-                    matches!(upload.status, UploadStatus::InProgress)
-                })
+                .filter(|upload| matches!(upload.status, UploadStatus::InProgress))
                 .count()
     }
 
@@ -230,7 +306,14 @@ impl ClientContext {
                     size: job.size,
                     bytes_sent: 0,
                     speed_bytes_per_sec: 0.0,
-                    status:if matches!(self.upload_decision(&job.downloader),super::sharing::Decision::Checking){UploadStatus::CheckingShares(as_place(place))}else{UploadStatus::Queued(as_place(place))},
+                    status: if matches!(
+                        self.upload_decision(&job.downloader),
+                        super::sharing::Decision::Checking
+                    ) {
+                        UploadStatus::CheckingShares(as_place(place))
+                    } else {
+                        UploadStatus::Queued(as_place(place))
+                    },
                 }
             })
             .collect()
@@ -239,11 +322,7 @@ impl ClientContext {
     /// Where `downloader`'s queued `filename` sits, counting from 1. `None`
     /// once it has left the queue for a slot.
     #[must_use]
-    pub fn place_in_queue(
-        &self,
-        downloader: &str,
-        filename: &str,
-    ) -> Option<u32> {
+    pub fn place_in_queue(&self, downloader: &str, filename: &str) -> Option<u32> {
         place_in_queue(&self.upload_queue, downloader, filename)
     }
 
@@ -265,30 +344,35 @@ impl ClientContext {
     /// upload so an operator sees why the peer never got its file. Returns
     /// whether anything was dropped, which is the caller's cue to pump again.
     pub fn expire_stale_offers(&mut self, now: Instant) -> bool {
-        let stale: Vec<u32> = self
+        let stale: Vec<(u32, bool)> = self
             .uploads
             .iter()
             .filter(|(_, job)| {
-                job.offered.is_some_and(|sent| {
-                    now.duration_since(sent) >= OFFER_TIMEOUT
-                })
+                job.offered
+                    .is_some_and(|sent| now.duration_since(sent) >= OFFER_TIMEOUT)
+                    || job.delivery_started.is_some_and(|at| now.duration_since(at) >= OFFER_DELIVERY_TIMEOUT)
             })
-            .map(|(&token, _)| token)
+            .map(|(&token, job)| (token, job.offered.is_some()))
             .collect();
-        for token in &stale {
+        for (token, delivered) in &stale {
             let Some(job) = self.uploads.remove(token) else {
                 continue;
             };
-            self.upload_events.push(UploadInfo {
+            crate::warn!("[client] upload offer {token} to {} for {} expired {} (delivery actor {:?})",
+                job.downloader, job.virtual_path,
+                if *delivered { "waiting 45 seconds for an answer" } else { "waiting 60 seconds for delivery" }, job.delivery_actor);
+            self.upload_events.push(std::sync::Arc::new(UploadInfo {
                 username: job.downloader,
                 filename: job.virtual_path,
                 size: job.size,
                 bytes_sent: 0,
                 speed_bytes_per_sec: 0.0,
                 status: UploadStatus::TimedOut(
-                    "The receiving peer did not answer the transfer offer within 30 seconds.".to_string(),
+                    (if *delivered { "The receiving peer did not answer the transfer offer within 45 seconds." }
+                    else { "Could not deliver the upload offer within 60 seconds; the control connection could not be established or stopped accepting data." })
+                        .to_string(),
                 ),
-            });
+            }));
         }
         !stale.is_empty()
     }
@@ -298,7 +382,100 @@ impl ClientContext {
     pub fn mark_offer_answered(&mut self, token: u32) {
         if let Some(job) = self.uploads.get_mut(&token) {
             job.offered = None;
+            job.delivery_started = None;
         }
+    }
+
+    pub(super) fn mark_offer_sent(&mut self, username: &str, token: u32) {
+        if let Some(job) = self.uploads.get_mut(&token)
+            && job.downloader.eq_ignore_ascii_case(username) && job.delivery_started.is_some()
+        {
+            job.delivery_started = None;
+            job.offered = Some(Instant::now());
+        }
+    }
+
+    /// Recover only offers not yet written by the exact actor that closed.
+    /// A new token on the next admission makes late callbacks/replies harmless.
+    pub(super) fn recover_undelivered_upload_offers(&mut self, actor: u64) -> usize {
+        let tokens: Vec<_> = self.uploads.iter()
+            .filter(|(_, job)| job.delivery_actor == Some(actor) && job.delivery_started.is_some())
+            .map(|(&token, _)| token).collect();
+        for token in &tokens {
+            let job = &self.uploads[token];
+            crate::info!("[client] recovering undelivered upload offer {token} to {} after control actor {actor} closed", job.downloader);
+            self.requeue_upload_offer(*token);
+        }
+        tokens.len()
+    }
+
+    pub(super) fn requeue_upload_offer(&mut self, token: u32) {
+        if self.uploads.get(&token).is_none_or(|job| job.delivery_started.is_none()) { return; }
+        let job = self.uploads.remove(&token).unwrap();
+        // This is an already admitted request, not a new queue entry.
+        // Keep its place even when newer requests filled the queue cap.
+        if !self.banned_users.contains(&job.downloader.to_ascii_lowercase()) {
+            self.upload_queue.push(QueuedUpload {
+                privileged: self.privileged_users.contains(&job.downloader),
+                seq: job.queue_seq,
+                manual_order: self.upload_order.get(&(job.downloader.to_lowercase(), job.virtual_path.clone())).copied(),
+                downloader: job.downloader,
+                virtual_path: job.virtual_path,
+                real_path: job.real_path,
+                size: job.size,
+            });
+        }
+    }
+
+    /// None is a response for another transfer/peer; true starts this upload.
+    /// A negative response is an answer, never a silent-peer timeout. Keep
+    /// actual payload counters at zero when the peer already has the file.
+    pub(super) fn answer_upload_offer(
+        &mut self,
+        username: &str,
+        token: u32,
+        allowed: bool,
+        reason: Option<String>,
+    ) -> Option<bool> {
+        let job = self.uploads.get_mut(&token)?;
+        if !job.downloader.eq_ignore_ascii_case(username) {
+            return None;
+        }
+        if job.offered.is_none() && job.delivery_started.is_none() {
+            return Some(false); // Already accepted; duplicate responses do nothing.
+        }
+        if allowed {
+            job.offered = None;
+            job.delivery_started = None;
+            return Some(true);
+        }
+        let job = self.uploads.remove(&token).unwrap();
+        let reason: String = reason.unwrap_or_default().trim().chars().filter(|c| !c.is_control()).take(256).collect();
+        crate::info!("[client] upload offer {token} to {username} declined: {}", if reason.is_empty() { "no reason supplied" } else { &reason });
+        let status = if reason.eq_ignore_ascii_case("Complete") {
+            UploadStatus::Completed
+        } else if reason.eq_ignore_ascii_case("Cancelled")
+            || reason.eq_ignore_ascii_case("Disallowed extension")
+        {
+            UploadStatus::Cancelled
+        } else {
+            UploadStatus::Failed(if reason.is_empty() {
+                "The receiving peer declined the upload.".into()
+            } else {
+                format!("The receiving peer declined the upload: {reason}")
+            })
+        };
+        self.upload_events.push(std::sync::Arc::new(UploadInfo {
+            username: job.downloader,
+            filename: job.virtual_path,
+            size: job.size,
+            bytes_sent: 0,
+            speed_bytes_per_sec: 0.,
+            status,
+        }));
+        let overflow = self.upload_events.len().saturating_sub(MAX_UPLOAD_EVENTS);
+        self.upload_events.drain(..overflow);
+        Some(false)
     }
 
     /// Forget everything `downloader` was waiting for or had been offered, and
@@ -309,8 +486,10 @@ impl ClientContext {
     /// that slot for the life of the process, so leaving is what releases it.
     pub fn release_upload_slots(&mut self, downloader: &str) -> bool {
         let before = self.upload_queue.len() + self.uploads.len();
-        self.upload_queue.retain(|job| !job.downloader.eq_ignore_ascii_case(downloader));
-        self.uploads.retain(|_, job| !job.downloader.eq_ignore_ascii_case(downloader));
+        self.upload_queue
+            .retain(|job| !job.downloader.eq_ignore_ascii_case(downloader));
+        self.uploads
+            .retain(|_, job| !job.downloader.eq_ignore_ascii_case(downloader));
         before != self.upload_queue.len() + self.uploads.len()
     }
 }
@@ -319,11 +498,131 @@ impl ClientContext {
 mod tests {
     use super::*;
     #[test]
+    fn closed_actor_recovers_only_its_undelivered_offers_without_replaying_stale_tokens() {
+        let mut ctx = ClientContext::new();
+        ctx.upload_slots = 6;
+        ctx.upload_slots_per_user = 6;
+        for name in ["unsent", "delivered", "accepted", "replacement", "cancelled"] {
+            ctx.enqueue_upload("alice", name, name.into(), 100);
+        }
+        let mut token = 9;
+        ctx.pump_uploads(|| { token += 1; token });
+        for job in ctx.uploads.values_mut() { job.delivery_actor = Some(7); }
+        ctx.mark_offer_sent("alice", 11);
+        ctx.answer_upload_offer("alice", 12, true, None);
+        ctx.uploads.get_mut(&13).unwrap().delivery_actor = Some(8);
+        ctx.answer_upload_offer("alice", 14, false, Some("Cancelled".into()));
+        assert_eq!(ctx.recover_undelivered_upload_offers(99), 0);
+        assert_eq!(ctx.recover_undelivered_upload_offers(7), 1);
+        assert_eq!(ctx.recover_undelivered_upload_offers(7), 0);
+        assert_eq!(ctx.upload_queue.len(), 1);
+        assert_eq!(ctx.upload_queue[0].virtual_path, "unsent");
+        ctx.mark_offer_sent("alice", 10);
+        assert_eq!(ctx.answer_upload_offer("alice", 10, true, None), None);
+        ctx.pump_uploads(|| 15);
+        assert!(ctx.uploads[&15].delivery_started.is_some());
+        assert!(ctx.uploads.contains_key(&11));
+        assert!(ctx.uploads.contains_key(&12));
+        assert!(ctx.uploads.contains_key(&13));
+        assert!(!ctx.uploads.contains_key(&14));
+        assert!(ctx.take_peer_messages("alice").is_empty());
+    }
+    #[test]
+    fn recovery_preserves_arrival_order_when_new_requests_have_filled_the_queue() {
+        let mut ctx = ClientContext::new();
+        ctx.upload_slots = 1;
+        ctx.enqueue_upload("alice", "first", "first".into(), 1);
+        ctx.pump_uploads(|| 10);
+        ctx.uploads.get_mut(&10).unwrap().delivery_actor = Some(7);
+        for index in 0..128 {
+            let name = format!("later-{index}");
+            ctx.enqueue_upload("alice", &name, name.clone().into(), 1);
+        }
+        assert_eq!(ctx.upload_queue.len(), 128);
+        assert_eq!(ctx.recover_undelivered_upload_offers(7), 1);
+        assert_eq!(ctx.upload_queue.len(), 129);
+        assert_eq!(ctx.place_in_queue("alice", "first"), Some(1));
+        ctx.pump_uploads(|| 11);
+        assert_eq!(ctx.uploads[&11].virtual_path, "first");
+        assert_eq!(ctx.upload_queue.len(), 128);
+    }
+    #[test]
+    fn only_delivered_offers_start_the_answer_timeout_and_delivery_itself_is_bounded() {
+        let mut ctx = ClientContext::new();
+        ctx.enqueue_upload("alice", "f.flac", "f.flac".into(), 100);
+        ctx.pump_uploads(|| 10);
+        ctx.uploads.get_mut(&10).unwrap().delivery_started = Some(Instant::now() - Duration::from_secs(50));
+        assert!(!ctx.expire_stale_offers(Instant::now()), "an unsent offer must not use the answer clock");
+        ctx.mark_offer_sent("other", 10);
+        assert!(ctx.uploads[&10].offered.is_none());
+        ctx.mark_offer_sent("alice", 10);
+        assert!(!ctx.expire_stale_offers(Instant::now() + Duration::from_secs(44)));
+        assert!(ctx.expire_stale_offers(Instant::now() + Duration::from_secs(46)));
+        assert!(matches!(&ctx.upload_events.last().unwrap().status, UploadStatus::TimedOut(message) if message.contains("did not answer")));
+        ctx.enqueue_upload("alice", "f.flac", "f.flac".into(), 100);
+        ctx.pump_uploads(|| 11);
+        assert!(ctx.expire_stale_offers(Instant::now() + Duration::from_secs(61)));
+        assert!(matches!(&ctx.upload_events.last().unwrap().status, UploadStatus::TimedOut(message) if message.contains("Could not deliver")));
+    }
+    #[test]
+    fn negative_upload_answers_release_slots_immediately_without_phantom_timeouts_or_bytes() {
+        for (reason, expected) in [("Complete", "completed"), ("Cancelled", "cancelled"),
+            ("Disallowed extension", "cancelled"), ("Busy", "failed"), ("", "failed")] {
+            let mut ctx = ClientContext::new();
+            ctx.upload_slots = 1;
+            for file in ["first.flac", "next.flac"] {
+                ctx.enqueue_upload("alice", file, PathBuf::from(file), 100);
+            }
+            assert_eq!(ctx.pump_uploads(|| 10).1.len(), 1);
+            assert_eq!(ctx.answer_upload_offer("alice", 10, false, Some(reason.into())), Some(false));
+            let event = ctx.upload_events.last().unwrap();
+            match (&event.status, expected) {
+                (UploadStatus::Completed, "completed") | (UploadStatus::Cancelled, "cancelled") => {},
+                (UploadStatus::Failed(message), "failed") => assert!(message.contains("declined")),
+                other => panic!("wrong rejection outcome: {other:?}"),
+            }
+            assert_eq!(event.bytes_sent, 0);
+            assert_eq!(event.speed_bytes_per_sec, 0.);
+            assert!(!ctx.uploads.contains_key(&10));
+            assert!(!ctx.expire_stale_offers(Instant::now() + Duration::from_secs(60)));
+            let next = ctx.pump_uploads(|| 11).1;
+            assert_eq!(next.len(), 1);
+            assert_eq!(next[0].virtual_path, "next.flac");
+        }
+    }
+    #[test]
+    fn responses_are_bound_to_the_requesting_user_and_accepted_once_across_connections() {
+        let mut ctx = ClientContext::new();
+        ctx.enqueue_upload("Alice", "file.flac", PathBuf::from("file.flac"), 100);
+        ctx.pump_uploads(|| 10);
+        assert_eq!(ctx.answer_upload_offer("mallory", 10, false, Some("Complete".into())), None);
+        assert_eq!(ctx.answer_upload_offer("mallory", 10, true, None), None);
+        assert!(ctx.uploads[&10].delivery_started.is_some());
+        assert_eq!(ctx.answer_upload_offer("alice", 10, true, None), Some(true));
+        assert_eq!(ctx.answer_upload_offer("ALICE", 10, true, None), Some(false));
+        assert_eq!(ctx.answer_upload_offer("Alice", 10, false, Some("Cancelled".into())), Some(false));
+        assert!(ctx.uploads.contains_key(&10));
+        assert!(!ctx.expire_stale_offers(Instant::now() + Duration::from_secs(60)));
+    }
+    #[test]
     fn banned_names_and_duplicate_requests_never_enter_the_queue() {
-        let mut ctx=ClientContext::new();ctx.banned_users.insert("alice".into());
-        ctx.enqueue_upload("Alice","music\\a.flac",PathBuf::from("/tmp/a"),100);assert!(ctx.upload_queue.is_empty());
-        for _ in 0..1000{ctx.enqueue_upload("bob","music\\b.flac",PathBuf::from("/tmp/b"),100);}assert_eq!(ctx.upload_queue.len(),1);
-        for i in 0..200{ctx.enqueue_upload("bob",&format!("music\\{i}.flac"),PathBuf::from("/tmp/b"),100);}assert_eq!(ctx.upload_queue.len(),128);
+        let mut ctx = ClientContext::new();
+        ctx.banned_users.insert("alice".into());
+        ctx.enqueue_upload("Alice", "music\\a.flac", PathBuf::from("/tmp/a"), 100);
+        assert!(ctx.upload_queue.is_empty());
+        for _ in 0..1000 {
+            ctx.enqueue_upload("bob", "music\\b.flac", PathBuf::from("/tmp/b"), 100);
+        }
+        assert_eq!(ctx.upload_queue.len(), 1);
+        for i in 0..200 {
+            ctx.enqueue_upload(
+                "bob",
+                &format!("music\\{i}.flac"),
+                PathBuf::from("/tmp/b"),
+                100,
+            );
+        }
+        assert_eq!(ctx.upload_queue.len(), 128);
     }
 
     fn queued(user: &str, privileged: bool, seq: u64) -> QueuedUpload {
@@ -365,29 +664,42 @@ mod tests {
 
     #[test]
     fn manual_priorities_and_positions_reorder_waiting_files_within_privilege_classes() {
-        let mut a=queued("alice",false,1);let mut b=queued("bob",false,2);let mut c=queued("carol",true,3);
-        a.manual_order=Some((0,1));b.manual_order=Some((1,0));c.manual_order=Some((-1,2));
-        let mut queue=vec![a,b,c];
-        assert_eq!(serve_order(&queue),vec![2,1,0]);
-        queue[0].manual_order=Some((1,0));queue[1].manual_order=Some((1,1));
-        assert_eq!(serve_order(&queue),vec![2,0,1]);
-        queue[2].privileged=false;
-        assert_eq!(serve_order(&queue),vec![0,1,2]);
+        let mut a = queued("alice", false, 1);
+        let mut b = queued("bob", false, 2);
+        let mut c = queued("carol", true, 3);
+        a.manual_order = Some((0, 1));
+        b.manual_order = Some((1, 0));
+        c.manual_order = Some((-1, 2));
+        let mut queue = vec![a, b, c];
+        assert_eq!(serve_order(&queue), vec![2, 1, 0]);
+        queue[0].manual_order = Some((1, 0));
+        queue[1].manual_order = Some((1, 1));
+        assert_eq!(serve_order(&queue), vec![2, 0, 1]);
+        queue[2].privileged = false;
+        assert_eq!(serve_order(&queue), vec![0, 1, 2]);
     }
 
     #[test]
     fn updating_manual_preferences_changes_the_next_real_upload_offer() {
-        let client=crate::Client::new("me","password");
+        let client = crate::Client::new("me", "password");
         {
-            let mut ctx=client.context.write().unwrap();ctx.upload_slots=0;
-            ctx.enqueue_upload("alice","a.flac",std::path::PathBuf::from("/tmp/a"),100);
-            ctx.enqueue_upload("bob","b.flac",std::path::PathBuf::from("/tmp/b"),100);
+            let mut ctx = client.context.write().unwrap();
+            ctx.upload_slots = 0;
+            ctx.enqueue_upload("alice", "a.flac", std::path::PathBuf::from("/tmp/a"), 100);
+            ctx.enqueue_upload("bob", "b.flac", std::path::PathBuf::from("/tmp/b"), 100);
         }
-        client.set_upload_queue_order(vec![("bob".into(),"b.flac".into(),1,0),("alice".into(),"a.flac".into(),0,1)]);
-        let mut ctx=client.context.write().unwrap();ctx.upload_slots=1;
-        let (_,offers)=ctx.pump_uploads(||123);
-        assert_eq!(offers.len(),1);assert_eq!(offers[0].requester_key,"bob");assert_eq!(offers[0].virtual_path,"b.flac");
-        assert_eq!(ctx.upload_queue.len(),1);assert_eq!(ctx.upload_queue[0].downloader,"alice");
+        client.set_upload_queue_order(vec![
+            ("bob".into(), "b.flac".into(), 1, 0),
+            ("alice".into(), "a.flac".into(), 0, 1),
+        ]);
+        let mut ctx = client.context.write().unwrap();
+        ctx.upload_slots = 1;
+        let (_, offers) = ctx.pump_uploads(|| 123);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].requester_key, "bob");
+        assert_eq!(offers[0].virtual_path, "b.flac");
+        assert_eq!(ctx.upload_queue.len(), 1);
+        assert_eq!(ctx.upload_queue[0].downloader, "alice");
     }
 
     #[test]
@@ -450,10 +762,23 @@ mod context_tests {
     use std::path::PathBuf;
     #[test]
     fn per_user_slots_skip_a_busy_user_and_zero_total_pauses_new_offers() {
-        let (mut ctx,mut token)=context(3);ctx.upload_slots_per_user=1;
-        ask(&mut ctx,"alice","a.flac");ask(&mut ctx,"alice","b.flac");ask(&mut ctx,"bob","c.flac");
-        let (_,offers)=ctx.pump_uploads(&mut token);assert_eq!(offers.iter().map(|o|o.requester_key.as_str()).collect::<Vec<_>>(),["alice","bob"]);assert_eq!(ctx.upload_queue.len(),1);
-        ctx.upload_slots=0;ask(&mut ctx,"charlie","d.flac");assert!(ctx.pump_uploads(&mut token).1.is_empty());
+        let (mut ctx, mut token) = context(3);
+        ctx.upload_slots_per_user = 1;
+        ask(&mut ctx, "alice", "a.flac");
+        ask(&mut ctx, "alice", "b.flac");
+        ask(&mut ctx, "bob", "c.flac");
+        let (_, offers) = ctx.pump_uploads(&mut token);
+        assert_eq!(
+            offers
+                .iter()
+                .map(|o| o.requester_key.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert_eq!(ctx.upload_queue.len(), 1);
+        ctx.upload_slots = 0;
+        ask(&mut ctx, "charlie", "d.flac");
+        assert!(ctx.pump_uploads(&mut token).1.is_empty());
     }
 
     /// A context with `slots` upload slots and a token counter that hands out
@@ -473,12 +798,10 @@ mod context_tests {
     }
 
     /// Who the pump offered to, by the order it offered them.
-    fn offered(
-        ctx: &mut ClientContext,
-        token: &mut impl FnMut() -> u32,
-    ) -> Vec<String> {
-        ctx.pump_uploads(token)
-            .1
+    fn offered(ctx: &mut ClientContext, token: &mut impl FnMut() -> u32) -> Vec<String> {
+        let offers = ctx.pump_uploads(token).1;
+        for offer in &offers { ctx.mark_offer_sent(&offer.requester_key, offer.token); }
+        offers
             .into_iter()
             .map(|offer| offer.requester_key)
             .collect()
@@ -584,8 +907,7 @@ mod context_tests {
         );
         assert_eq!(offered(&mut ctx, &mut token), ["next"]);
         assert!(ctx.take_upload_events().iter().any(|event| {
-            event.username == "gone"
-                && matches!(event.status, UploadStatus::TimedOut(_))
+            event.username == "gone" && matches!(event.status, UploadStatus::TimedOut(_))
         }));
     }
 
@@ -614,15 +936,12 @@ mod context_tests {
             1,
             crate::client::ActiveUpload {
                 payload_bytes: Default::default(),
+                rate: Default::default(),
                 username: job.downloader,
                 filename: job.virtual_path,
                 size: job.size,
-                bytes_sent: std::sync::Arc::new(
-                    std::sync::atomic::AtomicU64::new(job.size),
-                ),
-                cancel: std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
-                ),
+                bytes_sent: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(job.size)),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 status: UploadStatus::Completed,
                 started: std::time::Instant::now(),
             },
@@ -688,8 +1007,9 @@ mod context_tests {
         // ...but the fact that bob waited survives for whoever asks next.
         let events = ctx.take_upload_events();
         assert!(
-            events.iter().any(|u| u.username == "bob"
-                && matches!(u.status, UploadStatus::Queued(_))),
+            events
+                .iter()
+                .any(|u| u.username == "bob" && matches!(u.status, UploadStatus::Queued(_))),
             "bob's wait should still be reportable, got {events:?}"
         );
         assert!(

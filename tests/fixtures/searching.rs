@@ -65,7 +65,7 @@ fn scoped_searches_have_independent_tokens_and_wishlist_clock_survives_restart()
         handle
             .commands
             .send(Command::SearchScoped {
-                query: "same query".into(),
+                query: "supertramp logical flac".into(),
                 scope,
             })
             .unwrap();
@@ -87,12 +87,15 @@ fn scoped_searches_have_independent_tokens_and_wishlist_clock_survives_restart()
         if code == 42 {
             user_token = token;
         }
-        assert_eq!(take_string(&payload, &mut at), "same query");
+        assert_eq!(take_string(&payload, &mut at), "supertramp logical flac");
     }
     tokens.sort();
     tokens.dedup();
     assert_eq!(tokens.len(), 3);
     assert!(user_token > 0);
+    // Busy peers and server rosters can delay replies beyond the old 30-second
+    // collection cutoff. Keep this a real wire reply, not an injected snapshot.
+    std::thread::sleep(Duration::from_secs(31));
     let mut peer = TcpStream::connect(("127.0.0.1", peer_port)).unwrap();
     init_peer(&mut peer, "P");
     let mut payload = string("fixture-peer");
@@ -100,7 +103,9 @@ fn scoped_searches_have_independent_tokens_and_wishlist_clock_survives_restart()
     payload.extend(4000_u32.to_le_bytes());
     for i in 0..4000 {
         payload.push(1);
-        payload.extend(string(&format!("Music\\Album\\{i:04}.flac")));
+        payload.extend(string(&format!(
+            "Music\\Supertramp\\Logical Song {i:04}.flac"
+        )));
         payload.extend((if i == 0 { 0_u64 } else { 100_u64 }).to_le_bytes());
         payload.extend(string("flac"));
         payload.extend(0_u32.to_le_bytes());
@@ -158,9 +163,15 @@ fn scoped_searches_have_independent_tokens_and_wishlist_clock_survives_restart()
     assert!(!tokens.contains(&repeated_token));
     assert_eq!(take_string(&repeat_payload, &mut at), "edited album");
     // Old-token results cannot repopulate the repeated search.
+    // Search-only connections may be closed after a reply, as in Nicotine+.
+    let mut peer = TcpStream::connect(("127.0.0.1", peer_port)).unwrap();
+    init_peer(&mut peer, "P");
     send(&mut peer, 9, &compressed(&payload));
+    drop(peer);
     let token_at = string("fixture-peer").len();
     payload[token_at..token_at + 4].copy_from_slice(&repeated_token.to_le_bytes());
+    let mut peer = TcpStream::connect(("127.0.0.1", peer_port)).unwrap();
+    init_peer(&mut peer, "P");
     send(&mut peer, 9, &compressed(&payload));
     wait_for(&handle, |s| {
         s.searches
@@ -202,6 +213,36 @@ fn scoped_searches_have_independent_tokens_and_wishlist_clock_survives_restart()
         s.error.as_ref().is_some_and(|e| e.contains("rate limit"))
     });
     assert!(frames.try_recv().is_err());
+    // Ordinary and pinned wishlist history is not capped at the legacy 8/16.
+    for i in 0..20 {
+        handle
+            .commands
+            .send(Command::Search {
+                query: format!("extra album {i}"),
+            })
+            .unwrap();
+    }
+    wait_for(&handle, |s| {
+        s.searches
+            .iter()
+            .filter(|s| s.wishlist_id.is_none())
+            .count()
+            == 23
+    });
+    for _ in 0..20 {
+        assert_eq!(frames.recv_timeout(Duration::from_secs(5)).unwrap().0, 26);
+    }
+    handle
+        .commands
+        .send(Command::OpenWish {
+            id: wish.id.clone(),
+        })
+        .unwrap();
+    wait_for(&handle, |s| {
+        s.searches
+            .iter()
+            .any(|s| s.wishlist_id.as_deref() == Some(wish.id.as_str()) && s.pinned)
+    });
     drop(peer);
     handle.commands.send(Command::Disconnect).unwrap();
     wait_for(&handle, |s| s.connection == "disconnected");
@@ -223,6 +264,7 @@ fn scoped_searches_have_independent_tokens_and_wishlist_clock_survives_restart()
         wish.last_run
     );
     assert!(!restored.snapshot.borrow().wishlist[0].enabled);
+    assert_eq!(restored.snapshot.borrow().searches.len(), 23);
     assert_eq!(
         restored
             .snapshot
