@@ -2,6 +2,8 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, expect, it } from "vitest";
 import {
   cancelTransferBatches,
+  retryDownloadBatches,
+  canCancelTransfer,
   selectTransferRange,
   transferKey,
   useTransferSelection,
@@ -17,6 +19,47 @@ const rows: Transfer[] = Array.from({ length: 350 }, (_, i) => ({
   status: "queued",
   queue_position: null,
 }));
+it("selects failed and timed-out downloads across filters and preserves them for retry", () => {
+  const failed = rows
+    .slice(0, 3)
+    .map((t, i) => ({
+      ...t,
+      status: ["failed", "timed_out", "interrupted"][i],
+    }));
+  const { result, rerender } = renderHook(
+    ({ all, order }) => useTransferSelection(all, order, "failed", false),
+    { initialProps: { all: failed, order: failed } },
+  );
+  act(() => result.current.select(failed[0], {}));
+  act(() => result.current.select(failed[2], { shiftKey: true }));
+  expect(result.current.selected.size).toBe(3);
+  expect(
+    [...result.current.selected.values()].filter((t) =>
+      canCancelTransfer(t, false),
+    ),
+  ).toHaveLength(1);
+  rerender({ all: [failed[1]], order: [failed[1]] });
+  expect(result.current.selected.size).toBe(3);
+  rerender({ all: [{ ...failed[1], status: "completed" }], order: [] });
+  expect(result.current.selected.size).toBe(2);
+});
+it("splits bulk retries into bounded requests without losing long UTF-8 paths", () => {
+  const failed = rows.map((t) => ({
+    ...t,
+    status: "failed",
+    path: t.path + "音楽🎶".repeat(30),
+  }));
+  const batches = retryDownloadBatches("alice", failed);
+  expect(batches.flatMap((b) => b.paths)).toEqual(failed.map((t) => t.path));
+  expect(
+    batches.every(
+      (b) =>
+        b.type === "retry_downloads" &&
+        b.paths.length <= 256 &&
+        new TextEncoder().encode(JSON.stringify(b)).length <= 7500,
+    ),
+  ).toBe(true);
+});
 it("uses Ctrl toggles, reverse Shift ranges and additive Ctrl-Shift ranges across unloaded DOM rows", () => {
   let state = selectTransferRange(new Map(), rows, rows[0], null, false, false);
   state = selectTransferRange(

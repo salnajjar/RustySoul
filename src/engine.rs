@@ -601,7 +601,9 @@ impl Engine {
             Command::Search { .. } | Command::SearchScoped { .. } => "Start search",
             Command::RestartSearch { .. } => "Repeat search",
             Command::Discover { .. } => "Update discovery",
-            Command::RetryDownloads { .. } => "Retry failed downloads",
+            Command::RetryDownloads { .. } | Command::RetryDownloadsConfirmed { .. } => {
+                "Retry failed downloads"
+            }
             Command::RetryUploads { .. } => "Retry failed uploads",
             Command::CancelUploads { .. } | Command::CancelUpload { .. } => "Cancel uploads",
             Command::CancelDownloads { .. } => "Cancel downloads",
@@ -1088,50 +1090,19 @@ impl Engine {
                 ));
                 return Ok(());
             }
-            Command::RetryDownloads { username } => {
-                let c = self
-                    .client
-                    .as_ref()
-                    .context("Connect to Soulseek before retrying downloads")?;
-                let retryable = |r: &&SavedDownload| {
-                    matches!(r.status.as_str(), "failed" | "timed_out" | "interrupted")
-                        && username.as_ref().is_none_or(|u| u == &r.username)
-                };
-                let count = self.queue.iter().filter(retryable).count();
-                let active = self
-                    .queue
-                    .iter()
-                    .filter(|r| !automation::finished(&r.status))
-                    .count();
-                ensure!(
-                    count + active <= self.config.limits.transfers,
-                    "Not enough download queue space; retry individual files or increase the transfer queue limit"
-                );
-                let keys = self
-                    .queue
-                    .iter()
-                    .filter(retryable)
-                    .map(|r| (r.username.clone(), r.path.clone()))
-                    .collect::<Vec<_>>();
-                for (user, path) in &keys {
-                    let _ = c.remove_download(user, path);
-                    self.retries.remove(&(user.clone(), path.clone()));
-                    self.store.connection.execute(
-                        "DELETE FROM download_retries WHERE username=?1 AND path=?2",
-                        rusqlite::params![user, path],
-                    )?;
-                }
-                for r in &mut self.queue {
-                    if keys.iter().any(|(u, p)| u == &r.username && p == &r.path) {
-                        r.status = "waiting".into();
-                    }
-                }
-                self.persist()?;
-                self.pump_downloads()?;
-                self.view.notice = Some(format!(
-                    "Queued {count} failed or interrupted downloads for retry"
-                ));
-                return Ok(());
+            Command::RetryDownloads { username, paths } => {
+                return self
+                    .retry_downloads(username.as_deref(), &paths)
+                    .map(|_| ());
+            }
+            Command::RetryDownloadsConfirmed {
+                username,
+                paths,
+                reply,
+            } => {
+                let result = self.retry_downloads(username.as_deref(), &paths);
+                let _ = reply.send(result.as_ref().copied().map_err(|e| format!("{e:#}")));
+                return result.map(|_| ());
             }
             Command::UpdateTransferQueue {
                 direction,
@@ -2390,6 +2361,57 @@ impl Engine {
         crate::search::trim_previews(&mut self.view.searches);
         Ok(())
     }
+    fn retry_downloads(&mut self, username: Option<&str>, paths: &[String]) -> Result<usize> {
+        let c = self
+            .client
+            .as_ref()
+            .context("Connect to Soulseek before retrying downloads")?;
+        let wanted: std::collections::HashSet<_> = paths.iter().map(String::as_str).collect();
+        let keys: Vec<_> = self
+            .queue
+            .iter()
+            .filter(|r| {
+                matches!(r.status.as_str(), "failed" | "timed_out" | "interrupted")
+                    && username.is_none_or(|u| u.eq_ignore_ascii_case(&r.username))
+                    && (paths.is_empty() || wanted.contains(r.path.as_str()))
+            })
+            .map(|r| (r.username.clone(), r.path.clone()))
+            .collect();
+        let active = self
+            .queue
+            .iter()
+            .filter(|r| !automation::finished(&r.status))
+            .count();
+        ensure!(
+            active + keys.len() <= self.config.limits.transfers,
+            "Not enough download queue space; retry fewer files or increase the transfer queue limit"
+        );
+        // Persist the status and timer reset atomically before touching the SDK
+        // or acknowledging the selection. Partial payload and history stay intact.
+        self.store.retry_downloads(&keys)?;
+        let selected: std::collections::HashSet<_> =
+            keys.iter().map(|(u, p)| (u.as_str(), p.as_str())).collect();
+        for row in &mut self.queue {
+            if selected.contains(&(row.username.as_str(), row.path.as_str())) {
+                row.status = "waiting".into();
+            }
+        }
+        for key in &keys {
+            let _ = c.remove_download(&key.0, &key.1);
+            self.retries.remove(key);
+            self.storage_retry.remove(key);
+        }
+        self.view.transfer_revision += 1;
+        self.view.downloads = crate::transfers::preview(&self.store.connection, "downloads")?;
+        if let Err(error) = self.pump_downloads() {
+            self.view.error = Some(format!("Could not start queued retries: {error:#}"));
+        }
+        self.view.notice = Some(format!(
+            "Queued {} failed or interrupted downloads for retry",
+            keys.len()
+        ));
+        Ok(keys.len())
+    }
     fn pump_upload_retries(&mut self) -> Result<()> {
         let Some(c) = self
             .client
@@ -2824,6 +2846,18 @@ impl Engine {
                 .iter_mut()
                 .find(|r| r.username == d.username && r.path == d.filename)
             {
+                if row.size != d.size {
+                    crate::activity::record(
+                        "info",
+                        "downloads",
+                        &format!(
+                            "Updated size for '{}' from {}: {} to {} bytes; obsolete partial bytes were reset before accepting the offer",
+                            row.path, row.username, row.size, d.size
+                        ),
+                    );
+                    row.size = d.size;
+                    changed = true;
+                }
                 if status == "completed" && row.local_path.is_empty() {
                     match crate::downloads::organize(row) {
                         Ok(Some(path)) => {
@@ -2865,10 +2899,6 @@ impl Engine {
                         }
                     }
                     row.status = status.clone();
-                    changed = true;
-                }
-                if row.size != d.size {
-                    row.size = d.size;
                     changed = true;
                 }
             }

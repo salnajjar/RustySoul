@@ -16,7 +16,7 @@ Use HTTPS for remote integrations. Keys are not accepted through cookies, query 
 
 Read-only keys can read `/status`, `/metrics`, `/events`, `/logs`, `/profile`, `/traffic`, `/folders`, `/users/picture`, `/downloads/file`, `/browse/files`, `/browse/tree`, `/rooms/entries`, `/transfers/{kind}` and `/searches/{id}/results`, relative to `/api/v1`. This includes retained chats, file metadata and downloaded file contents; share keys only with trusted integrations.
 
-Read-and-control keys additionally allow POST `/commands`, `/downloads/batch` and `/profile`. They can initiate searches and transfers, send messages, and change application, network, sharing, file-location and Soulseek-account settings through ordinary validated commands. These are broad control permissions, not a download-only role.
+Read-and-control keys additionally allow POST `/commands`, `/downloads/batch`, `/downloads/retry` and `/profile`. They can initiate searches and transfers, send messages, and change application, network, sharing, file-location and Soulseek-account settings through ordinary validated commands. These are broad control permissions, not a download-only role.
 
 Administrator account/session routes, API-key management, encrypted backup/restore and database maintenance require an administrator browser session and are excluded from both scopes. Newly added routes are denied to named keys unless explicitly added to the allowlist. Existing request bounds, command rate limits and queue admission apply to keys as well. HTTP 401 means invalid/expired/revoked/disabled credentials; 403 means insufficient permissions. A 202 command response acknowledges admission, not completion.
 

@@ -295,7 +295,7 @@ export const emptySnapshot: Snapshot = {
     checked_at: 0,
     listener_ready: false,
   },
-  transfer_capacity: 128,
+  transfer_capacity: 2048,
   location_roots: [],
   locations: { downloads: "", shares: [] },
   library: {

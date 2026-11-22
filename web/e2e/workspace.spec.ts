@@ -4823,6 +4823,116 @@ test("refresh restores the current section and Settings logs filter safely", asy
   ).toHaveAttribute("aria-selected", "true");
 });
 
+test("failed download groups retry beyond one batch, preserve rejected selections and scope user retries", async ({
+  page,
+}) => {
+  await page.route("**/api/v1/commands",r=>r.fulfill({status:202,json:{status:"queued"}}));
+  let rows = Array.from({ length: 270 }, (_, i) => ({
+    username: "alice",
+    path: `Music/failed-${i}.flac`,
+    size: 100,
+    transferred: 42,
+    speed: 0,
+    status: i % 2 ? "timed_out" : "failed",
+    queue_position: null,
+  }));
+  rows.push(
+    { ...rows[0], path: "Music/active.flac", status: "queued" },
+    { ...rows[0], path: "Music/done.flac", status: "completed" },
+  );
+  const calls: { username: string | null; paths: string[] }[] = [];
+  let reject = true;
+  await page.route("**/api/v1/transfers/downloads?**", (r) =>
+    r.fulfill({
+      json: {
+        transfers: rows,
+        total: rows.length,
+        offset: 0,
+        next_offset: rows.length,
+        summary: {
+          total: rows.length,
+          active: 0,
+          queued: 1,
+          speed: 0,
+          clearable: { all: 271, failed: 135, timed_out: 135, completed: 1 },
+        },
+        users: {},
+      },
+    }),
+  );
+  await page.route("**/api/v1/downloads/retry", async (r) => {
+    const body = r.request().postDataJSON();
+    calls.push(body);
+    if (reject)
+      return r.fulfill({
+        status: 409,
+        json: { error: "Queue full in fixture" },
+      });
+    return r.fulfill({
+      status: 202,
+      json: { status: "queued", files: body.paths.length || 270 },
+    });
+  });
+  await fixture(page, {
+    ...emptySnapshot,
+    connection: "connected",
+    downloads_total: rows.length,
+    downloads: rows,
+  });
+  await page.getByRole("button", { name: "Downloads", exact: true }).click();
+  await page.getByLabel("Group by user", { exact: true }).check();
+  await page
+    .getByRole("button", {
+      name: "Select failed downloads for alice",
+      exact: true,
+    })
+    .click();
+  await expect(page.getByText(/^270 downloads selected/)).toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Retry selected downloads (270)",
+      exact: true,
+    })
+    .click();
+  await expect(
+    page.getByText("Queue full in fixture", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/^270 downloads selected/)).toBeVisible();
+  expect(calls).toHaveLength(1);
+  reject = false;
+  calls.length = 0;
+  await page
+    .getByRole("button", {
+      name: "Retry selected downloads (270)",
+      exact: true,
+    })
+    .click();
+  await expect(page.getByText(/^0 downloads selected/)).toBeVisible();
+  expect(calls).toHaveLength(2);
+  expect(calls.flatMap((c) => c.paths)).toEqual(
+    rows.slice(0, 270).map((r) => r.path),
+  );
+  expect(
+    calls.every((c) => c.username === "alice" && c.paths.length <= 256),
+  ).toBe(true);
+  expect(calls.flatMap((c) => c.paths)).not.toContain("Music/active.flac");
+  expect(calls.flatMap((c) => c.paths)).not.toContain("Music/done.flac");
+  await page
+    .getByRole("button", {
+      name: "Retry failed downloads for alice",
+      exact: true,
+    })
+    .click();
+  await expect
+    .poll(() => calls.at(-1))
+    .toEqual({ username: "alice", paths: [] });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
+
 test("failed downloads can be retried and a user's uploads can be cancelled in bulk", async ({
   page,
 }) => {
@@ -4830,6 +4940,11 @@ test("failed downloads can be retried and a user's uploads can be cancelled in b
   await page.route("**/api/v1/commands", (r) => {
     commands.push(r.request().postDataJSON());
     return r.fulfill({ status: 202, json: { status: "queued" } });
+  });
+  await page.route("**/api/v1/downloads/retry", (r) => {
+    const body = r.request().postDataJSON();
+    commands.push({ type: "retry_downloads", ...body });
+    return r.fulfill({ status: 202, json: { status: "queued", files: 1 } });
   });
   const transfer = (username: string, path: string, status: string) => ({
     username,
@@ -4854,7 +4969,11 @@ test("failed downloads can be retried and a user's uploads can be cancelled in b
   await page
     .getByRole("button", { name: "Retry failed downloads", exact: true })
     .click();
-  expect(commands).toContainEqual({ type: "retry_downloads", username: null });
+  expect(commands).toContainEqual({
+    type: "retry_downloads",
+    username: null,
+    paths: [],
+  });
   await page
     .getByRole("button", { name: "Retry failed.flac", exact: true })
     .click();

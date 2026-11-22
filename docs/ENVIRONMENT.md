@@ -37,7 +37,7 @@ Booleans accept `true` or `false`. Folder lists accept one absolute path or a JS
 | `RUSTYSOUL_MAX_SEARCH_RESULTS` | `100000`; 100–1000000 |
 | `RUSTYSOUL_MAX_BROWSE_FILES` | `1000000`; 100–2000000 |
 | `RUSTYSOUL_MAX_SEARCHES` | Legacy setting accepted and ignored; search history has no count limit. |
-| `RUSTYSOUL_MAX_TRANSFERS` | `128`; 1–1024 |
+| `RUSTYSOUL_MAX_TRANSFERS` | `2048`; 1–2048 unfinished downloads; simultaneous transfers use the separate slot settings |
 | `RUST_LOG` | `rustysoul=info` when unset; diagnostic logging filter |
 | `RUSTYSOUL_INSTALL_TYPE` | Auto-detected; optional `docker`, `podman`, `container` or `native` override for [release update instructions](UPDATES.md) |
 

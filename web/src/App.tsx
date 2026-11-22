@@ -67,7 +67,10 @@ import {
   useTransferSelection,
   transferKey,
   canCancelTransfer,
+  canSelectTransfer,
+  canRetryDownload,
   cancelTransferBatches,
+  retryDownloadBatches,
 } from "./TransferSelection";
 import { useTransferFeed } from "./useTransferFeed";
 import AudioPlayer from "./AudioPlayer";
@@ -250,6 +253,12 @@ export default function App() {
                   },
                 ]
               : (command as { files: unknown }).files,
+        });
+      } else if ((command as { type: string }).type === "retry_downloads") {
+        const retry = command as { username: string | null; paths?: string[] };
+        await api(token, "downloads/retry", {
+          username: retry.username,
+          paths: retry.paths ?? [],
         });
       } else {
         await api(token, "commands", command);
@@ -1317,7 +1326,7 @@ function TransfersPage({
   const visibleOrder = groups
     .filter(([u]) => !groupUsers || !isCollapsed(u))
     .flatMap(([, rows]) => rows)
-    .filter((t) => canCancelTransfer(t, uploads));
+    .filter((t) => canSelectTransfer(t, uploads));
   const selection = useTransferSelection(
     shown,
     visibleOrder,
@@ -1325,11 +1334,24 @@ function TransfersPage({
     uploads,
   );
   const { selected, setSelected } = selection;
-  async function submitCancellation(command: object) {
+  const selectedRetryCount = (user?: string) =>
+    [...selected.values()].filter(
+      (t) => canRetryDownload(t) && (!user || t.username === user),
+    ).length;
+  const selectedCancelCount = (user?: string) =>
+    [...selected.values()].filter(
+      (t) => canCancelTransfer(t, uploads) && (!user || t.username === user),
+    ).length;
+  async function submitCancellation(command: object, retry = false) {
     const deadline = Date.now() + 30000;
     for (;;) {
       try {
-        await api(token, "commands", command);
+        const action = command as { username: string | null; paths: string[] };
+        await api(
+          token,
+          retry ? "downloads/retry" : "commands",
+          retry ? { username: action.username, paths: action.paths } : command,
+        );
         return true;
       } catch (e) {
         if (
@@ -1349,7 +1371,7 @@ function TransfersPage({
     setSelectionError("");
     try {
       const entries = [...selected.values()].filter(
-        (t) => !user || t.username === user,
+        (t) => canCancelTransfer(t, uploads) && (!user || t.username === user),
       );
       for (const username of new Set(entries.map((t) => t.username))) {
         for (const batch of cancelTransferBatches(
@@ -1358,6 +1380,41 @@ function TransfersPage({
           entries.filter((t) => t.username === username),
         )) {
           if (!(await submitCancellation(batch))) return;
+          const keys = new Set(
+            batch.paths.map((path) => transferKey({ username, path })),
+          );
+          setSelected(
+            (old) => new Map([...old].filter(([key]) => !keys.has(key))),
+          );
+        }
+      }
+    } catch (e) {
+      setSelectionError((e as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }
+  async function retrySelected(user?: string, allForUser = false) {
+    setCancelling(true);
+    setSelectionError("");
+    try {
+      const entries = [...selected.values()].filter(
+        (t) => canRetryDownload(t) && (!user || t.username === user),
+      );
+      if (allForUser) {
+        await submitCancellation({ username: user ?? null, paths: [] }, true);
+        const keys = new Set(entries.map(transferKey));
+        setSelected(
+          (old) => new Map([...old].filter(([key]) => !keys.has(key))),
+        );
+        return;
+      }
+      for (const username of new Set(entries.map((t) => t.username))) {
+        for (const batch of retryDownloadBatches(
+          username,
+          entries.filter((t) => t.username === username),
+        )) {
+          await submitCancellation(batch, true);
           const keys = new Set(
             batch.paths.map((path) => transferKey({ username, path })),
           );
@@ -1505,6 +1562,7 @@ function TransfersPage({
             <button
               className="button small secondary"
               disabled={
+                cancelling ||
                 (!uploads && !online) ||
                 ((data?.summary.clearable.failed || 0) +
                   (data?.summary.clearable.timed_out || 0) +
@@ -1515,10 +1573,9 @@ function TransfersPage({
                   ))
               }
               onClick={() =>
-                send({
-                  type: uploads ? "retry_uploads" : "retry_downloads",
-                  username: null,
-                })
+                uploads
+                  ? send({ type: "retry_uploads", username: null })
+                  : void retrySelected(undefined, true)
               }
             >
               Retry failed {uploads ? "uploads" : "downloads"}
@@ -1641,14 +1698,14 @@ function TransfersPage({
             {selectionError}
           </SystemMessage>
         )}
-        {cancelling && <p role="status">Submitting cancellation requests…</p>}
+        {cancelling && <p role="status">Submitting transfer requests…</p>}
         <div className="results-selection upload-selection">
           <button
             className="button small secondary"
             disabled={cancelling}
             onClick={() => selection.add(shown)}
           >
-            Select loaded active {direction}
+            Select loaded {uploads ? "active uploads" : "downloads"}
           </button>
           <button
             className="button small secondary"
@@ -1661,9 +1718,19 @@ function TransfersPage({
             {selected.size} {direction} selected ·{" "}
             {bytes([...selected.values()].reduce((n, t) => n + t.size, 0))}
           </span>
+          {!uploads && (
+            <button
+              className="button small secondary"
+              disabled={cancelling || !online || !selectedRetryCount()}
+              onClick={() => void retrySelected()}
+              title="Queue selected failed, timed-out or interrupted downloads for another attempt."
+            >
+              Retry selected downloads ({selectedRetryCount()})
+            </button>
+          )}
           <button
             className="button small secondary"
-            disabled={cancelling || !selected.size}
+            disabled={cancelling || !selectedCancelCount()}
             onClick={() => void cancelSelected()}
           >
             Cancel selected {direction}
@@ -1725,6 +1792,43 @@ function TransfersPage({
                     </button>
                     <User username={username} />
                     <div className="button-row upload-bulk-controls">
+                      {!uploads && (
+                        <>
+                          <button
+                            className="button small secondary"
+                            aria-label={`Select failed downloads for ${username}`}
+                            disabled={
+                              cancelling || !rows.some(canRetryDownload)
+                            }
+                            onClick={() =>
+                              selection.add(rows.filter(canRetryDownload))
+                            }
+                          >
+                            Select failed
+                          </button>
+                          <button
+                            className="button small secondary"
+                            aria-label={`Retry failed downloads for ${username}`}
+                            disabled={cancelling || !online}
+                            title="Retry all this user's failed, timed-out or interrupted downloads, including files hidden by filters."
+                            onClick={() => void retrySelected(username, true)}
+                          >
+                            Retry failed
+                          </button>
+                          <button
+                            className="button small secondary"
+                            aria-label={`Retry selected downloads for ${username} (${selectedRetryCount(username)})`}
+                            disabled={
+                              cancelling ||
+                              !online ||
+                              !selectedRetryCount(username)
+                            }
+                            onClick={() => void retrySelected(username)}
+                          >
+                            Retry selected ({selectedRetryCount(username)})
+                          </button>
+                        </>
+                      )}
                       {uploads && (
                         <button
                           className="button small secondary"
@@ -1747,7 +1851,7 @@ function TransfersPage({
                         className="button small secondary"
                         disabled={
                           cancelling ||
-                          !rows.some((t) => canCancelTransfer(t, uploads))
+                          !rows.some((t) => canSelectTransfer(t, uploads))
                         }
                         aria-label={`Select all ${direction} for ${username}`}
                         onClick={() => selection.add(rows)}
@@ -1778,22 +1882,11 @@ function TransfersPage({
                       </button>
                       <button
                         className="button small secondary"
-                        disabled={
-                          cancelling ||
-                          ![...selected.values()].some(
-                            (t) => t.username === username,
-                          )
-                        }
-                        aria-label={`Cancel selected ${direction} for ${username} (${[...selected.values()].filter((t) => t.username === username).length})`}
+                        disabled={cancelling || !selectedCancelCount(username)}
+                        aria-label={`Cancel selected ${direction} for ${username} (${selectedCancelCount(username)})`}
                         onClick={() => void cancelSelected(username)}
                       >
-                        Cancel selected (
-                        {
-                          [...selected.values()].filter(
-                            (t) => t.username === username,
-                          ).length
-                        }
-                        )
+                        Cancel selected ({selectedCancelCount(username)})
                       </button>
                     </div>
                     {data?.users?.[username] && (
@@ -1819,7 +1912,7 @@ function TransfersPage({
                       <div
                         className={`transfer-row${selected.has(transferKey(t)) ? " selected" : ""}`}
                         key={transferKey(t)}
-                        tabIndex={canCancelTransfer(t, uploads) ? 0 : undefined}
+                        tabIndex={canSelectTransfer(t, uploads) ? 0 : undefined}
                         role="group"
                         aria-label={`${uploads ? "Upload" : "Download"} ${t.path} for ${t.username}`}
                         onMouseDown={(e) => {
@@ -1845,7 +1938,7 @@ function TransfersPage({
                           }
                         }}
                       >
-                        {canCancelTransfer(t, uploads) && (
+                        {canSelectTransfer(t, uploads) && (
                           <input
                             type="checkbox"
                             aria-label={`Select ${uploads ? "upload" : "download"} ${t.path} for ${t.username}`}

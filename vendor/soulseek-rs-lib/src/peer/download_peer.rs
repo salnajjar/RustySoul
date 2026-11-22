@@ -125,6 +125,33 @@ pub(crate) fn discard_idle_partial(download: &Download) {
     }
 }
 
+/// Retire bytes belonging to an obsolete advertised size before accepting a
+/// new offer. Do this before publishing the new size, so a crash cannot resume
+/// old payload with the updated length. Never truncate an external hardlink or
+/// follow a symlink; a locked writer prevents the size change entirely.
+pub(crate) fn reset_idle_partial(download: &Download) -> io::Result<()> {
+    let path = part_path_of(download).ok_or_else(|| io::Error::other("Invalid partial-file path"))?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(target_os="linux")] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    file.try_lock().map_err(io::Error::other)?;
+    if !file.metadata()?.is_file() { return Err(io::Error::other("Partial is not a regular file")); }
+    remove_owned_partial(&path, &file);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::other("Obsolete partial could not be removed safely")),
+    }
+}
+
 pub fn part_path_of(download: &Download) -> Option<String> {
     resolve_download_path(download)
         .ok()

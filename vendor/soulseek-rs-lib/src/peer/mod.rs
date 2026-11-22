@@ -5,7 +5,7 @@ pub mod upload_peer;
 // Export actor types
 pub use crate::actor::peer_actor::PeerMessage;
 
-pub(crate) use download_peer::discard_idle_partial;
+pub(crate) use download_peer::{discard_idle_partial, reset_idle_partial};
 pub use download_peer::{DownloadError, DownloadPeer};
 
 use crate::message::Message;

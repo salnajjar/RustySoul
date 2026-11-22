@@ -294,3 +294,96 @@ fn partial_downloads_pause_cancel_resume_and_restart_without_changing_bytes_or_t
         "ok"
     );
 }
+#[test]
+fn changed_remote_sizes_restart_obsolete_partials_and_persist_exact_completed_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        while let Ok((code, _)) = receive(&mut stream) {
+            if code == 1 {
+                let mut reply = vec![1];
+                reply.extend(string("Changed-size fixture"));
+                reply.extend([1, 0, 0, 127]);
+                reply.extend(string("checksum"));
+                reply.push(0);
+                send(&mut stream, 1, &reply);
+            }
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: temp.path().into(),
+        ..Default::default()
+    };
+    config.soulseek.server = "127.0.0.1".into();
+    config.soulseek.port = server_port;
+    config.soulseek.listen_port = peer_port;
+    config.soulseek.auto_connect = false;
+    let h = engine::start(
+        config,
+        Secrets::new("s".repeat(32), "fixture-user".into(), "password".into()).unwrap(),
+    )
+    .unwrap();
+    h.commands
+        .send(Command::UpdateNetwork {
+            settings: rustysoul::model::NetworkSettings {
+                port: peer_port,
+                minimum_free_space_mib: 0,
+                download_slots: 1,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    h.commands.send(Command::Connect).unwrap();
+    wait_for(&h, |s| s.connection == "connected");
+    let mut peer = control(peer_port);
+    let root = std::path::PathBuf::from(&h.snapshot.borrow().locations.downloads);
+    for (token, path, advertised, actual) in [
+        (9201, "grow.flac", 4096, 8192),
+        (9202, "shrink.flac", 8192, 4096),
+        (9203, "empty.txt", 100, 0),
+    ] {
+        let part = root
+            .join(".incomplete")
+            .join(rustysoul::downloads::key("fixture-peer", path))
+            .join(format!("{path}.part"));
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, vec![255; advertised / 2]).unwrap();
+        h.commands
+            .send(Command::Download {
+                username: "fixture-peer".into(),
+                path: path.into(),
+                size: advertised as u64,
+            })
+            .unwrap();
+        assert_eq!(receive_code(&mut peer, 43), string(path));
+        let (mut file, offset) = offer(&mut peer, peer_port, path, actual, token);
+        assert_eq!(offset, 0, "Changed content must never resume old bytes");
+        let payload: Vec<_> = (0..actual).map(|n| (n % 251) as u8).collect();
+        file.write_all(&payload).unwrap();
+        drop(file);
+        wait_for(&h, |s| {
+            s.downloads
+                .iter()
+                .any(|t| t.path == path && t.status == "completed" && t.size == actual as u64)
+        });
+        let complete = root.join("fixture-peer").join(path);
+        assert_eq!(std::fs::read(complete).unwrap(), payload);
+        assert!(!part.exists());
+        let db = rusqlite::Connection::open(temp.path().join("rustysoul.sqlite3")).unwrap();
+        let saved: (i64, String, i64) = db.query_row("SELECT size,status,transferred FROM downloads WHERE username='fixture-peer' AND path=?1", [path], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(saved, (actual as i64, "completed".into(), actual as i64));
+    }
+    assert!(h.snapshot.borrow().error.is_none());
+    h.stop.send(()).unwrap();
+    h.thread.join().unwrap();
+    drop(peer);
+    server.join().unwrap();
+}

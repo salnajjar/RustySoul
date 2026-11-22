@@ -46,6 +46,7 @@ impl Scope {
                 path,
                 "/commands"
                     | "/downloads/batch"
+                    | "/downloads/retry"
                     | "/profile"
                     | "/rooms/read"
                     | "/messages/read"

@@ -16,6 +16,10 @@ export const canCancelTransfer = (t: Transfer, uploads: boolean) =>
         "interrupted",
       ]
   ).includes(t.status);
+export const canRetryDownload = (t: Transfer) =>
+  ["failed", "timed_out", "interrupted"].includes(t.status);
+export const canSelectTransfer = (t: Transfer, uploads: boolean) =>
+  canCancelTransfer(t, uploads) || (!uploads && canRetryDownload(t));
 
 export function selectTransferRange(
   selected: Map<string, Transfer>,
@@ -57,9 +61,9 @@ export function useTransferSelection(
       for (const t of all) {
         const key = transferKey(t);
         if (!old.has(key)) continue;
-        if (!canCancelTransfer(t, uploads) || old.get(key) !== t) {
+        if (!canSelectTransfer(t, uploads) || old.get(key) !== t) {
           if (next === old) next = new Map(old);
-          if (canCancelTransfer(t, uploads)) next.set(key, t);
+          if (canSelectTransfer(t, uploads)) next.set(key, t);
           else next.delete(key);
         }
       }
@@ -71,7 +75,7 @@ export function useTransferSelection(
     modifiers: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean },
     checkbox = false,
   ) {
-    if (!canCancelTransfer(t, uploads)) return;
+    if (!canSelectTransfer(t, uploads)) return;
     const prior =
       anchor.current.criterion === criterion ? anchor.current.key : null;
     const toggle = !!(
@@ -102,7 +106,7 @@ export function useTransferSelection(
     setSelected((old) => {
       const next = new Map(old);
       for (const t of rows)
-        if (canCancelTransfer(t, uploads)) next.set(transferKey(t), t);
+        if (canSelectTransfer(t, uploads)) next.set(transferKey(t), t);
       return next;
     });
   }
@@ -125,6 +129,16 @@ export function cancelTransferBatches(
   rows: Transfer[],
 ) {
   const type = uploads ? "cancel_uploads" : "cancel_downloads";
+  return transferActionBatches(type, username, rows);
+}
+export function retryDownloadBatches(username: string, rows: Transfer[]) {
+  return transferActionBatches("retry_downloads", username, rows);
+}
+function transferActionBatches(
+  type: string,
+  username: string,
+  rows: Transfer[],
+) {
   const batches: { type: string; username: string; paths: string[] }[] = [];
   let batch = { type, username, paths: [] as string[] };
   const encoder = new TextEncoder();
@@ -134,7 +148,7 @@ export function cancelTransferBatches(
         .length > 7500
     )
       throw new Error(
-        "This filename exceeds the batch request limit. You can cancel all transfers for this user instead.",
+        `This filename exceeds the batch request limit. You can ${type === "retry_downloads" ? "retry all failed downloads" : "cancel all transfers"} for this user instead.`,
       );
     const candidate = { ...batch, paths: [...batch.paths, t.path] };
     if (

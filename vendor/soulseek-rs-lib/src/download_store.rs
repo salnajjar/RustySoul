@@ -103,12 +103,22 @@ impl DownloadStore {
         if matches!(download.status, DownloadStatus::Cancelled) { return Err("Cancelled"); }
         if download.is_finished() { return Err("File no longer requested"); }
         if !matches!(download.status, DownloadStatus::Queued) || self.offers.contains_key(&download.token) { return Err("Transfer already active, offered or paused"); }
-        if download.size != size { return Err("File size changed; refresh the search or listing"); }
+        // Some SoulseekQt peers send zero in offers for files over 2 GiB.
+        // Keep the requested length in that case; zero must not publish an
+        // empty replacement for a large file. Small genuinely empty files work.
+        let size = if size == 0 && download.size > i32::MAX as u64 { download.size } else { size };
+        if size > 16 * 1024_u64.pow(4) { return Err("Invalid offered file size (maximum 16 TiB)"); }
         if !self.has_slot(username) {
             self.defer(username,filename);
             return Err("No free download slot; please wait for a new request");
         }
-        self.get_by_file_mut(username,filename).unwrap().token = token;
+        let download = self.get_by_file_mut(username,filename).unwrap();
+        if download.size != size {
+            crate::peer::reset_idle_partial(download).map_err(|_| "File size changed, but the old partial file is busy or cannot be safely reset; retry after resolving local storage access")?;
+            download.progress.set(0);
+            download.size = size;
+        }
+        download.token = token;
         self.offers.insert(token, std::time::Instant::now());
         Ok(())
     }
@@ -364,7 +374,78 @@ mod tests {
         let mut store=DownloadStore::new();store.add(make_download(7,DownloadStatus::Queued));
         assert!(store.accept_offer("peer","file-7.mp3",7,100).is_ok());assert_eq!(store.list().len(),1);assert!(store.claim_for_peer(7,"peer").is_some());
         assert!(store.accept_offer("peer","file-7.mp3",8,100).is_err());assert!(store.accept_offer("other","file-7.mp3",7,100).is_err());assert!(store.accept_offer("peer","not-requested",8,100).is_err());
-        let mut store=DownloadStore::new();store.add(make_download(7,DownloadStatus::Queued));store.add(make_download(8,DownloadStatus::Queued));assert!(store.accept_offer("peer","file-7.mp3",8,100).is_err());assert!(store.accept_offer("peer","file-7.mp3",9,101).is_err());assert!(store.accept_offer("peer","file-7.mp3",9,100).is_ok());assert!(store.get_by_token(7).is_none());assert!(store.claim_for_peer(9,"peer").is_some());
+        let dir=OfferDir::new();let mut first=make_download(7,DownloadStatus::Queued);first.download_directory=dir.path().to_string_lossy().into_owned();let mut store=DownloadStore::new();store.add(first);store.add(make_download(8,DownloadStatus::Queued));assert!(store.accept_offer("peer","file-7.mp3",8,100).is_err());assert!(store.accept_offer("peer","file-7.mp3",9,101).is_ok());assert_eq!(store.get_by_token(9).unwrap().size,101);assert!(store.get_by_token(7).is_none());assert!(store.claim_for_peer(9,"peer").is_some());
+    }
+    struct OfferDir(std::path::PathBuf);
+    impl OfferDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+            let path=std::env::temp_dir().join(format!("soulseek-offer-{}-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir(&path).unwrap();Self(path)
+        }
+        fn path(&self)->&std::path::Path { &self.0 }
+    }
+    impl Drop for OfferDir { fn drop(&mut self) { let _=std::fs::remove_dir_all(&self.0); } }
+    #[test]
+    fn changed_offer_size_resets_old_bytes_and_rejects_huge_or_busy_offers() {
+        let dir = OfferDir::new();
+        let mut d = make_download(1,DownloadStatus::Queued);
+        d.download_directory = dir.path().to_string_lossy().into_owned();
+        let part = dir.path().join("file-1.mp3.part");
+        std::fs::write(&part,b"obsolete tags and audio").unwrap();
+        let mut store = DownloadStore::new(); store.add(d);
+        // Invalid and unsolicited offers cannot discard existing payload.
+        assert!(store.accept_offer("other","file-1.mp3",11,101).is_err());
+        assert!(store.accept_offer("peer","file-1.mp3",11,u64::MAX).is_err());
+        assert_eq!(std::fs::read(&part).unwrap(),b"obsolete tags and audio");
+        let writer = std::fs::OpenOptions::new().read(true).write(true).open(&part).unwrap();
+        writer.try_lock().unwrap();
+        assert!(store.accept_offer("peer","file-1.mp3",11,101).is_err());
+        assert_eq!(store.get_by_token(1).unwrap().size,100);
+        assert_eq!(store.usage().0,0);
+        drop(writer);
+        assert!(store.accept_offer("peer","file-1.mp3",11,101).is_ok());
+        assert!(!part.exists());
+        let accepted=store.get_by_token(11).unwrap();
+        assert_eq!(accepted.size,101); assert_eq!(accepted.progress_bytes(),Some(0));
+        assert_eq!(store.usage().0,1);
+    }
+    #[test]
+    fn unchanged_offer_keeps_resumable_payload_and_full_slots_do_not_reset_it() {
+        let dir = OfferDir::new();
+        let mut d=make_download(1,DownloadStatus::Queued);
+        d.download_directory=dir.path().to_string_lossy().into_owned();
+        let part=dir.path().join("file-1.mp3.part");std::fs::write(&part,b"keep me").unwrap();
+        let mut store=DownloadStore::new();store.add(d.clone());store.set_limits(0,1);
+        assert!(store.accept_offer("peer","file-1.mp3",11,101).is_err());
+        assert_eq!(std::fs::read(&part).unwrap(),b"keep me");
+        store.add(d);store.set_limits(1,1);
+        assert!(store.accept_offer("peer","file-1.mp3",11,100).is_ok());
+        assert_eq!(std::fs::read(&part).unwrap(),b"keep me");
+    }
+    #[test]
+    fn zero_size_large_file_quirk_preserves_the_known_length_and_partial() {
+        let dir=OfferDir::new();let mut d=make_download(1,DownloadStatus::Queued);
+        d.size=3*1024_u64.pow(3);d.download_directory=dir.path().to_string_lossy().into_owned();
+        let part=dir.path().join("file-1.mp3.part");std::fs::write(&part,b"valid large-file prefix").unwrap();
+        let mut store=DownloadStore::new();store.add(d);
+        assert!(store.accept_offer("peer","file-1.mp3",11,0).is_ok());
+        let claimed=store.claim_for_peer(11,"peer").unwrap();assert_eq!(claimed.size,3*1024_u64.pow(3));
+        assert_eq!(std::fs::read(&part).unwrap(),b"valid large-file prefix");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn changed_size_never_modifies_external_symlink_or_hardlink_contents() {
+        let dir=OfferDir::new();let outside=dir.path().join("outside");
+        std::fs::write(&outside,b"external payload").unwrap();
+        let mut d=make_download(1,DownloadStatus::Queued);d.download_directory=dir.path().to_string_lossy().into_owned();
+        let part=dir.path().join("file-1.mp3.part");std::os::unix::fs::symlink(&outside,&part).unwrap();
+        let mut store=DownloadStore::new();store.add(d);
+        assert!(store.accept_offer("peer","file-1.mp3",11,101).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(),b"external payload");
+        std::fs::remove_file(&part).unwrap();std::fs::hard_link(&outside,&part).unwrap();
+        assert!(store.accept_offer("peer","file-1.mp3",11,101).is_ok());
+        assert!(!part.exists());assert_eq!(std::fs::read(&outside).unwrap(),b"external payload");
     }
     #[test]
     fn add_get_remove_roundtrip() {

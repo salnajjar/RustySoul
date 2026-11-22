@@ -20,4 +20,4 @@ peers = 64
 upload_slots = 2
 download_bytes_per_second = 0
 # Search history has no count limit; close individual searches in the UI.
-transfers = 128
+transfers = 2048

@@ -632,6 +632,7 @@ fn manual_retry_scopes_failed_downloads_and_preserves_completed_and_other_users(
     h.commands
         .send(Command::RetryDownloads {
             username: Some("alice".into()),
+            paths: vec![],
         })
         .unwrap();
     let end = Instant::now() + Duration::from_secs(5);
@@ -935,6 +936,164 @@ fn storage_holds_release_slots_do_not_retry_and_respect_offline_pause_cancel_and
         "cancelled"
     );
     drop(snapshot);
+    h.stop.send(()).unwrap();
+    h.thread.join().unwrap();
+}
+
+#[test]
+fn selected_bulk_retries_preserve_other_files_progress_and_reject_full_queue_atomically() {
+    use rustysoul::model::NetworkSettings;
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let server = Server::start();
+    let mut config = Config {
+        data_dir: dir.path().into(),
+        ..Default::default()
+    };
+    config.soulseek.server = "127.0.0.1".into();
+    config.soulseek.port = server.port;
+    config.soulseek.listen_port = server.peer_port;
+    config.soulseek.auto_connect = false;
+    config.limits.transfers = 3;
+    let database = dir.path().join("rustysoul.sqlite3");
+    let mut store = rustysoul::store::Store::open(&database).unwrap();
+    store
+        .save_downloads(
+            &[
+                ("alice", "a", "failed"),
+                ("alice", "b", "timed_out"),
+                ("alice", "d", "interrupted"),
+                ("bob", "c", "failed"),
+                ("alice", "done", "completed"),
+                ("alice", "cancelled", "cancelled"),
+                ("alice", "active", "waiting"),
+            ]
+            .map(|(u, p, status)| rustysoul::store::SavedDownload {
+                username: u.into(),
+                path: p.into(),
+                status: status.into(),
+                size: 10,
+                directory: dir.path().join("downloads").to_string_lossy().into_owned(),
+                local_path: String::new(),
+            }),
+        )
+        .unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    db.execute(
+        "UPDATE downloads SET transferred=4 WHERE username='alice' AND path='a'",
+        [],
+    )
+    .unwrap();
+    db.execute_batch("INSERT INTO download_retries VALUES('alice','a',2,2000000000);INSERT INTO download_retries VALUES('alice','d',1,2000000000);").unwrap();
+    let h = engine::start(
+        config,
+        Secrets::new("s".repeat(32), "".into(), "".into()).unwrap(),
+    )
+    .unwrap();
+    h.commands
+        .send(Command::UpdateNetwork {
+            settings: NetworkSettings {
+                port: server.peer_port,
+                download_slots: 0,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    h.commands
+        .send(Command::UpdateCredentials {
+            username: "fixture".into(),
+            password: Some("fixture-password".into()),
+        })
+        .unwrap();
+    wait(&h, 1);
+    let (reply, receive) = std::sync::mpsc::sync_channel(1);
+    h.commands
+        .send(Command::RetryDownloadsConfirmed {
+            username: Some("ALICE".into()),
+            paths: vec![
+                "a".into(),
+                "a".into(),
+                "b".into(),
+                "done".into(),
+                "active".into(),
+                "cancelled".into(),
+            ],
+            reply,
+        })
+        .unwrap();
+    assert_eq!(
+        receive
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT transferred FROM downloads WHERE username='alice' AND path='a'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        4
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM download_retries WHERE path='a'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let (reply, receive) = std::sync::mpsc::sync_channel(1);
+    h.commands
+        .send(Command::RetryDownloadsConfirmed {
+            username: Some("alice".into()),
+            paths: vec!["d".into()],
+            reply,
+        })
+        .unwrap();
+    assert!(
+        receive
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err()
+            .contains("queue space")
+    );
+    for (user, path, status) in [
+        ("bob", "c", "failed"),
+        ("alice", "d", "interrupted"),
+        ("alice", "done", "completed"),
+        ("alice", "cancelled", "cancelled"),
+        ("alice", "a", "waiting"),
+        ("alice", "b", "waiting"),
+    ] {
+        assert_eq!(
+            db.query_row(
+                "SELECT status FROM downloads WHERE username=?1 AND path=?2",
+                [user, path],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            status
+        );
+    }
+    assert_eq!(
+        db.query_row(
+            "SELECT attempts FROM download_retries WHERE path='d'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
     h.stop.send(()).unwrap();
     h.thread.join().unwrap();
 }

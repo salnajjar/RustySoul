@@ -91,7 +91,7 @@ impl Default for Limits {
             upload_slots: 2,
             download_bytes_per_second: 0,
             searches: 0,
-            transfers: 128,
+            transfers: 2048,
         }
     }
 }
@@ -230,8 +230,8 @@ impl Config {
             "upload_slots must be 1..16"
         );
         ensure!(
-            (1..=1024).contains(&self.limits.transfers),
-            "transfers must be 1..1024"
+            (1..=2048).contains(&self.limits.transfers),
+            "transfers must be 1..2048"
         );
         ensure!(
             (100..=1_000_000).contains(&self.limits.search_results)
@@ -338,7 +338,7 @@ mod tests {
             ("RUSTYSOUL_MAX_PEERS", "12".into()),
             ("RUSTYSOUL_MAX_SEARCH_RESULTS", "1234".into()),
             ("RUSTYSOUL_MAX_BROWSE_FILES", "2345".into()),
-            ("RUSTYSOUL_MAX_TRANSFERS", "77".into()),
+            ("RUSTYSOUL_MAX_TRANSFERS", "2048".into()),
             ("RUSTYSOUL_MAX_SEARCHES", "4".into()),
             ("RUSTYSOUL_DOWNLOAD_BYTES_PER_SECOND", "999".into()),
         ]);
@@ -362,7 +362,7 @@ mod tests {
                 c.limits.transfers,
                 c.limits.searches
             ),
-            (12, 3, 77, 4)
+            (12, 3, 2048, 4)
         );
         assert_eq!(
             (
@@ -383,6 +383,10 @@ mod tests {
                     .apply_environment(|k| if k == key { Some(value.into()) } else { None })
                     .is_err()
             );
+        }
+        for invalid in [0, 2049] {
+            c.limits.transfers = invalid;
+            assert!(c.validate().is_err());
         }
         assert!(Config::load_optional(Some(&dir.path().join("missing.toml"))).is_err());
     }

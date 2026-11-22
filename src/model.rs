@@ -401,6 +401,14 @@ pub enum Command {
     },
     RetryDownloads {
         username: Option<String>,
+        #[serde(default)]
+        paths: Vec<String>,
+    },
+    #[serde(skip)]
+    RetryDownloadsConfirmed {
+        username: Option<String>,
+        paths: Vec<String>,
+        reply: std::sync::mpsc::SyncSender<Result<usize, String>>,
     },
     UpdateTransferQueue {
         direction: HistoryDirection,
@@ -662,9 +670,27 @@ impl Command {
                 }
                 Ok(())
             }
-            Self::RetryDownloads { username: u } | Self::RetryUploads { username: u } => {
+            Self::RetryUploads { username: u } => {
                 if let Some(u) = u {
                     username(u)?;
+                }
+                Ok(())
+            }
+            Self::RetryDownloads { username: u, paths }
+            | Self::RetryDownloadsConfirmed {
+                username: u, paths, ..
+            } => {
+                if let Some(u) = u {
+                    username(u)?;
+                }
+                if paths.len() > 256 {
+                    return Err("Select at most 256 transfers per request".into());
+                }
+                if !paths.is_empty() && u.is_none() {
+                    return Err("Choose a user for selected download retries".into());
+                }
+                for path in paths {
+                    remote_path(path)?;
                 }
                 Ok(())
             }

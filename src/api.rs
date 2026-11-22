@@ -166,6 +166,7 @@ pub fn router(state: ApiState) -> Router {
             "/downloads/batch",
             post(batch_download).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
+        .route("/downloads/retry", post(retry_downloads))
         .route("/auth/me", get(me))
         .route("/auth/account", post(change_account))
         .route("/auth/logout", post(logout))
@@ -815,6 +816,39 @@ struct BatchInput {
 struct BatchQuery {
     confirm: bool,
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryInput {
+    username: Option<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+async fn retry_downloads(State(state): State<ApiState>, Json(input): Json<RetryInput>) -> Response {
+    let (reply, receive) = mpsc::sync_channel(1);
+    let queued = admit_command(
+        &state,
+        Command::RetryDownloadsConfirmed {
+            username: input.username,
+            paths: input.paths,
+            reply,
+        },
+    );
+    if queued.status() != StatusCode::ACCEPTED {
+        return queued;
+    }
+    match tokio::task::spawn_blocking(move || receive.recv_timeout(Duration::from_secs(15))).await {
+        Ok(Ok(Ok(count))) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"status":"queued","files":count})),
+        )
+            .into_response(),
+        Ok(Ok(Err(message))) => error(StatusCode::CONFLICT, &message),
+        _ => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Retry confirmation timed out; selection was kept. Check the queue before retrying.",
+        ),
+    }
+}
 async fn batch_download(
     state: State<ApiState>,
     Query(query): Query<BatchQuery>,
@@ -894,6 +928,8 @@ async fn security(State(state): State<ApiState>, request: Request, next: Next) -
         ) || (path.starts_with("/api/v1/backups/") && path.ends_with("/restore")));
     let timeout = if backup_work {
         backups::OPERATION_TIMEOUT
+    } else if is_post && path == "/api/v1/downloads/retry" {
+        Duration::from_secs(20)
     } else if is_post && path == "/api/v1/profile" {
         Duration::from_secs(180)
     } else {
@@ -1595,6 +1631,80 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+    #[tokio::test]
+    async fn bulk_retry_requires_valid_scoped_paths_and_confirms_engine_admission() {
+        for expected in [Ok(2_usize), Err("Download queue is full".to_string())] {
+            let (app, receive) = app();
+            let result = expected.clone();
+            let worker = std::thread::spawn(move || match receive.recv().unwrap() {
+                Command::RetryDownloadsConfirmed {
+                    username,
+                    paths,
+                    reply,
+                } => {
+                    assert_eq!(username.as_deref(), Some("alice"));
+                    assert_eq!(paths, vec!["Music\\a.flac", "Music\\b.flac"]);
+                    reply.send(result).unwrap();
+                }
+                _ => panic!("Expected confirmed download retry"),
+            });
+            let response = app
+                .oneshot(req(
+                    "POST",
+                    "/api/v1/downloads/retry",
+                    Some(&"s".repeat(32)),
+                    r#"{"username":"alice","paths":["Music\\a.flac","Music\\b.flac"]}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if expected.is_ok() {
+                    StatusCode::ACCEPTED
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+            worker.join().unwrap();
+        }
+        for body in [
+            r#"{"username":null,"paths":["a"]}"#.to_string(),
+            serde_json::json!({"username":"alice","paths":vec!["a";257]}).to_string(),
+            r#"{"username":"alice","paths":["../escape"]}"#.to_string(),
+        ] {
+            let (app, _) = app();
+            assert_eq!(
+                app.oneshot(req(
+                    "POST",
+                    "/api/v1/downloads/retry",
+                    Some(&"s".repeat(32)),
+                    &body
+                ))
+                .await
+                .unwrap()
+                .status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        let (app, _) = app();
+        assert_eq!(
+            app.oneshot(req(
+                "POST",
+                "/api/v1/downloads/retry",
+                None,
+                r#"{"username":"alice","paths":["a"]}"#
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(crate::api_access::Scope::Control.allows("POST", "/downloads/retry"));
+        assert!(!crate::api_access::Scope::ReadOnly.allows("POST", "/downloads/retry"));
+        let legacy: Command =
+            serde_json::from_str(r#"{"type":"retry_downloads","username":null}"#).unwrap();
+        assert!(legacy.validate().is_ok());
     }
     #[tokio::test]
     async fn operational_logs_require_auth_and_filter_inert_messages() {

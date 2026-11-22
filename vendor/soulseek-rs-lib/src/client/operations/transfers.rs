@@ -116,6 +116,9 @@ impl Client {
                 drop(context);
                 if let Some(registry) = registry {
                     let response = if let Err(reason) = accepted {
+                        if reason.starts_with("File size changed") || reason.starts_with("Invalid offered file size") {
+                            warn!("[client] download offer from {} for '{}' rejected: {}", username, transfer.filename, reason);
+                        }
                         MessageFactory::build_transfer_denial_message(
                             transfer.token,
                             reason,

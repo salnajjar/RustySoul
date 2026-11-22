@@ -306,6 +306,20 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
+    /// Reset only the chosen failed records and their automatic timers together.
+    pub(crate) fn retry_downloads(&mut self, keys: &[(String, String)]) -> Result<()> {
+        let tx = write_transaction(&self.connection)?;
+        for (user, path) in keys {
+            tx.execute("UPDATE downloads SET status='waiting',speed=0,queue_position=NULL,updated_at=strftime('%s','now') WHERE username=?1 AND path=?2",params![user,path])?;
+            tx.execute(
+                "DELETE FROM download_retries WHERE username=?1 AND path=?2",
+                params![user, path],
+            )?;
+        }
+        tx.commit()?;
+        self.download_cache = None;
+        Ok(())
+    }
     pub fn save_downloads(&mut self, downloads: &[SavedDownload]) -> Result<()> {
         if self.download_cache.is_none() {
             let mut cache = std::collections::BTreeMap::<
@@ -659,6 +673,45 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_timer_write_failure_rolls_back_all_selected_status_and_progress_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let files = ["a", "b"].map(|p| SavedDownload {
+            username: "alice".into(),
+            path: p.into(),
+            size: 10,
+            status: "failed".into(),
+            directory: dir.path().to_string_lossy().into_owned(),
+            local_path: String::new(),
+        });
+        store.save_downloads(&files).unwrap();
+        store.connection.execute_batch("UPDATE downloads SET transferred=4;INSERT INTO download_retries VALUES('alice','b',2,2000000000);CREATE TRIGGER refuse_retry_timer BEFORE DELETE ON download_retries BEGIN SELECT RAISE(ABORT,'injected timer failure');END;").unwrap();
+        assert!(
+            store
+                .retry_downloads(&[("alice".into(), "a".into()), ("alice".into(), "b".into())])
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM downloads WHERE status='failed' AND transferred=4",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT attempts FROM download_retries", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
     #[test]
     fn schema_thirteen_keeps_arrival_ids_history_and_queue_preferences() {
         let dir = tempfile::tempdir().unwrap();
