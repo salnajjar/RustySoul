@@ -1,3 +1,23 @@
+# RustySoul v0.1.0
+
+The first stable release adds durable upload retries and installation-specific update notices to the functionality released in beta.5.
+
+## Changes since beta.5
+
+- Automatically re-offer new interrupted and timed-out uploads with increasing delays and a bounded retry budget. Retries wait for recipients to be online, respect sharing restrictions and queue limits, and require fresh transfer acceptance and the normal resume handshake. Cancelled transfers and permanent refusals are not retried automatically. Pending retries survive restarts and expire after seven days.
+- Retry saved failed uploads for one recipient or everyone from the Uploads page. Historical failures are retried only when requested. Cancellation includes pending retry timers. Transfer retry settings control downloads and uploads separately; both default to enabled.
+- Check for new stable releases anonymously at startup and every six hours. Show a dismissible notice with release notes and update instructions for Docker, Podman or native installations. Settings > Status & privacy includes a toggle and a manual check. No automatic installation or account/library telemetry is performed.
+- Release disconnected peer workers promptly even when a replacement arrives before lifecycle notifications are processed, preventing capacity from remaining occupied by dead workers.
+- Publish the stable container as `ghcr.io/salnajjar/rustysoul:0.1.0` and `:latest`, with a matching native Linux bundle. Update installation instructions and the project website for the stable channel.
+
+## Upgrade
+
+Back up persistent state, then pull the pinned `ghcr.io/salnajjar/rustysoul:0.1.0` image or the stable `:latest` channel. Recreate the container with its existing volumes, environment and service management. Beta users should explicitly switch image tags; the old `:beta` tag remains a beta release. Native installations can use the executable and installer in the release bundle. Keep the existing application data; no account reset or library rebuild is required.
+
+SQLite schema 18 migrates supported earlier installations and validates schema-11 through schema-18 backups. Preserve the matching database and executable/image together for rollback. Existing accounts, sessions, encrypted credentials, history, settings, library and traffic statistics are retained. Pending retries concern originally requested files only; the receiver may decline a new offer.
+
+The release gates include Rust/SDK and browser regressions, CodeQL review, native smoke checks and Docker/Podman installation checks. Public artifacts target Linux amd64/x86-64; the native bundle requires glibc 2.36 or newer. See [installation](https://github.com/salnajjar/RustySoul#readme) and [release verification](https://github.com/salnajjar/RustySoul/blob/main/docs/TESTING.md).
+
 # RustySoul v0.1.0-beta.5
 
 This beta improves search completeness, transfer reliability, upload reporting and everyday navigation. It includes the changes tested on the daemon since beta.4.

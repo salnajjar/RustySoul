@@ -11,6 +11,30 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 impl Client {
+    /// Re-offer a previously requested, still-shared file through normal upload
+    /// admission. The receiver may decline or resume it; payload is never pushed
+    /// without a fresh transfer acceptance and offset handshake.
+    pub fn retry_upload(&self, username: &str, filename: &str) -> crate::error::Result<bool> {
+        let queued = {
+            let mut ctx = self.context.write_safe()?;
+            if ctx.banned_users.contains(&username.to_ascii_lowercase()) {
+                return Err(crate::error::SoulseekRs::InvalidMessage("User is banned from shares".into()));
+            }
+            if ctx.upload_queue.iter().any(|u| u.downloader == username && u.virtual_path == filename)
+                || ctx.uploads.values().any(|u| u.downloader == username && u.virtual_path == filename)
+                || ctx.active_uploads.values().any(|u| u.username == username && u.filename == filename && matches!(u.status, UploadStatus::InProgress)) {
+                return Ok(false);
+            }
+            let file = ctx.shares.get(filename).ok_or_else(|| crate::error::SoulseekRs::InvalidMessage("File is no longer shared".into()))?;
+            let (size, real_path) = (file.size, file.real_path.clone());
+            let before = ctx.upload_queue.len();
+            ctx.enqueue_upload(username, filename, real_path, size);
+            ctx.upload_queue.len() > before
+        };
+        if !queued { return Err(crate::error::SoulseekRs::InvalidMessage("Upload queue is full".into())); }
+        Self::pump_upload_queue(&self.context);
+        Ok(true)
+    }
     /// None measures normally; a positive value overrides it; zero withholds speed.
     /// Configuration alone sends no server report and does not inflate upload counts.
     pub fn configure_upload_speed_reporting(&self, override_speed: Option<u32>, measured: u32) {

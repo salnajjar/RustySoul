@@ -171,6 +171,20 @@ test("four transfer summary cards show the full queue independently of visible h
 });
 
 test.beforeEach(async ({ page }) => {
+  await page.route("**/api/v1/updates", (route) =>
+    route.fulfill({
+      json: {
+        current_version: "0.1.0",
+        install_type: "native",
+        enabled: true,
+        checking: false,
+        checked_at: null,
+        next_check_at: null,
+        error: null,
+        available: null,
+      },
+    }),
+  );
   await page.route("**/api/v1/messages/read", (route) =>
     route.fulfill({ status: 202, json: { status: "queued" } }),
   );
@@ -183,6 +197,156 @@ test.beforeEach(async ({ page }) => {
     /\/api\/v1\/transfers\/uploads\?status=blocked&order=updated$/,
     (route) => route.fulfill({ json: { transfers: [], total: 0 } }),
   );
+});
+
+test("release notices link to the installation upgrade and settings control daemon checks", async ({
+  page,
+}) => {
+  const commands: any[] = [];
+  let checks = 0;
+  await page.route("**/api/v1/updates", (route) =>
+    route.fulfill({
+      json: {
+        current_version: "0.1.0",
+        install_type: "podman",
+        enabled: true,
+        checking: false,
+        checked_at: 100,
+        next_check_at: 21700,
+        error: null,
+        available: {
+          version: "0.2.0",
+          release_url:
+            "https://github.com/salnajjar/RustySoul/releases/tag/v0.2.0",
+          instructions_url:
+            "https://github.com/salnajjar/RustySoul/blob/v0.2.0/docs/CONTAINERS.md",
+          image: "ghcr.io/salnajjar/rustysoul:0.2.0",
+          native_url: null,
+          checksum_url: null,
+        },
+      },
+    }),
+  );
+  await page.route("**/api/v1/updates/check", (route) => {
+    checks++;
+    return route.fulfill({ json: { queued: true } });
+  });
+  await page.route("**/api/v1/commands", (route) => {
+    commands.push(route.request().postDataJSON());
+    return route.fulfill({ status: 202, json: { status: "queued" } });
+  });
+  await fixture(page, { ...emptySnapshot, connection: "connected" });
+  const notice = page
+    .getByRole("status")
+    .filter({ hasText: "RustySoul 0.2.0 is available." });
+  await expect(notice).toBeVisible();
+  await expect(
+    notice.getByRole("link", { name: "Update Podman" }),
+  ).toHaveAttribute(
+    "href",
+    "https://github.com/salnajjar/RustySoul/blob/v0.2.0/docs/CONTAINERS.md",
+  );
+  await notice.getByRole("button", { name: "Dismiss message" }).click();
+  await expect(notice).not.toBeVisible();
+  await page
+    .getByRole("button", { name: "Open settings", exact: true })
+    .click();
+  await page
+    .getByRole("tab", { name: "Status & privacy", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Check for updates now", exact: true })
+    .click();
+  await expect.poll(() => checks).toBe(1);
+  await page.getByLabel("Check for new releases automatically").uncheck();
+  await expect
+    .poll(() =>
+      commands.some(
+        (c) =>
+          c.type === "update_network" && c.settings.check_for_updates === false,
+      ),
+    )
+    .toBe(true);
+});
+
+test("upload history can be retried by recipient and pending retries cancelled while offline", async ({
+  page,
+}) => {
+  const commands: any[] = [];
+  const state: Snapshot = {
+    ...emptySnapshot,
+    connection: "disconnected",
+    uploads: [
+      {
+        username: "recipient",
+        path: "Music/failed.flac",
+        size: 100,
+        transferred: 42,
+        speed: 0,
+        status: "failed",
+        queue_position: null,
+      },
+      {
+        username: "recipient",
+        path: "Music/waiting.flac",
+        size: 100,
+        transferred: 42,
+        speed: 0,
+        status: "retry_waiting",
+        queue_position: null,
+      },
+    ],
+  };
+  await page.route("**/api/v1/commands", (route) => {
+    commands.push(route.request().postDataJSON());
+    return route.fulfill({ status: 202, json: { status: "queued" } });
+  });
+  await page.route("**/api/v1/transfers/uploads?**", (route) =>
+    route.fulfill({
+      json: {
+        transfers: state.uploads,
+        total: 2,
+        offset: 0,
+        has_more: false,
+        summary: {
+          total: 2,
+          active: 0,
+          queued: 1,
+          speed: 0,
+          clearable: { failed: 1 },
+        },
+        users: [],
+      },
+    }),
+  );
+  await fixture(page, state);
+  await page.getByRole("button", { name: "Uploads", exact: true }).click();
+  await page
+    .getByRole("button", {
+      name: "Retry failed uploads for recipient",
+      exact: true,
+    })
+    .click();
+  await expect
+    .poll(() =>
+      commands.some(
+        (c) => c.type === "retry_uploads" && c.username === "recipient",
+      ),
+    )
+    .toBe(true);
+  await page
+    .getByRole("button", { name: "Expand uploads for recipient", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Cancel upload", exact: true })
+    .click();
+  await expect
+    .poll(() =>
+      commands.some(
+        (c) => c.type === "cancel_upload" && c.path === "Music/waiting.flac",
+      ),
+    )
+    .toBe(true);
 });
 
 test("private unread alerts clear only when the selected chat reaches its latest message", async ({

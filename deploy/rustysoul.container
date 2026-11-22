@@ -1,5 +1,5 @@
 # Rootless Podman Quadlet. Install in ~/.config/containers/systemd/.
-# Pull image first: podman pull ghcr.io/salnajjar/rustysoul:beta
+# Pull image first: podman pull ghcr.io/salnajjar/rustysoul:latest
 # Create ~/.config/rustysoul/daemon.env with mode 600 (see .env.example).
 [Unit]
 Description=RustySoul daemon
@@ -7,7 +7,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/salnajjar/rustysoul:beta
+Image=ghcr.io/salnajjar/rustysoul:latest
 ContainerName=rustysoul
 User=10001:10001
 Network=host

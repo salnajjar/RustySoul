@@ -68,6 +68,7 @@ struct Engine {
     focused_users: BTreeMap<String, Instant>,
     wishlist_last_sent: u64,
     retries: BTreeMap<(String, String), automation::RetryState>,
+    upload_retry_watches: BTreeMap<String, Instant>,
     queue: Vec<SavedDownload>,
     store: Store,
     last_save: Instant,
@@ -244,6 +245,7 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
     let unread_through = view.messages.last().map_or(0, |m| m.id);
 
     crate::transfers::recover_uploads(&store.connection)?;
+    crate::upload_retry::recover(&store.connection, now() as i64)?;
     view.uploads = crate::transfers::preview(&store.connection, "uploads")?;
     view.traffic = crate::traffic::totals(&store.connection)?;
     crate::traffic::compact(&store.connection, now())?;
@@ -327,6 +329,7 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
                 focused_users: BTreeMap::new(),
                 wishlist_last_sent,
                 retries,
+                upload_retry_watches: BTreeMap::new(),
                 retry: None,
                 retry_seconds: 5,
             };
@@ -375,6 +378,10 @@ pub fn start(mut config: Config, mut secrets: Secrets) -> Result<EngineHandle> {
                     engine.publish();
                 }
                 engine.refresh();
+                if let Err(error) = engine.pump_upload_retries() {
+                    engine.view.error = Some(format!("Could not retry uploads: {error:#}"));
+                    engine.publish();
+                }
                 engine.poll_wishlist();
             }
             if let Some(client) = engine.client.as_mut() {
@@ -595,6 +602,7 @@ impl Engine {
             Command::RestartSearch { .. } => "Repeat search",
             Command::Discover { .. } => "Update discovery",
             Command::RetryDownloads { .. } => "Retry failed downloads",
+            Command::RetryUploads { .. } => "Retry failed uploads",
             Command::CancelUploads { .. } | Command::CancelUpload { .. } => "Cancel uploads",
             Command::CancelDownloads { .. } => "Cancel downloads",
             Command::UpdateTransferQueue { .. } => "Update transfer priority and queue",
@@ -1068,6 +1076,18 @@ impl Engine {
                 self.searches.insert(id, (query, Instant::now()));
                 return Ok(());
             }
+            Command::RetryUploads { username } => {
+                let count = crate::upload_retry::manual(
+                    &self.store.connection,
+                    username.as_deref(),
+                    now() as i64,
+                )?;
+                self.view.transfer_revision += 1;
+                self.view.notice = Some(format!(
+                    "Scheduled {count} upload retries; recipients must be online and accept the transfer."
+                ));
+                return Ok(());
+            }
             Command::RetryDownloads { username } => {
                 let c = self
                     .client
@@ -1198,10 +1218,22 @@ impl Engine {
                 return Ok(());
             }
             Command::CancelUploads { username, paths } => {
-                let c = self.client.as_ref().context("Connect to Soulseek first")?;
-                let cancelled = c.cancel_uploads(&username, &paths);
-                let count = cancelled.len();
+                let pending = crate::upload_retry::cancel(
+                    &self.store.connection,
+                    &username,
+                    &paths,
+                    now() as i64,
+                )?;
+                let cancelled = self
+                    .client
+                    .as_ref()
+                    .map_or_else(Vec::new, |c| c.cancel_uploads(&username, &paths));
+                let count = cancelled.len() + pending;
                 for u in cancelled {
+                    self.store.connection.execute(
+                        "DELETE FROM upload_retries WHERE username=?1 AND path=?2",
+                        rusqlite::params![u.username, u.filename],
+                    )?;
                     crate::transfers::record_upload(
                         &self.store.connection,
                         &TransferView {
@@ -1464,12 +1496,23 @@ impl Engine {
                 return Ok(());
             }
             Command::CancelUpload { username, path } => {
+                let pending = crate::upload_retry::cancel(
+                    &self.store.connection,
+                    &username,
+                    std::slice::from_ref(&path),
+                    now() as i64,
+                )?;
                 ensure!(
                     self.client
                         .as_ref()
-                        .is_some_and(|c| c.cancel_upload(&username, &path)),
+                        .is_some_and(|c| c.cancel_upload(&username, &path))
+                        || pending > 0,
                     "Upload is no longer active"
                 );
+                self.store.connection.execute(
+                    "DELETE FROM upload_retries WHERE username=?1 AND path=?2",
+                    rusqlite::params![username, path],
+                )?;
                 self.store.connection.execute("UPDATE uploads SET status='cancelled',speed=0,updated_at=strftime('%s','now') WHERE username=?1 AND path=?2 AND status IN ('queued','uploading','checking_shares')",rusqlite::params![username,path])?;
                 self.view.transfer_revision += 1;
                 return Ok(());
@@ -1906,8 +1949,12 @@ impl Engine {
                     }
                     self.persist()?;
                 }
+                if !settings.uploads_enabled {
+                    crate::upload_retry::disable(&self.store.connection)?;
+                    self.view.transfer_revision += 1;
+                }
                 self.view.retry_policy = settings;
-                self.view.notice = Some("Download retry settings saved".into());
+                self.view.notice = Some("Transfer retry settings saved".into());
                 return Ok(());
             }
             Command::RescanShares => {
@@ -2054,6 +2101,7 @@ impl Engine {
                 self.sample_traffic(true);
                 self.client = None;
                 crate::transfers::recover_uploads(&self.store.connection)?;
+                crate::upload_retry::recover(&self.store.connection, now() as i64)?;
                 self.view.transfer_revision += 1;
                 self.network_worker.update(self.network.clone(), false);
                 self.searches.clear();
@@ -2342,6 +2390,65 @@ impl Engine {
         crate::search::trim_previews(&mut self.view.searches);
         Ok(())
     }
+    fn pump_upload_retries(&mut self) -> Result<()> {
+        let Some(c) = self
+            .client
+            .as_ref()
+            .filter(|_| self.view.connection == "connected")
+        else {
+            return Ok(());
+        };
+        let timestamp = now() as i64;
+        self.upload_retry_watches
+            .retain(|_, at| at.elapsed() < Duration::from_secs(60));
+        for row in crate::upload_retry::due(&self.store.connection, timestamp)? {
+            if row.expires <= timestamp || row.attempts >= self.view.retry_policy.max_attempts {
+                crate::upload_retry::stop(
+                    &self.store.connection,
+                    &row,
+                    "Upload retry limit reached; use Retry failed uploads to try again.",
+                )?;
+            } else if c
+                .user_info(&row.user)
+                .and_then(|u| u.presence)
+                .is_some_and(|p| p.status.is_reachable())
+            {
+                match c.retry_upload(&row.user, &row.path) {
+                    Ok(attempted) => {
+                        crate::upload_retry::admitted(&self.store.connection, &row, attempted)?
+                    }
+                    Err(e)
+                        if e.to_string().contains("no longer shared")
+                            || e.to_string().contains("banned") =>
+                    {
+                        crate::upload_retry::stop(&self.store.connection, &row, &e.to_string())?
+                    }
+                    Err(_) => crate::upload_retry::defer(
+                        &self.store.connection,
+                        &row,
+                        timestamp,
+                        "Waiting for upload queue space and a connection to the recipient.",
+                    )?,
+                }
+            } else {
+                if self.upload_retry_watches.len() < 8
+                    && !self.upload_retry_watches.contains_key(&row.user)
+                {
+                    let _ = c.watch_user(&row.user);
+                    self.upload_retry_watches
+                        .insert(row.user.clone(), Instant::now());
+                }
+                crate::upload_retry::defer(
+                    &self.store.connection,
+                    &row,
+                    timestamp,
+                    "Waiting for the receiving user to be online; no upload slot is reserved.",
+                )?;
+            }
+            self.view.transfer_revision += 1;
+        }
+        Ok(())
+    }
     fn pump_downloads(&mut self) -> Result<()> {
         if automation::advance(
             &self.view.retry_policy,
@@ -2586,6 +2693,7 @@ impl Engine {
             self.sample_traffic(true);
             self.client = None;
             let _ = crate::transfers::recover_uploads(&self.store.connection);
+            let _ = crate::upload_retry::recover(&self.store.connection, now() as i64);
             self.view.transfer_revision += 1;
             self.clear_presence();
             self.network_worker.update(self.network.clone(), false);
@@ -2834,6 +2942,15 @@ impl Engine {
                     Ok(changed) => {
                         if changed {
                             self.view.transfer_revision += 1;
+                        }
+                        if let Err(e) = crate::upload_retry::observe(
+                            &self.store.connection,
+                            t,
+                            &self.view.retry_policy,
+                            now() as i64,
+                        ) {
+                            recorded = false;
+                            self.view.error = Some(format!("Could not save upload retry: {e:#}"));
                         }
                     }
                     Err(e) => {

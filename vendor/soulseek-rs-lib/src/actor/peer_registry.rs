@@ -163,7 +163,10 @@ impl PeerRegistry {
         self.get_peer_with_id(username).map(|(_, handle)| handle)
     }
 
-    pub(crate) fn get_peer_with_id(&self, username: &str) -> Option<(u64, ActorHandle<PeerMessage>)> {
+    pub(crate) fn get_peer_with_id(
+        &self,
+        username: &str,
+    ) -> Option<(u64, ActorHandle<PeerMessage>)> {
         match self.peers.lock_safe() {
             Ok(peers) => peers.get(username).cloned(),
             Err(e) => {
@@ -311,6 +314,48 @@ mod tests {
             Arc::new(AtomicUsize::new(capacity)),
         );
         (registry, rx)
+    }
+
+    #[test]
+    fn disconnected_workers_release_capacity_before_registry_notifications_are_processed() {
+        let (registry, operations) = capped_registry(1);
+        // Leave each closed worker registered until its successor replaces it.
+        // The client operations loop may be busy when a replacement arrives.
+        for _ in 0..8 {
+            let (peer, stream, remote) = loopback_peer("reconnecting-user");
+            let actor = registry.register_peer(peer, Some(stream), None).unwrap();
+            drop(remote);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let operation = operations
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if matches!(
+                    operation,
+                    crate::client::ClientOperation::PeerDisconnected(_, _, _)
+                ) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+            }
+            let _ = actor.send(crate::actor::peer_actor::PeerMessage::Retire);
+            // The registry still has this handle, but no socket can use it.
+            // Replacing it must not depend on the old actor accepting Retire.
+            while registry.live.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                actor.stopped.load(Ordering::Acquire),
+                "Disconnected peer worker never stopped"
+            );
+            assert_eq!(
+                registry.live.load(Ordering::Acquire),
+                0,
+                "Closed peers held the connection capacity"
+            );
+        }
+        registry.stop_all();
     }
 
     #[test]

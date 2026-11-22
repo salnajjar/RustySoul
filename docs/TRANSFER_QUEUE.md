@@ -2,7 +2,7 @@
 
 Downloads and Uploads share selection controls. Click a file to select it; Ctrl/Cmd-click toggles it and Shift-click selects the range in the current displayed order. Ctrl/Cmd+Shift-click adds a range. Checkboxes add/remove individual files. Ranges include loaded offscreen rows, skip completed/history entries, and respect collapsed user groups. A user's **Select all** includes its full loaded group. Filters retain selected identities until cancellation is accepted, the transfer finishes, or selection is cleared.
 
-Use **Cancel selected** for a batch or **Cancel all** beside a username for every unfinished transfer from that user, including files hidden by filters. Completed downloads and their media stay intact. Cancellation is submitted in bounded batches; accepted batches clear their selection and a failed remainder stays selected for retry. Downloads can be cancelled while offline. Upload cancellation requires the network connection. This cancels work rather than deleting retained history.
+Use **Cancel selected** for a batch or **Cancel all** beside a username for every unfinished transfer from that user, including files hidden by filters. Completed downloads and their media stay intact. Cancellation is submitted in bounded batches; accepted batches clear their selection and a failed remainder stays selected for retry. Downloads can be cancelled while offline. Pending upload retry timers can also be cancelled while offline. This cancels work rather than deleting retained history.
 
 ## Priority and order
 

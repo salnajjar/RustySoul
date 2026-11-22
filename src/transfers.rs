@@ -284,16 +284,18 @@ pub fn page(db: &Connection, kind: &str, q: &Query) -> Result<Page> {
                     },
                     status: r.get(5)?,
                     queue_position: r.get(6)?,
-                    retry_at: if kind == "downloads" {
+                    retry_at: {
                         db.query_row(
-                            "SELECT next_at FROM download_retries WHERE username=?1 AND path=?2",
+                            if kind == "downloads" {
+                                "SELECT next_at FROM download_retries WHERE username=?1 AND path=?2"
+                            } else {
+                                "SELECT next_at FROM upload_retries WHERE username=?1 AND path=?2"
+                            },
                             params![r.get::<_, String>(0)?, r.get::<_, String>(1)?],
                             |r| r.get::<_, Option<i64>>(0),
                         )
                         .unwrap_or_default()
                         .map(|v| v as u64)
-                    } else {
-                        None
                     },
                     added_at: r.get::<_, i64>(7)? as u64,
                     updated_at: r.get::<_, i64>(8)? as u64,

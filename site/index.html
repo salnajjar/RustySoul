@@ -60,8 +60,8 @@
         >
         <a
           class="release-pill"
-          href="https://github.com/salnajjar/RustySoul/releases/tag/v0.1.0-beta.5"
-          ><span class="dot"></span> v0.1.0-beta.5</a
+          href="https://github.com/salnajjar/RustySoul/releases/tag/v0.1.0"
+          ><span class="dot"></span> v0.1.0</a
         >
         <div class="nav-links">
           <a href="#features">Features</a><a href="#inside">Inside the app</a
@@ -561,7 +561,7 @@
             </div>
             <pre
               tabindex="0"
-            ><code id="code-docker">docker pull ghcr.io/salnajjar/rustysoul:beta
+            ><code id="code-docker">docker pull ghcr.io/salnajjar/rustysoul:latest
 docker run -d --name rustysoul --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
@@ -573,12 +573,12 @@ docker run -d --name rustysoul --restart unless-stopped \
   -v rustysoul-data:/var/lib/rustysoul \
   -v rustysoul-downloads:/downloads \
   -v rustysoul-library:/library:ro \
-  ghcr.io/salnajjar/rustysoul:beta</code></pre>
+  ghcr.io/salnajjar/rustysoul:latest</code></pre>
             <p class="install-help">
               Requires Docker Engine on Linux. Set environment variables and mount
               persistent storage; no repository checkout, Compose or configuration
               files are needed. The application comes from the public
-              <code>:beta</code> image; no registry login needed.
+              <code>:latest</code> image; no registry login needed.
               <a
                 href="https://github.com/salnajjar/RustySoul/blob/main/docs/STORAGE_MOUNTS.md"
                 >Configure your mounts ↗</a
@@ -604,7 +604,7 @@ docker run -d --name rustysoul --restart unless-stopped \
             </div>
             <pre
               tabindex="0"
-            ><code id="code-podman">podman pull ghcr.io/salnajjar/rustysoul:beta
+            ><code id="code-podman">podman pull ghcr.io/salnajjar/rustysoul:latest
 podman run -d --name rustysoul --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
@@ -616,7 +616,7 @@ podman run -d --name rustysoul --restart unless-stopped \
   -v rustysoul-data:/var/lib/rustysoul \
   -v rustysoul-downloads:/downloads \
   -v rustysoul-library:/library:ro \
-  ghcr.io/salnajjar/rustysoul:beta</code></pre>
+  ghcr.io/salnajjar/rustysoul:latest</code></pre>
             <p class="install-help">
               Requires Podman on Linux. Uses environment variables and named volumes,
               with no configuration files to download. Quadlet remains an optional
@@ -646,8 +646,8 @@ podman run -d --name rustysoul --restart unless-stopped \
             </div>
             <pre
               tabindex="0"
-            ><code id="code-native">curl -fLO https://github.com/salnajjar/RustySoul/releases/download/v0.1.0-beta.5/rustysoul-linux-x86_64.tar.gz &amp;&amp;
-curl -fLO https://github.com/salnajjar/RustySoul/releases/download/v0.1.0-beta.5/rustysoul-linux-x86_64.tar.gz.sha256 &amp;&amp;
+            ><code id="code-native">curl -fLO https://github.com/salnajjar/RustySoul/releases/download/v0.1.0/rustysoul-linux-x86_64.tar.gz &amp;&amp;
+curl -fLO https://github.com/salnajjar/RustySoul/releases/download/v0.1.0/rustysoul-linux-x86_64.tar.gz.sha256 &amp;&amp;
 sha256sum -c rustysoul-linux-x86_64.tar.gz.sha256 &amp;&amp;
 tar -xzf rustysoul-linux-x86_64.tar.gz &amp;&amp;
 cd rustysoul &amp;&amp;
@@ -672,9 +672,9 @@ sudo systemctl enable --now rustysoul-native.service</code></pre>
             </p>
           </div>
           <p class="beta-note">
-            <span class="dot"></span> Beta 2 · Linux amd64 ·
+            <span class="dot"></span> Stable 0.1.0 · Linux amd64 ·
             <a
-              href="https://github.com/salnajjar/RustySoul/releases/tag/v0.1.0-beta.5"
+              href="https://github.com/salnajjar/RustySoul/releases/tag/v0.1.0"
               >Release notes &amp; downloads ↗</a
             >
           </p>
@@ -723,10 +723,10 @@ sudo systemctl enable --now rustysoul-native.service</code></pre>
               >
             </summary>
             <p>
-              This is the first public beta. Automated tests cover the
+              Version 0.1.0 is the first stable release. Automated tests cover the
               application, interface and container setup, alongside
               independent-client interoperability tests. Back up your data
-              before upgrades and expect more field testing and refinement.
+              before upgrades. Continued field testing and refinement remain part of the project.
               <a
                 href="https://github.com/salnajjar/RustySoul/blob/main/docs/TODO.md"
                 >See the remaining work</a

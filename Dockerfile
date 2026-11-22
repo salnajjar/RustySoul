@@ -21,7 +21,7 @@ COPY --from=web /build/web/dist ./web/dist
 RUN cargo test --locked --all-targets && cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime
-ARG VERSION=0.1.0-beta.5
+ARG VERSION=0.1.0
 ARG REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/salnajjar/RustySoul" \
       org.opencontainers.image.title="RustySoul" \
@@ -39,6 +39,7 @@ COPY LICENSE /usr/share/doc/rustysoul/LICENSE
 COPY THIRD_PARTY_NOTICES.md /usr/share/doc/rustysoul/THIRD_PARTY_NOTICES.md
 USER 10001:10001
 ENV RUSTYSOUL_DEFAULT_USERNAME=admin RUSTYSOUL_DEFAULT_PASSWORD=change-me-now
+ENV RUSTYSOUL_PACKAGED_CONTAINER=1
 WORKDIR /var/lib/rustysoul
 EXPOSE 8484 2234
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["rustysoul", "--config", "/etc/rustysoul/rustysoul.toml", "--healthcheck"]

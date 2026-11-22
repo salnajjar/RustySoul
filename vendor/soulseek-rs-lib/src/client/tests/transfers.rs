@@ -4,6 +4,26 @@
 use super::*;
 
 #[test]
+fn upload_reoffers_require_a_shared_file_and_preserve_admission_and_bans() {
+    use crate::shares::{Shares,SharedFile};
+    let client=Client::new("fixture","password");
+    {
+        let mut ctx=client.context.write().unwrap();
+        ctx.upload_slots=0;
+        ctx.shares=Arc::new(Shares::from_files(vec![SharedFile::from_cached("Music\\one.flac".into(),"/not-opened-until-accepted.flac".into(),100,vec![])],1));
+    }
+    assert!(client.retry_upload("alice","Music\\absent.flac").is_err());
+    assert!(client.retry_upload("alice","Music\\one.flac").unwrap());
+    assert!(!client.retry_upload("alice","Music\\one.flac").unwrap());
+    assert_eq!(client.context.read().unwrap().upload_queue.len(),1);
+    client.context.write().unwrap().banned_users.insert("bob".into());
+    assert!(client.retry_upload("BOB","Music\\one.flac").is_err());
+    assert_eq!(client.cancel_uploads("alice",&[]).len(),1);
+    assert!(client.retry_upload("alice","Music\\one.flac").unwrap());
+    let ctx=client.context.read().unwrap();assert!(ctx.active_uploads.is_empty());assert!(ctx.uploads.is_empty());
+}
+
+#[test]
 fn disconnect_interrupts_download_attempts_without_cancelling_their_partials() {
     let mut client = Client::new("test-user", "test-password");
     let transfer = download("peer", "paused.bin", 445, DownloadStatus::Paused {

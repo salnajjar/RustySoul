@@ -83,7 +83,7 @@ fn an_empty_local_share_is_indexed_browsed_and_uploaded_without_payload() {
     for (reason, status) in [
         ("Complete", "completed"),
         ("Cancelled", "cancelled"),
-        ("Busy", "failed"),
+        ("Busy", "retry_waiting"),
     ] {
         send(&mut p, 43, &string("public\\empty.txt"));
         let offer = receive_code(&mut p, 40);

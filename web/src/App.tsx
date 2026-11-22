@@ -55,6 +55,7 @@ import Wishlist from "./Wishlist";
 import PeopleSettings from "./PeopleSettings";
 import SharingSettingsForm from "./SharingSettings";
 import RetrySettings from "./RetrySettings";
+import ReleaseNotice, { ReleaseSettings } from "./ReleaseUpdates";
 import Profile from "./Profile";
 import Traffic from "./Traffic";
 import LoadMore from "./LoadMore";
@@ -334,7 +335,6 @@ export default function App() {
                 alt=""
               />
               rusty<span>soul</span>
-              <span className="beta">BETA</span>
             </a>
             <div className="workspace">
               <span className="workspace-avatar">RS</span>
@@ -472,6 +472,10 @@ export default function App() {
               <AudioPlayer file={playing} close={() => setPlaying(null)} />
             )}
             <main>
+              <ReleaseNotice
+                token={token}
+                enabled={state.network.check_for_updates}
+              />
               {(error || (state.error && state.error !== dismissedError)) && (
                 <SystemMessage
                   error
@@ -759,6 +763,7 @@ export default function App() {
                     )}
                     {settingsTab === "status" && (
                       <>
+                        <ReleaseSettings state={state} token={token} />
                         <SystemStatus
                           state={state}
                           live={live}
@@ -1496,11 +1501,11 @@ function TransfersPage({
         </div>
         <div className="results-toolbar">
           <strong>{uploads ? "Upload activity" : "Download queue"}</strong>
-          {!uploads && (
+          {
             <button
               className="button small secondary"
               disabled={
-                !online ||
+                (!uploads && !online) ||
                 ((data?.summary.clearable.failed || 0) +
                   (data?.summary.clearable.timed_out || 0) +
                   (data?.summary.clearable.interrupted || 0) ===
@@ -1509,11 +1514,16 @@ function TransfersPage({
                     ["failed", "timed_out", "interrupted"].includes(t.status),
                   ))
               }
-              onClick={() => send({ type: "retry_downloads", username: null })}
+              onClick={() =>
+                send({
+                  type: uploads ? "retry_uploads" : "retry_downloads",
+                  username: null,
+                })
+              }
             >
-              Retry failed downloads
+              Retry failed {uploads ? "uploads" : "downloads"}
             </button>
-          )}
+          }
           <input
             aria-label="Filter transfers"
             placeholder="Find a file or user…"
@@ -1653,7 +1663,7 @@ function TransfersPage({
           </span>
           <button
             className="button small secondary"
-            disabled={cancelling || (uploads && !online) || !selected.size}
+            disabled={cancelling || !selected.size}
             onClick={() => void cancelSelected()}
           >
             Cancel selected {direction}
@@ -1715,6 +1725,24 @@ function TransfersPage({
                     </button>
                     <User username={username} />
                     <div className="button-row upload-bulk-controls">
+                      {uploads && (
+                        <button
+                          className="button small secondary"
+                          aria-label={`Retry failed uploads for ${username}`}
+                          disabled={
+                            !rows.some((t) =>
+                              ["failed", "timed_out", "interrupted"].includes(
+                                t.status,
+                              ),
+                            )
+                          }
+                          onClick={() =>
+                            send({ type: "retry_uploads", username })
+                          }
+                        >
+                          Retry failed
+                        </button>
+                      )}
                       <button
                         className="button small secondary"
                         disabled={
@@ -1741,7 +1769,7 @@ function TransfersPage({
                       </button>
                       <button
                         className="button small secondary"
-                        disabled={cancelling || (uploads && !online)}
+                        disabled={cancelling}
                         aria-label={`Cancel all ${direction} for ${username}`}
                         title="Cancel this user's unfinished transfers, including files hidden by filters. Completed files are kept."
                         onClick={() => void cancelUser(username)}
@@ -1752,7 +1780,6 @@ function TransfersPage({
                         className="button small secondary"
                         disabled={
                           cancelling ||
-                          (uploads && !online) ||
                           ![...selected.values()].some(
                             (t) => t.username === username,
                           )
@@ -1912,12 +1939,15 @@ function TransfersPage({
                           )}
                         </div>
                         {uploads &&
-                          ["queued", "uploading", "checking_shares"].includes(
-                            t.status,
-                          ) && (
+                          [
+                            "queued",
+                            "uploading",
+                            "checking_shares",
+                            "retry_waiting",
+                          ].includes(t.status) && (
                             <button
                               className="button small secondary"
-                              disabled={!online}
+                              disabled={!online && t.status !== "retry_waiting"}
                               onClick={() =>
                                 send({
                                   type: "cancel_upload",

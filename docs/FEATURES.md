@@ -1,6 +1,6 @@
 # Feature coverage
 
-RustySoul is a beta Linux Soulseek daemon with a browser UI and API. Features below have automated coverage; beta testing across more peers, routers and distributions remains useful. [Testing](TESTING.md) distinguishes fixtures from independent-client tests.
+RustySoul is a Linux Soulseek daemon with a browser UI and API. Features below have automated coverage; field testing across more peers, routers and distributions remains useful. [Testing](TESTING.md) distinguishes fixtures from independent-client tests.
 
 | Area | Available features |
 | --- | --- |
@@ -13,8 +13,8 @@ RustySoul is a beta Linux Soulseek daemon with a browser UI and API. Features be
 | Chat | Multiple room tabs, unread indicators, private messages, room boards/private access, compatible Unicode emoji/emoticon display, consecutive-message grouping |
 | Statistics | Per-user volumes, all-time totals/ratio, compact historical traffic buckets with graph direction toggles |
 | Sharing | Intuitive configurable leech protection, profile/public share settings, privilege status and purchase link |
-| Operations | Logs/activity, status/metrics, themes, scoped API keys, database maintenance, encrypted backup/restore, native systemd installation |
+| Operations | Logs/activity, status/metrics, themes, scoped API keys, database maintenance, encrypted backup/restore, native systemd installation, periodic release notices with installation-specific upgrade links |
 
 Detailed guides: [API](API.md), [transfer reliability](TRANSFER_RELIABILITY.md), [queue controls](TRANSFER_QUEUE.md), [storage protection](STORAGE_PROTECTION.md), [discovery](USER_DISCOVERY.md), [privacy/security](SECURITY.md), [maintenance](MAINTENANCE.md), [backup](BACKUPS.md), [monitoring](MONITORING.md).
 
-The supplied independent-client test matrices cover real Soulfind, slskd and Nicotine+ behavior. Findings in other clients are documented in [interoperability](INTEROPERABILITY.md) and [Soulfind/slskd](SOULFIND_SLSKD.md); repairing those implementations is outside this project's scope. See [remaining work](TODO.md) for beta limitations.
+The supplied independent-client test matrices cover real Soulfind, slskd and Nicotine+ behavior. Findings in other clients are documented in [interoperability](INTEROPERABILITY.md) and [Soulfind/slskd](SOULFIND_SLSKD.md); repairing those implementations is outside this project's scope. See [remaining work](TODO.md) for continuing validation and possible improvements.

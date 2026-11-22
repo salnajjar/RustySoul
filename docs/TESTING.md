@@ -39,6 +39,8 @@ All 87 SDK server cases were exercised against real isolated Soulfind servers wi
 
 ## Fuzzing and extended checks
 
+The upload retry fixture in `tests/fixtures/upload_retries.rs` uses independent loopback server/control/file sockets to verify a transient refusal, offline waiting without a payload connection, a fresh offer and byte-exact resumption. Unit checks cover durable budgets, cancellation, manual resets and the stopped-service lock. Release-check tests cover semantic version ordering, trusted installation links, conditional requests, response/time limits, backoff and API authorization; browser checks cover notices and settings. No production account or public Soulseek traffic is used by these fixtures.
+
 The repository includes `fuzz/` targets and `scripts/seed-fuzz-corpus.py`. Install cargo-fuzz and nightly Rust, generate a corpus, then run individual targets with bounded time and memory appropriate to the test host. Generated corpora/crashes are local artifacts and excluded from Git. See `fuzz/Cargo.toml` for available targets. Long-running campaigns and resource/soak results must be recorded separately; a short CI pass cannot establish all network, router or large-library behavior.
 
-GitHub Actions runs portable checks for pushes and beta releases. Do not add credentials, personal logs or production backups to workflow artifacts. An independent security review and broader field testing remain desirable before claiming production readiness.
+GitHub Actions runs portable checks for pushes and releases. Do not add credentials, personal logs or production backups to workflow artifacts. An independent security review and broader field testing remain desirable before claiming production readiness.

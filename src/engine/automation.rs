@@ -83,6 +83,7 @@ mod tests {
         let db = crate::store::Store::open(&dir.path().join("db")).unwrap();
         let policy = RetryPolicy {
             enabled: true,
+            uploads_enabled: true,
             max_attempts: 3,
             base_delay_seconds: 5,
             max_delay_seconds: 12,

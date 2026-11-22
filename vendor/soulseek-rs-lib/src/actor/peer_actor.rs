@@ -1019,10 +1019,13 @@ impl Actor for PeerActor {
                     }
                 }
             }
-            // Nothing in the registry points at a retired actor any more, so
-            // it is the one to stop itself.
+            // Closed workers own no usable socket. Stop independently of the
+            // operations loop: a replacement can win the registry slot before
+            // that loop processes our disconnect. Late Retire messages are
+            // intentionally ignored after disconnect_reported, so waiting for
+            // retirement here would leak a thread and its capacity permit.
             ConnectionState::Disconnected => {
-                if self.retire_deadline.is_some()
+                if (self.disconnect_reported || self.retire_deadline.is_some())
                     && let Some(handle) = &self.self_handle
                 {
                     let _ = handle.stop();

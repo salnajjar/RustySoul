@@ -188,6 +188,7 @@ pub struct RoomView {
 #[serde(default, deny_unknown_fields)]
 pub struct RetryPolicy {
     pub enabled: bool,
+    pub uploads_enabled: bool,
     pub max_attempts: u8,
     pub base_delay_seconds: u32,
     pub max_delay_seconds: u32,
@@ -196,6 +197,7 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
+            uploads_enabled: true,
             max_attempts: 3,
             base_delay_seconds: 15,
             max_delay_seconds: 300,
@@ -218,6 +220,7 @@ impl RetryPolicy {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkSettings {
+    pub check_for_updates: bool,
     pub minimum_free_space_mib: u64,
     pub port: u16,
     pub upnp: bool,
@@ -249,6 +252,7 @@ pub struct PortBinding {
 impl Default for NetworkSettings {
     fn default() -> Self {
         Self {
+            check_for_updates: true,
             minimum_free_space_mib: crate::storage::DEFAULT_MINIMUM_MIB,
             port: 2234,
             upnp: false,
@@ -356,6 +360,9 @@ pub struct BrowseView {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    RetryUploads {
+        username: Option<String>,
+    },
     UpdateStorageReserve {
         minimum_free_space_mib: u64,
     },
@@ -655,7 +662,7 @@ impl Command {
                 }
                 Ok(())
             }
-            Self::RetryDownloads { username: u } => {
+            Self::RetryDownloads { username: u } | Self::RetryUploads { username: u } => {
                 if let Some(u) = u {
                     username(u)?;
                 }

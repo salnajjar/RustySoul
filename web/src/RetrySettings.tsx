@@ -30,7 +30,7 @@ export default function RetrySettings({
   }
   return (
     <section className="panel wide">
-      <h2>Download retries</h2>
+      <h2>Transfer retries</h2>
       <form className="credentials-form" onSubmit={save}>
         <label className="checkbox-label">
           <input
@@ -42,10 +42,23 @@ export default function RetrySettings({
           />
           Automatically retry failed or timed-out downloads
         </label>
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={settings.uploads_enabled}
+            onChange={(e) =>
+              setSettings({ ...settings, uploads_enabled: e.target.checked })
+            }
+          />
+          Automatically retry interrupted or timed-out uploads
+        </label>
         <p className="hint">
           Enabled by default. Only new failures are scheduled. Delays increase
           after each attempt; disabling retries cancels pending retry timers.
-          Files already downloaded are retained.
+          Files already downloaded are retained. Upload retries wait for the
+          recipient to be online and require their acceptance. They expire after
+          seven days; cancelled transfers and permanent refusals are never
+          retried automatically.
         </p>
         <div className="network-fields">
           <label>

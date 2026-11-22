@@ -17,6 +17,8 @@ mod searching;
 mod social_discovery;
 #[path = "fixtures/storage.rs"]
 mod storage;
+#[path = "fixtures/upload_retries.rs"]
+mod upload_retries;
 #[path = "fixtures/users.rs"]
 mod users;
 use rustysoul::{
@@ -74,6 +76,7 @@ fn compressed(bytes: &[u8]) -> Vec<u8> {
     encoder.write_all(bytes).unwrap();
     encoder.finish().unwrap()
 }
+#[track_caller]
 fn receive_code(stream: &mut TcpStream, expected: u32) -> Vec<u8> {
     loop {
         let (code, payload) = receive(stream).unwrap();
@@ -449,6 +452,7 @@ fn login_search_messages_and_room_list_use_reference_wire_format() {
         .send(Command::UpdateRetryPolicy {
             settings: rustysoul::model::RetryPolicy {
                 enabled: true,
+                uploads_enabled: false,
                 max_attempts: 2,
                 base_delay_seconds: 5,
                 max_delay_seconds: 10,

@@ -470,7 +470,7 @@ def main():
     parser.add_argument('--fragment', action='store_true')
     parser.add_argument('--sdk', type=Path, help='Run required-server SDK tests with Soulfind from the official image')
     parser.add_argument('--sdk-test', help='Run one exact SDK server case instead of the full suite')
-    parser.add_argument('--rust-image', default='ghcr.io/salnajjar/rustysoul:beta')
+    parser.add_argument('--rust-image', default='ghcr.io/salnajjar/rustysoul:latest')
     parser.add_argument('--slskd-image', default='docker.io/slskd/slskd:latest')
     parser.add_argument('--soulfind-image', default='ghcr.io/soulfind-dev/soulfind:latest')
     parser.add_argument('--runner-image', default='localhost/rustysoul:interop-runner')

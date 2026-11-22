@@ -26,4 +26,4 @@ for name, package in sorted(lock["packages"].items()):
     for file in sorted(directory.iterdir()):
         if file.is_file() and file.name.upper().startswith(("LICENSE", "COPYING", "NOTICE")):
             out.append(f'\n### {file.name}\n\n```text\n{file.read_text(errors="replace")}\n```\n')
-(root / "THIRD_PARTY_NOTICES.md").write_text("\n".join(out))
+(root / "THIRD_PARTY_NOTICES.md").write_text("\n".join(line.rstrip() for line in "\n".join(out).splitlines()) + "\n")

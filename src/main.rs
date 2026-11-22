@@ -19,6 +19,9 @@ struct Args {
     /// Exit successfully if the local daemon's authenticated status endpoint responds.
     #[arg(long)]
     healthcheck: bool,
+    /// Schedule this recipient's failed uploads while the daemon is stopped.
+    #[arg(long, conflicts_with_all=["create_backup","inspect_backup","restore_backup","healthcheck","check"])]
+    retry_uploads_for: Option<String>,
     /// Save an encrypted application backup while the daemon is stopped.
     #[arg(long, conflicts_with_all=["inspect_backup","restore_backup"])]
     create_backup: Option<PathBuf>,
@@ -51,6 +54,13 @@ async fn main() -> Result<std::process::ExitCode> {
         .init();
     let args = Args::parse();
     let config = Config::load_optional(args.config.as_deref())?;
+    if let Some(user) = &args.retry_uploads_for {
+        let count = rustysoul::upload_retry::offline(&config, user)?;
+        println!(
+            "Scheduled {count} uploads; start RustySoul to re-offer them when the recipient is online."
+        );
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     if args.create_backup.is_some()
         || args.inspect_backup.is_some()
         || args.restore_backup.is_some()
@@ -108,6 +118,7 @@ async fn main() -> Result<std::process::ExitCode> {
     let token = secrets.api_token.clone();
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let handle = engine::start(config.clone(), secrets)?;
+    let (release_updates, _release_worker) = rustysoul::updates::start(handle.snapshot.clone())?;
     if let Err(error) = rustysoul::backup::cleanup_temporary(&config.data_dir) {
         tracing::warn!("Could not clean leftover backup workspace: {error}");
     }
@@ -143,6 +154,7 @@ async fn main() -> Result<std::process::ExitCode> {
             handle.snapshot.clone(),
         )
         .with_auth(auth)
+        .with_updates(release_updates)
         .with_restart(restart.clone()),
     );
     tracing::info!(%bind, "RustySoul is listening");

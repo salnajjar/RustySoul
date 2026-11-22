@@ -6,14 +6,14 @@ It has a modern React browser interface, an authenticated API and SQLite persist
 
 **[Explore the project website →](https://salnajjar.github.io/RustySoul/)** — screenshots, features and installation options.
 
-**Current beta: v0.1.0-beta.5.** Core workflows have automated coverage and independent-client interoperability tests. This is beta software; back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
+**First stable release: v0.1.0.** Core workflows have automated coverage and independent-client interoperability tests. Back up persistent state before upgrading. See [verification](docs/TESTING.md), [feature coverage](docs/FEATURES.md) and [remaining work](docs/TODO.md).
 
 ## Quick start with Docker
 
 Published images currently support **Linux amd64**. Pull the image and run it with environment variables and persistent volumes; no repository checkout, Compose file or user-supplied TOML file is needed.
 
 ```sh
-docker pull ghcr.io/salnajjar/rustysoul:beta
+docker pull ghcr.io/salnajjar/rustysoul:latest
 docker run -d --name rustysoul --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
@@ -25,10 +25,10 @@ docker run -d --name rustysoul --restart unless-stopped \
   -v rustysoul-data:/var/lib/rustysoul \
   -v rustysoul-downloads:/downloads \
   -v rustysoul-library:/library:ro \
-  ghcr.io/salnajjar/rustysoul:beta
+  ghcr.io/salnajjar/rustysoul:latest
 ```
 
-Open **http://127.0.0.1:8484**. For a server elsewhere, use `ssh -L 8484:127.0.0.1:8484 your-server` or an HTTPS reverse proxy. To publish HTTP on another host adapter, change the host address in `-p`. For a pinned image use `ghcr.io/salnajjar/rustysoul:0.1.0-beta.5`. Public pulls need no registry login.
+Open **http://127.0.0.1:8484**. For a server elsewhere, use `ssh -L 8484:127.0.0.1:8484 your-server` or an HTTPS reverse proxy. To publish HTTP on another host adapter, change the host address in `-p`. For a pinned image use `ghcr.io/salnajjar/rustysoul:0.1.0`. Public pulls need no registry login.
 
 Initial administrator credentials are **admin / change-me-now**, unless changed with the two deployment variables above. First sign-in requires replacing **both** the username and password (minimum eight characters). Existing accounts survive restarts and are never reset by these bootstrap variables. Soulseek credentials are entered and verified separately under **Settings → Accounts**.
 
@@ -57,6 +57,8 @@ Native Linux bundles include the executable, installer, systemd service and noti
 - Themes, API integration keys, operational logs, database maintenance and encrypted backup/restore.
 
 See [feature details](docs/FEATURES.md) and the [API reference](docs/API.md). Credentials are encrypted at rest using a private local key; authentication uses hashed passwords and protected persistent sessions. See [security](docs/SECURITY.md) for boundaries and reporting, and [security analysis](docs/SECURITY_ANALYSIS.md) for CI scanning, audited false-positive handling and release gates.
+
+[Release notifications and upgrades](docs/UPDATES.md) explains automatic checks and installing updates without losing application state.
 
 ## Build and test
 

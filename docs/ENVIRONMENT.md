@@ -39,6 +39,7 @@ Booleans accept `true` or `false`. Folder lists accept one absolute path or a JS
 | `RUSTYSOUL_MAX_SEARCHES` | Legacy setting accepted and ignored; search history has no count limit. |
 | `RUSTYSOUL_MAX_TRANSFERS` | `128`; 1–1024 |
 | `RUST_LOG` | `rustysoul=info` when unset; diagnostic logging filter |
+| `RUSTYSOUL_INSTALL_TYPE` | Auto-detected; optional `docker`, `podman`, `container` or `native` override for [release update instructions](UPDATES.md) |
 
 The HTTP and published transfer ports must differ. Transfer ports must be 1024–65535. Published host and container transfer ports should match so peers receive the correct address.
 
@@ -58,7 +59,7 @@ docker run -d --name rustysoul --restart unless-stopped \
   -v rustysoul-data:/var/lib/rustysoul \
   -v rustysoul-downloads:/downloads \
   -v rustysoul-library:/library:ro \
-  ghcr.io/salnajjar/rustysoul:beta
+  ghcr.io/salnajjar/rustysoul:latest
 ```
 
 For another adapter set `RUSTYSOUL_BIND=192.0.2.10:8484` and `RUSTYSOUL_ALLOW_REMOTE=true`. `all` means `0.0.0.0:8484`. Use an HTTPS reverse proxy for remote browser access as described in [connections](CONNECTIONS.md).

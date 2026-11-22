@@ -25,7 +25,7 @@ const MAGIC: &[u8; 16] = b"RustySoulBackup1";
 const CHUNK: usize = 64 * 1024;
 pub const MAX_DATABASE: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_UPLOAD: usize = (MAX_DATABASE + 4 * 1024 * 1024) as usize;
-const SCHEMA: u32 = 17;
+const SCHEMA: u32 = 18;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Summary {
@@ -539,6 +539,38 @@ fn inspect(
     }
     if saved_schema >= 12 {
         crate::queue_order::load(&db)?;
+    }
+    if saved_schema >= 18 {
+        ensure!(
+            db.query_row("SELECT COUNT(*) FROM upload_retries", [], |r| r
+                .get::<_, i64>(0))?
+                <= 4096,
+            "Backup upload retry queue exceeds the supported limit"
+        );
+        let mut rows = db.prepare(
+            "SELECT username,path,attempts,next_at,expires_at,manual FROM upload_retries",
+        )?;
+        let mut cursor = rows.query([])?;
+        while let Some(row) = cursor.next()? {
+            cancel.check()?;
+            crate::model::Command::CancelUpload {
+                username: row.get(0)?,
+                path: row.get(1)?,
+            }
+            .validate()
+            .map_err(anyhow::Error::msg)?;
+            let attempts: u8 = row.get(2)?;
+            let next: Option<i64> = row.get(3)?;
+            let expiry: i64 = row.get(4)?;
+            let manual: u8 = row.get(5)?;
+            ensure!(
+                attempts <= 10
+                    && manual <= 1
+                    && expiry >= 0
+                    && next.is_none_or(|n| n >= 0 && n <= expiry),
+                "Invalid saved upload retry"
+            );
+        }
     }
     let count = |table: &str| -> Result<u64> {
         Ok(
@@ -1234,7 +1266,7 @@ mod tests {
 
     #[test]
     fn legacy_schema_eleven_through_sixteen_archives_restore_before_migration() {
-        for legacy in [11, 12, 13, 14, 15, 16] {
+        for legacy in [11, 12, 13, 14, 15, 16, 17] {
             let (_temp, config, _) = fixture_at_schema(legacy);
             if legacy >= 12 {
                 let db = Connection::open(config.data_dir.join("rustysoul.sqlite3")).unwrap();

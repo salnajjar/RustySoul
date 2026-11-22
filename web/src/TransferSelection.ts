@@ -4,7 +4,7 @@ export const transferKey = (t: Pick<Transfer, "username" | "path">) =>
   JSON.stringify([t.username, t.path]);
 export const canCancelTransfer = (t: Transfer, uploads: boolean) =>
   (uploads
-    ? ["queued", "uploading", "checking_shares"]
+    ? ["queued", "uploading", "checking_shares", "retry_waiting"]
     : [
         "waiting",
         "waiting_for_space",

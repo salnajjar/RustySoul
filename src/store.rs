@@ -39,12 +39,12 @@ fn read_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_at_schema(path, 17)
+        Self::open_at_schema(path, 18)
     }
     // Used only to construct a trusted expected schema when validating older
     // backups. Never called on an untrusted backup before exact validation.
     pub(crate) fn open_at_schema(path: &Path, target: u32) -> Result<Self> {
-        ensure!((11..=17).contains(&target), "Unsupported schema target");
+        ensure!((11..=18).contains(&target), "Unsupported schema target");
         let connection = Connection::open(path).context("Cannot open SQLite database")?;
         #[cfg(unix)]
         if path != Path::new(":memory:") {
@@ -205,6 +205,11 @@ impl Store {
                 CREATE INDEX upload_speed_users_recent ON upload_speed_users(last_sequence DESC);
                 DROP TABLE upload_speed_estimate;
                 PRAGMA user_version=17; COMMIT;")?;
+        }
+        if version < 18 && target >= 18 {
+            connection.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE upload_retries(username TEXT NOT NULL,path TEXT NOT NULL,attempts INTEGER NOT NULL CHECK(attempts BETWEEN 0 AND 10),next_at INTEGER,expires_at INTEGER NOT NULL,manual INTEGER NOT NULL CHECK(manual IN (0,1)),PRIMARY KEY(username,path),FOREIGN KEY(username,path) REFERENCES uploads(username,path) ON DELETE CASCADE);
+                PRAGMA user_version=18; COMMIT;")?;
         }
         Ok(Self {
             connection,

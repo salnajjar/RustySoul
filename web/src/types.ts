@@ -105,6 +105,7 @@ export interface Snapshot {
   transfer_revision?: number;
   retry_policy: {
     enabled: boolean;
+    uploads_enabled: boolean;
     max_attempts: number;
     base_delay_seconds: number;
     max_delay_seconds: number;
@@ -127,6 +128,7 @@ export interface Snapshot {
   http_bind: string;
   port_binding: { fixed_port: number | null };
   network: {
+    check_for_updates: boolean;
     minimum_free_space_mib?: number;
     port: number;
     upnp: boolean;
@@ -249,6 +251,7 @@ export interface SystemStatus {
 export const emptySnapshot: Snapshot = {
   retry_policy: {
     enabled: true,
+    uploads_enabled: true,
     max_attempts: 3,
     base_delay_seconds: 15,
     max_delay_seconds: 300,
@@ -263,6 +266,7 @@ export const emptySnapshot: Snapshot = {
   http_bind: "127.0.0.1:8484",
   port_binding: { fixed_port: null },
   network: {
+    check_for_updates: true,
     minimum_free_space_mib: 1024,
     port: 2234,
     upnp: false,
@@ -312,7 +316,7 @@ export const emptySnapshot: Snapshot = {
   notice: null,
   credentials_configured: false,
   credentials_revision: 0,
-  version: "0.1.0-beta.5",
+  version: "0.1.0",
   connection: "disconnected",
   error: null,
   username: "",

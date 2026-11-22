@@ -10,6 +10,7 @@
 /data/
 /ReferenceCode/
 /artifacts/
+/.vscode/
 /docs/DEPLOYMENT.md
 # Keep only the runtime SVG; retain unused supplied artwork locally.
 /images/*

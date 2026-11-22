@@ -1,5 +1,9 @@
 # Local protocol-library adapters
 
+The upload re-offer API resolves an originally requested virtual filename through the current share index, checks bans and duplicate queued/offered/active work, then uses normal admission, sharing checks, priorities, per-user/global slots, offers and resume negotiation. It opens no payload before recipient acceptance. The daemon owns durable retry limits and online-status gating; the SDK never guesses filesystem paths from a peer-supplied filename.
+
+Closed peer workers now stop themselves after reporting a disconnect, independently of client-loop cleanup. A replacement arriving before the old disconnect is processed can otherwise leave the old worker ignoring a late Retire message and holding a connection-capacity permit indefinitely. A real-socket regression repeatedly closes and replaces peers with delayed notification handling and verifies that every worker and permit is released; the previous implementation fails this check.
+
 The MIT-licensed soulseek-rs-lib 20.0.0 source is pinned under vendor. Original copyright and license declarations remain intact. RustySoul adds:
 
 - Cached share-index construction/replacement, avoiding repeated full metadata parsing.

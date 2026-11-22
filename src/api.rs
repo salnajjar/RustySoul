@@ -37,6 +37,7 @@ static WEB: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
 
 #[derive(Clone)]
 pub struct ApiState {
+    release_updates: Option<Arc<crate::updates::Monitor>>,
     backup_config: Arc<Config>,
     backups: backups::Manager,
     restart: Option<Arc<tokio::sync::Notify>>,
@@ -62,6 +63,7 @@ impl ApiState {
         snapshot: watch::Receiver<Snapshot>,
     ) -> Self {
         Self {
+            release_updates: None,
             backup_config: Arc::new(config.clone()),
             backups: backups::Manager::default(),
             restart: None,
@@ -82,6 +84,10 @@ impl ApiState {
             rate: Arc::new(Mutex::new((10., Instant::now()))),
         }
     }
+    pub fn with_updates(mut self, updates: Arc<crate::updates::Monitor>) -> Self {
+        self.release_updates = Some(updates);
+        self
+    }
     pub fn with_restart(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.restart = Some(notify);
         self
@@ -95,6 +101,8 @@ impl ApiState {
 pub fn router(state: ApiState) -> Router {
     let api = Router::new()
         .route("/status", get(status))
+        .route("/updates", get(release_status))
+        .route("/updates/check", post(check_release))
         .route("/metrics", get(metrics))
         .route("/api-access", get(access::status).post(access::change))
         .route(
@@ -1120,6 +1128,30 @@ async fn logout(State(state): State<ApiState>, headers: axum::http::HeaderMap) -
     response
 }
 
+async fn release_status(State(state): State<ApiState>) -> Response {
+    match &state.release_updates {
+        Some(updates) => {
+            Json(updates.view(state.snapshot.borrow().network.check_for_updates)).into_response()
+        }
+        None => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Release checker is unavailable",
+        ),
+    }
+}
+async fn check_release(State(state): State<ApiState>) -> Response {
+    match &state.release_updates {
+        Some(updates) => {
+            let enabled = state.snapshot.borrow().network.check_for_updates;
+            let queued = updates.check(enabled);
+            Json(json!({"queued":queued,"status":updates.view(enabled)})).into_response()
+        }
+        None => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Release checker is unavailable",
+        ),
+    }
+}
 async fn status(State(state): State<ApiState>) -> Json<Snapshot> {
     Json(state.snapshot.borrow().clone())
 }
@@ -1241,6 +1273,70 @@ mod tests {
     use super::*;
     use axum::http::Request;
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn release_routes_require_authentication_and_keep_readonly_scope() {
+        let (_, snapshot) = watch::channel(Snapshot::default());
+        let (commands, _) = mpsc::sync_channel(32);
+        let app = router(ApiState::new(
+            &Config::default(),
+            &"s".repeat(32),
+            commands,
+            snapshot,
+        ));
+        for (method, path) in [
+            ("GET", "/api/v1/updates"),
+            ("POST", "/api/v1/updates/check"),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(req(method, path, None, "{}"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                app.clone()
+                    .oneshot(req(method, path, Some(&"s".repeat(32)), "{}"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert!(crate::api_access::Scope::ReadOnly.allows("GET", "/updates"));
+        assert!(!crate::api_access::Scope::ReadOnly.allows("POST", "/updates/check"));
+        assert!(crate::api_access::Scope::Control.allows("POST", "/updates/check"));
+        let mut disabled = Snapshot::default();
+        disabled.network.check_for_updates = false;
+        let (_, snapshot) = watch::channel(disabled);
+        let (updates, _worker) = crate::updates::start(snapshot.clone()).unwrap();
+        let (commands, _) = mpsc::sync_channel(32);
+        let app = router(
+            ApiState::new(&Config::default(), &"s".repeat(32), commands, snapshot)
+                .with_updates(updates),
+        );
+        for (method, path) in [
+            ("GET", "/api/v1/updates"),
+            ("POST", "/api/v1/updates/check"),
+        ] {
+            use http_body_util::BodyExt;
+            let response = app
+                .clone()
+                .oneshot(req(method, path, Some(&"s".repeat(32)), "{}"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if method == "GET" {
+                assert_eq!(value["enabled"], false);
+                assert_eq!(value["checking"], false);
+            } else {
+                assert_eq!(value["queued"], false);
+            }
+        }
+    }
     #[tokio::test]
     async fn attribute_and_message_search_queries_work_through_authenticated_readonly_http_routes()
     {

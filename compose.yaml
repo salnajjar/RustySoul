@@ -1,7 +1,7 @@
 services:
   rustysoul:
     build: .
-    image: "${RUSTYSOUL_IMAGE:-ghcr.io/salnajjar/rustysoul:beta}"
+    image: "${RUSTYSOUL_IMAGE:-ghcr.io/salnajjar/rustysoul:latest}"
     container_name: rustysoul
     restart: unless-stopped
 

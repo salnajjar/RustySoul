@@ -1,6 +1,6 @@
 # Remaining work
 
-The first beta includes the implemented functionality in [FEATURES.md](FEATURES.md). Before a production-readiness claim:
+The first stable release includes the implemented functionality in [FEATURES.md](FEATURES.md). Continuing validation and future improvements:
 
 - Broaden field validation of network/active-transfer cancellation and retry across more clients, routers and distributions.
 - Complete an independent security review and evaluate hard storage quotas/reservations beyond the current free-space floor.

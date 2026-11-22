@@ -22,6 +22,7 @@ impl Scope {
             return matches!(
                 path,
                 "/status"
+                    | "/updates"
                     | "/messages"
                     | "/messages/conversations"
                     | "/metrics"
@@ -43,7 +44,12 @@ impl Scope {
             && method == "POST"
             && matches!(
                 path,
-                "/commands" | "/downloads/batch" | "/profile" | "/rooms/read" | "/messages/read"
+                "/commands"
+                    | "/downloads/batch"
+                    | "/profile"
+                    | "/rooms/read"
+                    | "/messages/read"
+                    | "/updates/check"
             )
     }
 }

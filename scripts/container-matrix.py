@@ -300,7 +300,7 @@ def main():
                 engine('cp', name + ':/var/lib/rustysoul/rustysoul.sqlite3', str(root / 'state.sqlite3'))
             from contextlib import closing
             with closing(sqlite3.connect(root / 'state.sqlite3')) as db:
-                assert db.execute('PRAGMA user_version').fetchone()[0] == 17
+                assert db.execute('PRAGMA user_version').fetchone()[0] == 18
                 assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
                 assert not db.execute('PRAGMA foreign_key_check').fetchall()
                 for table in ['downloads', 'uploads']:

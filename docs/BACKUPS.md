@@ -1,6 +1,6 @@
 # Encrypted backup and restore
 
-Settings > Backup & restore creates and restores a portable snapshot of RustySoul application state. The same release executable supports stopped-service CLI recovery. This release validates schema 11 through 17 backups against their exact expected structures. Schema-11/12/13/14/15/16 restores migrate to schema 17 on startup; it is not an arbitrary SQLite importer or an automatic downgrade/migration tool.
+Settings > Backup & restore creates and restores a portable snapshot of RustySoul application state. The same release executable supports stopped-service CLI recovery. This release validates schema 11 through 18 backups against their exact expected structures. Schema-11/12/13/14/15/16/17 restores migrate to schema 18 on startup; it is not an arbitrary SQLite importer or an automatic downgrade/migration tool.
 
 ## Browser workflow
 
